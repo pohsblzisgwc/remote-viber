@@ -2,13 +2,21 @@ package com.remoteviber.client.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -17,6 +25,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.remoteviber.client.model.AgentSession
@@ -41,14 +51,31 @@ fun TerminalScreen(
     onSendPrompt: (String) -> Unit
 ) {
     var fontSizeSp by remember { mutableStateOf(11) }
+    var localCommandInput by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
 
-    // Auto-scroll to bottom when new terminal output arrives
     val lineCount = terminalBuffer.lines.size
-    LaunchedEffect(lineCount) {
+    val activeLineText = terminalBuffer.activeLine.text
+
+    // Auto-scroll to bottom when new terminal output arrives
+    LaunchedEffect(lineCount, activeLineText) {
         if (lineCount > 0) {
-            listState.scrollToItem(lineCount - 1)
+            listState.scrollToItem(lineCount)
+        }
+    }
+
+    val submitCommand = {
+        val text = localCommandInput.trim()
+        if (text.isNotEmpty()) {
+            terminalBuffer.appendLocalEcho(text)
+            onSendPrompt(text + "\n")
+            localCommandInput = ""
+            coroutineScope.launch {
+                if (terminalBuffer.lines.isNotEmpty()) {
+                    listState.animateScrollToItem(terminalBuffer.lines.size)
+                }
+            }
         }
     }
 
@@ -66,6 +93,67 @@ fun TerminalScreen(
             onNewTerminal = onNewTerminal,
             onReturnToDashboard = onReturnToDashboard
         )
+
+        // Low-Latency Stream Mode Sub-header & Quick Action Controls
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF070B14))
+                .border(width = 0.5.dp, color = ViberBorder)
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(ViberCyan.copy(alpha = 0.15f))
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Bolt,
+                            contentDescription = "Fast Stream",
+                            tint = ViberCyan,
+                            modifier = Modifier.size(11.dp)
+                        )
+                        Spacer(modifier = Modifier.width(3.dp))
+                        Text(
+                            text = "极速低延迟降级流",
+                            color = ViberCyan,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "${lineCount} 行日志",
+                    color = TextMuted,
+                    fontSize = 9.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // Clear Buffer Button
+                TextButton(
+                    onClick = { terminalBuffer.clear() },
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                    modifier = Modifier.height(22.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DeleteSweep,
+                        contentDescription = "Clear",
+                        tint = TextMuted,
+                        modifier = Modifier.size(12.dp)
+                    )
+                    Spacer(modifier = Modifier.width(2.dp))
+                    Text(text = "清屏", color = TextMuted, fontSize = 9.sp)
+                }
+            }
+        }
 
         // Reconnection Notice Banner
         if (connectionStatus != ConnectionStatus.CONNECTED) {
@@ -126,6 +214,7 @@ fun TerminalScreen(
                     state = listState,
                     modifier = Modifier.fillMaxSize()
                 ) {
+                    // Committed history lines
                     items(terminalBuffer.lines) { line ->
                         Text(
                             text = line,
@@ -134,6 +223,19 @@ fun TerminalScreen(
                             lineHeight = (fontSizeSp * 1.25).sp,
                             modifier = Modifier.fillMaxWidth()
                         )
+                    }
+
+                    // Active in-progress line (live prompt / spinner without trailing newline)
+                    if (terminalBuffer.activeLine.text.isNotEmpty()) {
+                        item {
+                            Text(
+                                text = terminalBuffer.activeLine,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = fontSizeSp.sp,
+                                lineHeight = (fontSizeSp * 1.25).sp,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
                     }
                 }
 
@@ -149,7 +251,7 @@ fun TerminalScreen(
                     SmallFloatingActionButton(
                         onClick = {
                             coroutineScope.launch {
-                                listState.animateScrollToItem(lineCount - 1)
+                                listState.animateScrollToItem(lineCount)
                             }
                         },
                         containerColor = ViberCyan,
@@ -160,18 +262,148 @@ fun TerminalScreen(
                             .padding(10.dp)
                             .size(34.dp)
                     ) {
-                        Icon(imageVector = Icons.Default.ArrowDownward, contentDescription = "Scroll to bottom", modifier = Modifier.size(18.dp))
+                        Icon(
+                            imageVector = Icons.Default.ArrowDownward,
+                            contentDescription = "Scroll to bottom",
+                            modifier = Modifier.size(18.dp)
+                        )
                     }
                 }
             }
         }
 
-        // Virtual Accessory Keyboard Bar
+        // Quick Signal & Approval Chips (One-tap for mobile thumbs)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF0A0F1C))
+                .border(width = 0.5.dp, color = ViberBorder)
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            ActionPill("y (确定)", ViberEmerald) {
+                terminalBuffer.appendLocalEcho("y")
+                onSendPrompt("y\n")
+            }
+            ActionPill("n (取消)", ViberRose) {
+                terminalBuffer.appendLocalEcho("n")
+                onSendPrompt("n\n")
+            }
+            ActionPill("↵ 回车", TextPrimary) {
+                onSendKey("\r")
+            }
+            ActionPill("^C 中断", ViberRose) {
+                terminalBuffer.appendSystemNotice("[已发送 Ctrl+C 中断信号]", ViberRose)
+                onSendKey("\u0003")
+            }
+            ActionPill("^D EOF", ViberCyan) {
+                onSendKey("\u0004")
+            }
+            ActionPill("git status", TextSecondary) {
+                terminalBuffer.appendLocalEcho("git status")
+                onSendPrompt("git status\n")
+            }
+            ActionPill("docker ps", TextSecondary) {
+                terminalBuffer.appendLocalEcho("docker ps")
+                onSendPrompt("docker ps\n")
+            }
+        }
+
+        // Local Optimistic Command Bar (Eliminates single-key network latency)
+        Surface(
+            color = ViberSurface,
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(width = 1.dp, color = ViberBorder)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = localCommandInput,
+                    onValueChange = { localCommandInput = it },
+                    placeholder = {
+                        Text(
+                            text = "本地编辑指令/Prompt，回车或点发送...",
+                            fontSize = 11.sp,
+                            color = TextMuted
+                        )
+                    },
+                    singleLine = true,
+                    textStyle = androidx.compose.ui.text.TextStyle(
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color.White
+                    ),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(onSend = { submitCommand() }),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = ViberCyan,
+                        unfocusedBorderColor = ViberBorder,
+                        focusedContainerColor = Color(0xFF070B14),
+                        unfocusedContainerColor = Color(0xFF070B14)
+                    ),
+                    modifier = Modifier.weight(1f)
+                )
+
+                Spacer(modifier = Modifier.width(6.dp))
+
+                IconButton(
+                    onClick = { submitCommand() },
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (localCommandInput.isNotBlank()) ViberCyan else ViberCard)
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "Send Command",
+                        tint = if (localCommandInput.isNotBlank()) Color.Black else TextMuted,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
+
+        // Virtual Accessory Keyboard Bar (ESC, TAB, CTRL, Arrows, Font Zoom)
         VirtualKeyboardBar(
             onSendKey = onSendKey,
             onSendPrompt = onSendPrompt,
-            onZoomIn = { if (fontSizeSp < 20) fontSizeSp += 1 },
+            onZoomIn = { if (fontSizeSp < 22) fontSizeSp += 1 },
             onZoomOut = { if (fontSizeSp > 8) fontSizeSp -= 1 }
         )
+    }
+}
+
+@Composable
+private fun ActionPill(
+    label: String,
+    accentColor: Color,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(ViberCard)
+            .border(1.dp, accentColor.copy(alpha = 0.4f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+    ) {
+        TextButton(
+            onClick = onClick,
+            contentPadding = PaddingValues(0.dp),
+            modifier = Modifier.height(18.dp)
+        ) {
+            Text(
+                text = label,
+                color = accentColor,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Medium
+            )
+        }
     }
 }
