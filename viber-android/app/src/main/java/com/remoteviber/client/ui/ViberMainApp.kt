@@ -116,12 +116,16 @@ fun ViberMainApp(
                     activeSessionId = activeSessionId,
                     connectionStatus = connectionStatus,
                     terminalBuffer = terminalBuffer,
+                    chatProcessor = wsClient.chatProcessor,
+                    xtermController = wsClient.xtermController,
                     onSelectSession = { id -> wsClient.attachSession(id) },
                     onCloseSession = { id -> wsClient.deleteSession(id) },
                     onNewTerminal = { wsClient.launchTerminal() },
                     onReturnToDashboard = { activeView = "dashboard" },
-                    onSendKey = { chars -> wsClient.sendInput(chars) },
-                    onSendPrompt = { prompt -> wsClient.sendInput(prompt) }
+                    onSendKey = { chars -> wsClient.sendInput(chars, false) },
+                    onSendPrompt = { prompt -> wsClient.sendInput(prompt, true) },
+                    onSendInputBase64 = { b64 -> wsClient.sendRawInputBase64(b64) },
+                    onResizeTerminal = { rows, cols -> wsClient.resizeTerminal(rows, cols) }
                 )
             }
         }

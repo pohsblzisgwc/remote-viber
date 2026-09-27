@@ -12,8 +12,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+import com.remoteviber.client.ui.components.XtermController
+
 class ViberWebSocketClient(
-    private val terminalBuffer: TerminalBuffer
+    val terminalBuffer: TerminalBuffer,
+    val chatProcessor: AgentChatStreamProcessor = AgentChatStreamProcessor(),
+    val xtermController: XtermController = XtermController()
 ) {
     companion object {
         private const val TAG = "ViberWS"
@@ -182,6 +186,8 @@ class ViberWebSocketClient(
 
                     if (msg.optBoolean("needs_reset", false)) {
                         terminalBuffer.clear()
+                        chatProcessor.clear()
+                        xtermController.clear()
                     }
                     msg.optJSONArray("replay")?.let { replayArr ->
                         for (i in 0 until replayArr.length()) {
@@ -189,6 +195,8 @@ class ViberWebSocketClient(
                             val dataB64 = chunk.optString("data")
                             val raw = String(Base64.decode(dataB64, Base64.DEFAULT), Charsets.UTF_8)
                             terminalBuffer.append(raw)
+                            chatProcessor.appendStreamText(raw)
+                            xtermController.writeBase64(dataB64)
                         }
                     }
                 }
@@ -204,6 +212,8 @@ class ViberWebSocketClient(
                     if (dataB64.isNotEmpty()) {
                         val raw = String(Base64.decode(dataB64, Base64.DEFAULT), Charsets.UTF_8)
                         terminalBuffer.append(raw)
+                        chatProcessor.appendStreamText(raw)
+                        xtermController.writeBase64(dataB64)
                     }
                 }
             }
@@ -352,9 +362,22 @@ class ViberWebSocketClient(
         send(obj)
     }
 
-    fun sendInput(data: String) {
+    fun sendInput(data: String, isUserPrompt: Boolean = false) {
         val sessId = _activeSessionId.value ?: return
+        if (isUserPrompt && data.isNotBlank()) {
+            chatProcessor.appendUserPrompt(data.trimEnd())
+        }
         val b64 = Base64.encodeToString(data.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        val obj = JSONObject().apply {
+            put("type", "TERMINAL_INPUT")
+            put("session_id", sessId)
+            put("data", b64)
+        }
+        send(obj)
+    }
+
+    fun sendRawInputBase64(b64: String) {
+        val sessId = _activeSessionId.value ?: return
         val obj = JSONObject().apply {
             put("type", "TERMINAL_INPUT")
             put("session_id", sessId)

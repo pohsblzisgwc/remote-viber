@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=yes">
+  <title>RemoteViber 2D Terminal</title>
+  <link rel="stylesheet" href="xterm.css">
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #090d16;
+    }
+    #terminal-container {
+      width: 100%;
+      height: 100%;
+      padding: 4px;
+    }
+    /* Customize xterm scrollbar for mobile */
+    .xterm .xterm-viewport::-webkit-scrollbar {
+      width: 4px;
+    }
+    .xterm .xterm-viewport::-webkit-scrollbar-thumb {
+      background: rgba(56, 189, 248, 0.3);
+      border-radius: 2px;
+    }
+  </style>
+</head>
+<body>
+  <div id="terminal-container"></div>
+
+  <script src="xterm.js"></script>
+  <script src="addon-fit.js"></script>
+  <script>
+    let term;
+    let fitAddon;
+
+    function initTerminal(fontSize = 12) {
+      term = new Terminal({
+        cursorBlink: true,
+        cursorStyle: 'bar',
+        fontSize: fontSize,
+        lineHeight: 1.15,
+        fontFamily: "'Fira Code', Menlo, Monaco, 'Courier New', monospace",
+        theme: {
+          background: '#090d16',
+          foreground: '#e2e8f0',
+          cursor: '#38bdf8',
+          cursorAccent: '#090d16',
+          selectionBackground: 'rgba(56, 189, 248, 0.25)',
+          black: '#1e293b',
+          red: '#f43f5e',
+          green: '#10b981',
+          yellow: '#f59e0b',
+          blue: '#3b82f6',
+          magenta: '#a855f7',
+          cyan: '#06b6d4',
+          white: '#f8fafc',
+          brightBlack: '#475569',
+          brightRed: '#fb7185',
+          brightGreen: '#34d399',
+          brightYellow: '#fbbf24',
+          brightBlue: '#60a5fa',
+          brightMagenta: '#c084fc',
+          brightCyan: '#22d3ee',
+          brightWhite: '#ffffff',
+        },
+        scrollback: 10000,
+        alternateScreenScroll: true,
+        scrollOnUserInput: true,
+        allowProposedApi: true,
+      });
+
+      fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+
+      const container = document.getElementById('terminal-container');
+      term.open(container);
+      fitAddon.fit();
+
+      // Handle user key inputs and forward to Android bridge
+      term.onData((data) => {
+        if (window.AndroidBridge && window.AndroidBridge.onInput) {
+          const b64 = window.btoa(unescape(encodeURIComponent(data)));
+          window.AndroidBridge.onInput(b64);
+        }
+      });
+
+      // Handle terminal resize
+      const notifyResize = () => {
+        try {
+          fitAddon.fit();
+          if (window.AndroidBridge && window.AndroidBridge.onResize && term.rows && term.cols) {
+            window.AndroidBridge.onResize(term.rows, term.cols);
+          }
+        } catch (e) {}
+      };
+
+      window.addEventListener('resize', notifyResize);
+      setTimeout(notifyResize, 100);
+
+      if (window.AndroidBridge && window.AndroidBridge.onReady) {
+        window.AndroidBridge.onReady();
+      }
+    }
+
+    // Called from Android Kotlin to write binary / base64 output into 2D terminal
+    window.writeB64Data = function(b64) {
+      if (!term) return;
+      try {
+        const binStr = window.atob(b64);
+        const len = binStr.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+          bytes[i] = binStr.charCodeAt(i);
+        }
+        term.write(bytes);
+      } catch (e) {
+        console.error('writeB64Data error', e);
+      }
+    };
+
+    window.clearTerminal = function() {
+      if (term) term.clear();
+    };
+
+    window.setFontSize = function(size) {
+      if (term && fitAddon) {
+        term.options.fontSize = size;
+        fitAddon.fit();
+        if (window.AndroidBridge && window.AndroidBridge.onResize) {
+          window.AndroidBridge.onResize(term.rows, term.cols);
+        }
+      }
+    };
+
+    window.refit = function() {
+      if (fitAddon) {
+        try {
+          fitAddon.fit();
+          if (window.AndroidBridge && window.AndroidBridge.onResize && term) {
+            window.AndroidBridge.onResize(term.rows, term.cols);
+          }
+        } catch (e) {}
+      }
+    };
+
+    document.addEventListener('DOMContentLoaded', () => {
+      initTerminal(12);
+    });
+  </script>
+</body>
+</html>
