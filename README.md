@@ -1,3 +1,4 @@
+# 声明：项目完全由google antigravity自行生成
 # RemoteViber (⚡ 远程 Vibe Coder 智能体启动与控制矩阵)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
