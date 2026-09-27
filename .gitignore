@@ -27,3 +27,4 @@ viber-android/app/build/
 viber-android/local.properties
 viber-android/.idea/
 *.hprof
+.gitconfig
