@@ -1,7 +1,11 @@
 # RemoteViber (⚡ 远程 Vibe Coder 智能体启动与控制矩阵)
 
-> 专门为 **Vibe Coder** 设计的轻量级、超低资源消耗、端到端加密（E2EE）跨平台远程服务系统。
-> 支持在 **Android、Windows、Linux 图形化桌面** 三端直接连接与多 Agent 统一调度；Windows 与 Linux 主机作为 Agent 启动器与持久化运行装置。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Android%20%7C%20Linux%20%7C%20Windows-brightgreen.svg)](#)
+[![Security](https://img.shields.io/badge/Security-E2EE%20(ECDH%20%2B%20AES--256--GCM)-cyan.svg)](#)
+
+> 专门为 **Vibe Coder** 设计的轻量级、超低资源消耗、端到端加密（E2EE）跨平台远程控制系统。  
+> 支持在 **Android 原生、Web 浏览器、Windows、Linux 桌面** 多端直接连接与多 Agent 统一调度；Windows 与 Linux 主机作为 Agent 启动器与持久化运行装置。
 
 ---
 
@@ -14,6 +18,16 @@
 - **Agent 持久化与网络中断保护**
   - **断网不中断**：网络波动、切换 Wi-Fi/5G 或进入电梯隧道，Agent CLI 在 Host 端独立 PTY 会话中持续执行，不接收 SIGHUP/EOF。
   - **断线无缝重放**：内置环形序列缓存（Ring Buffer），重连后按序列号（`seq`）瞬间补全漏看输出，恢复精确终端视图。
+- **📱 专属 Android 原生客户端 (双模共存架构)**
+  - **100% 纯 Kotlin + Jetpack Compose 原生构建**，无 WebView 界面延迟。
+  - **模式一：Agent 智能对话与任务卡片流（默认推荐）**：
+    - **智能段落重组（Smart Paragraph Stitching）**：自动融合 PTY 80 列物理硬折行，恢复自然段落排版，杜绝碎句与奇怪换行；
+    - **TUI 边框与噪音过滤**：彻底清除 `┌─┐│└┘` 边框字符与填充空格；
+    - **工具执行折叠栏**：长指令日志（如 `git diff`、`docker build`）自动收敛折叠，告别疯狂刷屏；
+    - **单手一键审批抽屉**：检测到 `[y/N]` 或确认提示时，底部浮现大号绿色「✓ 同意执行」与红色「✗ 拒绝」按钮，触控极速决策。
+  - **模式二：离线 2D xterm.js 虚拟终端内核（随时一键切入）**：
+    - 内置打包在 assets 中的真实 2D 终端网格，完美支持 `vim`、`htop`、交互式 curses 菜单；
+    - 纯本地离线加载，0 网络依赖，支持字号无级缩放 (`A+` / `A-`)。
 - **全新交互与分级管理升级**
   - **全中文交互界面**：所有功能、状态提示、操作按钮与断网提示均采用精细化的中文原生界面。
   - **远程图形化目录选择器**：无需手动盲打路径，支持远程直接浏览目录树、面包屑导航、一键直达家目录/工作区、以及在线新建文件夹。
@@ -39,12 +53,12 @@
                                                     v
   +-------------------------------+             +-------------------------------+
   |        多端控制客户端         |             |       Host Agent 启动宿主     |
-  |  (Android / Windows / Linux)  | < - - - - > |        (Windows / Linux)      |
+  | (Android 原生 / Web / 桌面端) | < - - - - > |        (Windows / Linux)      |
   |                               |  直连模式   |                               |
-  | - 120fps 丝滑 Glassmorphism UI| (Tailscale) | - POSIX / ConPTY 会话引擎     |
-  | - Xterm.js 终端 + 手机工具栏  |   (LAN IP)  | - 环形重放缓冲 (断网保活)      |
-  | - 1-Click 配对与 Agent 抽屉   |   (E2EE)    | - 0.00% 待机 CPU / ~40MB 内存  |
-  | - WebCrypto 硬件加速解密      |             | - 预设: Claude / Aider / AGY  |
+  | - 智能对话流 / 2D xterm 双模  | (Tailscale) | - POSIX / ConPTY 会话引擎     |
+  | - 一键审批浮窗 + 乐观回显输入 |   (LAN IP)  | - 环形重放缓冲 (断网保活)      |
+  | - 1-Click 配对与多 Agent 调度 |   (E2EE)    | - 0.00% 待机 CPU / ~40MB 内存  |
+  | - WebCrypto 硬件加速解密      |             | - 预设持久化: 自定义 Agent/Shell|
   +-------------------------------+             +-------------------------------+
 ```
 
@@ -53,7 +67,7 @@
 ## 📁 代码库结构
 
 ```
-/workspace/
+.
 ├── viber-host/               # Agent 启动宿主与持久化会话服务 (Windows / Linux)
 │   ├── core/
 │   │   ├── crypto.py         # ECDH P-256 + HKDF + AES-256-GCM 核心密码模块
@@ -70,61 +84,45 @@
 │   │   └── router.py         # E2EE 会话状态机与加密指令分发
 │   └── main.py               # 宿主命令行启动入口 (终端二维码/配对凭证)
 │
+├── viber-android/            # Android 原生客户端 (Kotlin + Jetpack Compose)
+│   ├── app/
+│   │   ├── src/main/java/    # 原生 UI、双模切换、流式解析与 WebSocket 网络层
+│   │   └── src/main/assets/  # 离线 2D xterm.js 虚拟终端容器资源
+│   └── build.gradle.kts      # Android 构建配置
+│
+├── viber-client/             # 跨平台 Web / 桌面客户端 (React + Tailwind + Vite)
+│   ├── src/
+│   │   ├── components/       # 响应式玻璃拟态 UI、终端与审批组件
+│   │   ├── crypto/           # W3C WebCrypto ECDH + AES-256-GCM 模块
+│   │   └── services/         # 智能链路选择 (Tailscale -> LAN -> Relay)
+│   └── vite.config.js
+│
 ├── viber-server/             # Linux 平台公网信令与加密转发中继 (Zero-Trust)
 │   ├── registry.py           # 内存化无状态宿主注册表
 │   ├── server.py             # 异步信令协商与加密帧中继流
 │   └── main.py               # 服务端入口 (Systemd / Docker 友好)
 │
-├── viber-client/             # 跨平台高质量客户端 (Android / Windows / Linux GUI)
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── TopBar.jsx            # 顶部状态栏 (Tailscale/LAN/Relay 指示器/Ping/加密徽章)
-│   │   │   ├── Dashboard.jsx         # 主控制矩阵 (资源面板 + 1-Click 卡片 + 会话列表)
-│   │   │   ├── AgentCard.jsx         # 带有动态悬浮光晕的 1-Click 启动卡片
-│   │   │   ├── RunningAgentsGrid.jsx # 运行中 Agent 矩阵 (动态状态/输入等待脉冲)
-│   │   │   ├── TerminalView.jsx      # Xterm.js 终端、自动重连与断网通知横幅
-│   │   │   ├── MobileToolbar.jsx     # Android 专属触控工具栏与提示词发送器
-│   │   │   ├── SessionTabs.jsx       # 多 Agent 标签栏平滑切换
-│   │   │   ├── LaunchModal.jsx       # 1-Click 参数配置与自定义 Agent 弹窗
-│   │   │   ├── PairingModal.jsx      # 1-Click 二维码/配对字符一键导入
-│   │   │   └── SystemMonitor.jsx     # 宿主资源监视小部件
-│   │   ├── crypto/
-│   │   │   └── e2ee.js               # W3C WebCrypto ECDH + AES-256-GCM 模块
-│   │   ├── services/
-│   │   │   └── viber_connection.js   # 智能链路选择 (Tailscale -> LAN -> Relay)
-│   │   ├── styles/
-│   │   │   └── index.css             # Glassmorphism、暗黑微光与平滑动画
-│   │   ├── App.jsx                   # 主应用控制器
-│   │   └── main.jsx
-│   ├── desktop/
-│   │   └── runner.py                 # Windows & Linux 轻量级原生窗口启动器 (免重型 Electron)
-│   ├── android/
-│   │   ├── AndroidManifest.xml       # Android 硬件加速、防键盘遮挡与 deep-link 配置
-│   │   └── capacitor.config.json     # APK 构建打包配置
-│   ├── public/
-│   │   └── manifest.json             # PWA 独立窗口安装清单
-│   └── dist/                         # 预先构建完成的极速生产环境静态包
-│
-├── scripts/
-│   ├── run_host_daemon.sh            # 启动宿主守护进程 (Linux)
-│   ├── run_windows_desktop.bat       # 启动 Windows 客户端与宿主 (Windows)
-│   ├── run_linux_desktop.sh          # 启动 Linux 图形化客户端 (Linux GUI)
-│   ├── run_relay_server.sh           # 启动 Linux 中继信令服务端
-│   └── test_e2e.py                   # 完整端到端自动化测试套件
+├── scripts/                  # 快捷启动脚本与 E2E 自动化测试
+│   ├── run_host_daemon.sh    # 启动宿主守护进程 (Linux)
+│   ├── run_windows_desktop.bat # 启动 Windows 客户端与宿主 (Windows)
+│   ├── run_linux_desktop.sh  # 启动 Linux 图形化客户端 (Linux GUI)
+│   ├── run_relay_server.sh   # 启动 Linux 中继信令服务端
+│   └── test_e2e.py           # 完整端到端自动化测试套件
+├── LICENSE                   # MIT 开源协议
 └── README.md
 ```
 
 ---
 
-## 🚀 极速上手体验
+## 🚀 极速上手指南
 
-### 1. 运行完整端到端测试（已内置验证）
+### 1. 运行完整端到端自动化测试
 验证宿主启动、中继握手、PTY 执行、断线重连重放与 E2EE 加密：
 ```bash
 python3 scripts/test_e2e.py
 ```
 
-### 2. 启动 Windows / Linux 宿主 (Agent Launcher Host)
+### 2. 启动宿主守护服务 (Agent Host)
 在拥有 GPU 或主力代码库的电脑上启动：
 ```bash
 # Linux
@@ -155,37 +153,47 @@ python viber-host/main.py
 
 ---
 
-## 📱 客户端使用方式 (三端全覆盖)
+## 📱 客户端接入方式
 
-### 方案 A：Android 手机 / 平板客户端
-1. **直接直连（首选 Tailscale）**：
-   - 手机浏览器（Chrome / Edge / Firefox）打开 `http://100.86.12.34:8765`（或局域网 IP）。
-   - 首次连接输入终端提示的 `Pairing Secret` 即可建立永久安全配对。
-   - 点击浏览器菜单 **“添加到主屏幕” (Add to Home screen)**，即变身为全屏独立的 Native 风格应用。
-2. **专属触控体验**：
-   - 屏幕底端悬浮触控辅助条：`ESC`、`TAB`、`CTRL`、`^C`、方向键触手可及。
-   - 点击底栏 `Prompt` 唤出提示词抽屉，长文本、多行指令与系统级输入法随心打字，一键发送给 Agent。
+### 方案 A：Android 原生客户端 (推荐)
+1. **安装 APK**：
+   - 可以在启动宿主后，手机直接浏览器访问 `http://<Host-IP>:8765/remote-viber.apk` 下载安装；
+   - 或使用 Android Studio / Gradle 编译 `viber-android/` 项目。
+2. **连接体验**：
+   - 扫码或粘贴 `viber://connect?...` 一键完成配对；
+   - **智能对话流**：默认排版整洁、文字连贯，底部提供单手审批大按钮；
+   - **2D 终端内核**：点击顶部「2D 终端」无缝切入底层 xterm 视图。
 
-### 方案 B：Windows 客户端
-- 双击运行根目录下或者 `scripts/run_windows_desktop.bat`。
-- 将自动以后台模式拉起 Host Daemon，并以独立无边框应用窗口呈现，内存极低，界面动画保持 120fps 满帧运行。
+### 方案 B：浏览器 Web 直连 (PWA)
+1. 手机或平板浏览器（Chrome / Safari / Edge）直接打开 `http://100.x.y.z:8765`。
+2. 输入配对码即可使用，点击浏览器菜单「添加到主屏幕」即可作为独立应用使用。
 
-### 方案 C：图形化 Linux 客户端
-- 执行 `./scripts/run_linux_desktop.sh` 即可启动图形化窗口。
+### 方案 C：桌面客户端 (Windows / Linux)
+- Windows：运行 `scripts/run_windows_desktop.bat`。
+- Linux：运行 `./scripts/run_linux_desktop.sh`。
 
 ---
 
-## 🌐 独立 Linux 服务端（可选信令与中继）
+## 🛠️ 从源码构建
 
-若不在 Tailscale 虚拟网内，且宿主处于无公网 IP 的复杂对称 NAT 下，可在任意 Linux VPS 上运行：
+### 1. 构建 Web 客户端
 ```bash
-./scripts/run_relay_server.sh --port 8766
+cd viber-client
+npm install
+npm run build
 ```
-启动宿主时加上中继参数即可：
+
+### 2. 构建 Android APK
 ```bash
-python3 viber-host/main.py --relay ws://your-vps-ip:8766
+cd viber-android
+./gradlew assembleRelease # 或 assembleDebug
 ```
-此时手机客户端在公网输入该中继地址，即可在双向 E2EE 加密保护下穿透访问家中的 Agent 宿主。中继仅做零知识二进制数据包转发。
+产物位于 `viber-android/app/build/outputs/apk/`。
+
+### 3. 打包 Linux 独立单文件宿主
+```bash
+pyinstaller viber-host-linux-x86_64.spec --noconfirm
+```
 
 ---
 
@@ -198,3 +206,10 @@ python3 viber-host/main.py --relay ws://your-vps-ip:8766
 | **加密强度** | **NIST P-256 + AES-256-GCM** | 具备防篡改鉴权标签（AEAD），完全杜绝中间人劫持 |
 | **断网会话留存率** | **100%** | 网络断开时 PTY 进程零受阻，恢复连接即秒级重放补全 |
 | **客户端帧率** | **60 / 120 FPS** | CSS GPU 加速合成与 Xterm Canvas 渲染引擎 |
+
+---
+
+## 📄 开源许可协议 (License)
+
+本项目采用 **[MIT 许可证](LICENSE)** 开源。  
+所有直接或间接引用的第三方开源库（如 React、xterm.js、OkHttp、Jetpack Compose、cryptography、websockets 等）均属于极其宽松的开源协议（MIT、Apache-2.0、BSD-3-Clause），允许商业与个人自由使用、修改和分发。

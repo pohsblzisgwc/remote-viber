@@ -1,0 +1,10 @@
+{
+  "host_id": "host-example",
+  "host_name": "MyDevMachine",
+  "direct_port": 8765,
+  "direct_bind": null,
+  "allow_lan": true,
+  "relay_url": "",
+  "pairing_secret": "EXAMPLE_SECRET_DO_NOT_USE",
+  "private_key_b64": ""
+}

@@ -1,0 +1,20 @@
+[
+  {
+    "id": "preset-claude",
+    "name": "Claude Code",
+    "category": "agent",
+    "command": "claude",
+    "default_cwd": "/workspace",
+    "gradient": "from-amber-600 via-orange-600 to-red-700",
+    "icon": "bot"
+  },
+  {
+    "id": "preset-terminal",
+    "name": "Bash 终端",
+    "category": "system",
+    "command": "bash -l",
+    "default_cwd": "/workspace",
+    "gradient": "from-slate-700 to-slate-900",
+    "icon": "terminal"
+  }
+]
