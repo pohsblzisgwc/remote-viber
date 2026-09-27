@@ -1,0 +1,449 @@
+import React, { useState, useEffect, useRef } from 'react';
+import TopBar from './components/TopBar';
+import Dashboard from './components/Dashboard';
+import TerminalView from './components/TerminalView';
+import SessionTabs from './components/SessionTabs';
+import LaunchModal from './components/LaunchModal';
+import PairingModal from './components/PairingModal';
+import { ViberConnection } from './services/viber_connection';
+
+const DEFAULT_CONFIG_KEY = 'viber_host_config';
+
+export default function App() {
+  const [hostConfig, setHostConfig] = useState(() => {
+    // 1. Check server-injected active configuration (zero-latency auto-pairing over Tailscale & Localhost)
+    if (typeof window !== 'undefined' && window.__VIBER_PRELOAD__ && window.__VIBER_PRELOAD__.token) {
+      const p = window.__VIBER_PRELOAD__;
+      const cfg = {
+        hostId: p.hostId || 'host-devbox',
+        hostName: p.hostName || '目标开发主机',
+        directPort: p.directPort || 8765,
+        tailscaleIps: p.tailscaleIps || [],
+        lanIps: p.lanIps || ['127.0.0.1'],
+        token: p.token,
+        relayUrl: p.relayUrl || '',
+      };
+      try { localStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(cfg)); } catch (e) {}
+      return cfg;
+    }
+
+    try {
+      const saved = localStorage.getItem(DEFAULT_CONFIG_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+
+    // Default fallback to local / current host
+    const isBrowser = typeof window !== 'undefined';
+    const host = isBrowser ? window.location.hostname : '127.0.0.1';
+    return {
+      hostId: 'host-devbox',
+      hostName: '目标开发主机',
+      directPort: 8765,
+      tailscaleIps: host.startsWith('100.') ? [host] : [],
+      lanIps: [host || '127.0.0.1'],
+      token: '',
+      relayUrl: '',
+    };
+  });
+
+  const [activeView, setActiveView] = useState('dashboard'); // 'dashboard' | 'terminal'
+  const [connectionState, setConnectionState] = useState('disconnected');
+  const [connectionMode, setConnectionMode] = useState('unknown');
+  const [pingMs, setPingMs] = useState(0);
+
+  const [systemStats, setSystemStats] = useState(null);
+  const [profiles, setProfiles] = useState([]);
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState(null);
+
+  const [isLaunchModalOpen, setIsLaunchModalOpen] = useState(false);
+  const [isPairingModalOpen, setIsPairingModalOpen] = useState(false);
+  const [selectedProfileForLaunch, setSelectedProfileForLaunch] = useState(null);
+  const [targetFolderForLaunch, setTargetFolderForLaunch] = useState('');
+
+  const connectionRef = useRef(null);
+
+  // Auto-discover pairing config if opened directly in browser from the host
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    // 1. Check URL parameters: ?token=xxx&hostId=xxx
+    const params = new URLSearchParams(window.location.search);
+    const urlToken = params.get('token');
+    const urlHostId = params.get('hostId') || params.get('host_id');
+
+    if (urlToken) {
+      setHostConfig((prev) => {
+        const next = { ...prev, token: urlToken };
+        if (urlHostId) next.hostId = urlHostId;
+        try { localStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(next)); } catch (e) {}
+        return next;
+      });
+      return;
+    }
+
+    // 2. Fetch /api/pairing to verify or refresh active credentials
+    fetch('/api/pairing')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data && data.token) {
+          setHostConfig((prev) => {
+            // Only update if token actually changed
+            if (prev.token === data.token) return prev;
+            const next = {
+              ...prev,
+              hostId: data.id || prev.hostId,
+              hostName: data.name || prev.hostName,
+              token: data.token,
+              tailscaleIps: data.tailscale && data.tailscale.length > 0 ? data.tailscale : prev.tailscaleIps,
+              lanIps: data.lan && data.lan.length > 0 ? data.lan : prev.lanIps,
+              directPort: data.port || prev.directPort || 8765,
+            };
+            try { localStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(next)); } catch (e) {}
+            return next;
+          });
+        } else if (!hostConfig.token) {
+          // No token auto-discovered and local config has none -> open pairing dialog
+          setIsPairingModalOpen(true);
+        }
+      })
+      .catch(() => {
+        if (!hostConfig.token) {
+          setIsPairingModalOpen(true);
+        }
+      });
+  }, []);
+
+  // Initialize or re-create connection when hostConfig changes
+  useEffect(() => {
+    if (connectionRef.current) {
+      connectionRef.current.disconnect();
+    }
+
+    const conn = new ViberConnection(hostConfig);
+    connectionRef.current = conn;
+
+    conn.on('status_change', ({ status, mode }) => {
+      setConnectionState(status);
+      setConnectionMode(mode);
+    });
+
+    conn.on('ready', ({ hostPub, fingerprint, token }) => {
+      if (token && token !== hostConfig.token) {
+        setHostConfig((prev) => {
+          const next = { ...prev, token };
+          try { localStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(next)); } catch (e) {}
+          return next;
+        });
+      }
+    });
+
+    conn.on('error', (err) => {
+      console.warn('RemoteViber Connection Error:', err);
+      if (typeof err === 'string' && (err.includes('token') || err.includes('Authentication') || err.includes('Handshake'))) {
+        setIsPairingModalOpen(true);
+      }
+    });
+
+    conn.on('ping', (ms) => {
+      setPingMs(ms);
+    });
+
+    conn.on('stats', (data) => {
+      setSystemStats(data);
+      if (data.sessions) {
+        setSessions(data.sessions);
+      }
+    });
+
+    conn.on('profiles', (profs) => {
+      setProfiles(profs);
+    });
+
+    conn.on('agent_error', (errMsg) => {
+      console.error('RemoteViber Agent Error:', errMsg);
+      alert(`启动失败: ${errMsg}`);
+    });
+
+    conn.on('agent_launched', (newSession) => {
+      setSessions((prev) => {
+        const filtered = prev.filter((s) => s.session_id !== newSession.session_id);
+        return [...filtered, newSession];
+      });
+      setActiveSessionId(newSession.session_id);
+      setActiveView('terminal');
+    });
+
+    conn.on('agent_terminated', ({ session_id }) => {
+      setSessions((prev) =>
+        prev.map((s) => (s.session_id === session_id ? { ...s, status: 'stopped' } : s))
+      );
+    });
+
+    conn.on('session_deleted', ({ session_id }) => {
+      setSessions((prev) => prev.filter((s) => s.session_id !== session_id));
+      setActiveSessionId((curr) => {
+        if (curr === session_id) {
+          return null;
+        }
+        return curr;
+      });
+    });
+
+    conn.on('session_restarted', (newSession) => {
+      setSessions((prev) => {
+        const filtered = prev.filter((s) => s.session_id !== newSession.session_id);
+        return [...filtered, newSession];
+      });
+      setActiveSessionId(newSession.session_id);
+      setActiveView('terminal');
+    });
+
+    conn.on('session_folder_updated', ({ session_id, folder }) => {
+      setSessions((prev) =>
+        prev.map((s) => (s.session_id === session_id ? { ...s, folder } : s))
+      );
+    });
+
+    conn.connect();
+
+    return () => {
+      conn.disconnect();
+    };
+  }, [hostConfig]);
+
+  // Periodic stats polling when connected
+  useEffect(() => {
+    if (connectionState !== 'connected') return;
+
+    const interval = setInterval(() => {
+      if (connectionRef.current) {
+        connectionRef.current.getStats();
+      }
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [connectionState]);
+
+  // Handle 1-click launch from card
+  const handleQuickLaunch = (profile) => {
+    if (connectionRef.current) {
+      connectionRef.current.launchAgent({
+        profile_id: profile.id,
+        name: profile.name,
+        cwd: profile.default_cwd || '',
+      });
+    }
+  };
+
+  // Direct Quick Terminal without needing an agent
+  const handleQuickTerminal = (cwd = '', folder = '') => {
+    if (connectionRef.current) {
+      connectionRef.current.launchTerminal({
+        cwd: cwd || '',
+        folder: folder,
+      });
+    }
+  };
+
+  // Handle customized launch
+  const handleConfigureLaunch = (config) => {
+    if (config?.default_cwd || config?.folder) {
+      setSelectedProfileForLaunch(null);
+      setTargetFolderForLaunch(config.folder || '');
+    } else {
+      setSelectedProfileForLaunch(config);
+      setTargetFolderForLaunch('');
+    }
+    setIsLaunchModalOpen(true);
+  };
+
+  const handleExecuteLaunch = (options) => {
+    if (connectionRef.current) {
+      connectionRef.current.launchAgent(options);
+    }
+  };
+
+  const handleSaveProfile = (profile) => {
+    if (connectionRef.current) {
+      connectionRef.current.saveProfile(profile);
+    }
+  };
+
+  const handleDeleteProfile = (profileId) => {
+    if (connectionRef.current) {
+      connectionRef.current.deleteProfile(profileId);
+    }
+  };
+
+  const handleUpdateSessionFolder = (sessionId, folder) => {
+    if (connectionRef.current) {
+      connectionRef.current.updateSessionFolder(sessionId, folder);
+      setSessions((prev) =>
+        prev.map((s) => (s.session_id === sessionId ? { ...s, folder } : s))
+      );
+    }
+  };
+
+  // Session switching
+  const handleAttachSession = (sessionId) => {
+    setActiveSessionId(sessionId);
+    setActiveView('terminal');
+  };
+
+  const handleTerminateSession = (sessionId) => {
+    if (connectionRef.current) {
+      connectionRef.current.terminateAgent(sessionId);
+    }
+    setSessions((prev) =>
+      prev.map((s) => (s.session_id === sessionId ? { ...s, status: 'stopped' } : s))
+    );
+  };
+
+  const handleDeleteSession = (sessionId) => {
+    if (connectionRef.current) {
+      connectionRef.current.deleteSession(sessionId);
+    }
+    setSessions((prev) => {
+      const next = prev.filter((s) => s.session_id !== sessionId);
+      if (activeSessionId === sessionId) {
+        if (next.length > 0) {
+          setActiveSessionId(next[0].session_id);
+        } else {
+          setActiveSessionId(null);
+          setActiveView('dashboard');
+        }
+      }
+      return next;
+    });
+  };
+
+  const handleRestartSession = (sessionId) => {
+    if (connectionRef.current) {
+      connectionRef.current.restartSession(sessionId);
+    }
+  };
+
+  const handleCloseTab = (session) => {
+    const sessionId = typeof session === 'object' ? session.session_id : session;
+    const sess = sessions.find((s) => s.session_id === sessionId);
+    if (!sess || sess.status === 'stopped') {
+      handleDeleteSession(sessionId);
+    } else {
+      if (window.confirm(`确定要关闭并终止终端【${sess.name}】吗？`)) {
+        handleTerminateSession(sessionId);
+        handleDeleteSession(sessionId);
+      }
+    }
+  };
+
+  const handleSaveConfig = (newConfig) => {
+    setHostConfig(newConfig);
+    try {
+      localStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(newConfig));
+    } catch (e) {}
+  };
+
+  const activeSession = sessions.find((s) => s.session_id === activeSessionId) || sessions[0];
+
+  return (
+    <div className="h-[100dvh] min-h-[100dvh] w-full flex flex-col bg-[#090d16] text-slate-100 overflow-hidden font-sans">
+      {/* Universal TopBar */}
+      <TopBar
+        connectionState={connectionState}
+        connectionMode={connectionMode}
+        pingMs={pingMs}
+        activeView={activeView}
+        setActiveView={setActiveView}
+        onOpenLaunchModal={() => {
+          setSelectedProfileForLaunch(null);
+          setTargetFolderForLaunch('');
+          setIsLaunchModalOpen(true);
+        }}
+        onQuickTerminal={() => handleQuickTerminal()}
+        onOpenPairingModal={() => setIsPairingModalOpen(true)}
+        hostConfig={hostConfig}
+        systemStats={systemStats}
+        activeSessionsCount={sessions.filter((s) => s.status !== 'stopped').length}
+      />
+
+      {/* Main View Area */}
+      <main className="flex-1 flex flex-col overflow-hidden relative">
+        {activeView === 'dashboard' ? (
+          <Dashboard
+            profiles={profiles}
+            sessions={sessions}
+            systemStats={systemStats}
+            connectionState={connectionState}
+            onQuickLaunch={handleQuickLaunch}
+            onConfigureLaunch={handleConfigureLaunch}
+            onQuickTerminal={handleQuickTerminal}
+            onAttachSession={handleAttachSession}
+            onTerminateSession={handleTerminateSession}
+            onRestartSession={handleRestartSession}
+            onDeleteSession={handleDeleteSession}
+            onUpdateSessionFolder={handleUpdateSessionFolder}
+            onOpenNewProfileModal={() => {
+              setSelectedProfileForLaunch(null);
+              setTargetFolderForLaunch('');
+              setIsLaunchModalOpen(true);
+            }}
+            onDeleteProfile={handleDeleteProfile}
+            onRefresh={() => {
+              if (connectionRef.current) {
+                connectionRef.current.getStats();
+                connectionRef.current.listProfiles();
+              }
+            }}
+          />
+        ) : (
+          <div className="flex-1 flex flex-col overflow-hidden relative">
+            <SessionTabs
+              sessions={sessions}
+              activeSessionId={activeSessionId || activeSession?.session_id}
+              onSelectSession={(id) => {
+                setActiveSessionId(id);
+                setActiveView('terminal');
+              }}
+              onCloseSession={handleCloseTab}
+              onNewSession={() => handleQuickTerminal()}
+              onSwitchToDashboard={() => setActiveView('dashboard')}
+              onRestartSession={handleRestartSession}
+              onTerminateSession={handleTerminateSession}
+              onDeleteSession={handleDeleteSession}
+            />
+            <TerminalView
+              connection={connectionRef.current}
+              activeSession={activeSession}
+              connectionState={connectionState}
+              onSwitchToDashboard={() => setActiveView('dashboard')}
+              onTerminateSession={handleTerminateSession}
+              onRestartSession={handleRestartSession}
+              onDeleteSession={handleDeleteSession}
+            />
+          </div>
+        )}
+      </main>
+
+      {/* Modals */}
+      <LaunchModal
+        isOpen={isLaunchModalOpen}
+        onClose={() => setIsLaunchModalOpen(false)}
+        profiles={profiles}
+        onLaunch={handleExecuteLaunch}
+        onSaveProfile={handleSaveProfile}
+        onDeleteProfile={handleDeleteProfile}
+        initialProfile={selectedProfileForLaunch}
+        defaultFolder={targetFolderForLaunch}
+        connection={connectionRef.current}
+      />
+
+      <PairingModal
+        isOpen={isPairingModalOpen}
+        onClose={() => setIsPairingModalOpen(false)}
+        currentConfig={hostConfig}
+        onSaveConfig={handleSaveConfig}
+      />
+    </div>
+  );
+}

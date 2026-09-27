@@ -1,0 +1,14 @@
+{
+  "appId": "com.viber.remote",
+  "appName": "RemoteViber",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https",
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": true
+  }
+}
