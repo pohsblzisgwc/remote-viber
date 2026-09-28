@@ -141,6 +141,23 @@ static BOOL FindBrowserEngine(wchar_t *outPath, size_t maxLen) {
     return FALSE;
 }
 
+static HANDLE g_hJob = NULL;
+
+static void SetupJobObject(HANDLE hProcess) {
+    if (!g_hJob) {
+        g_hJob = CreateJobObjectW(NULL, NULL);
+        if (g_hJob) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+            ZeroMemory(&jeli, sizeof(jeli));
+            jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(g_hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+        }
+    }
+    if (g_hJob && hProcess) {
+        AssignProcessToJobObject(g_hJob, hProcess);
+    }
+}
+
 /* Asynchronously spawn local host service if needed */
 static BOOL SpawnLocalHost(WinAppState *state) {
     wchar_t exeCandidates[2][MAX_PATH];
@@ -160,6 +177,7 @@ static BOOL SpawnLocalHost(WinAppState *state) {
 
             if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
                 state->hHostProcess = pi.hProcess;
+                SetupJobObject(pi.hProcess);
                 CloseHandle(pi.hThread);
                 return TRUE;
             }
@@ -169,7 +187,7 @@ static BOOL SpawnLocalHost(WinAppState *state) {
     return FALSE;
 }
 
-/* Launch standalone desktop window */
+/* Launch standalone desktop window and wait for completion to clean up background host */
 static BOOL LaunchDesktopWindow(WinAppState *state) {
     wchar_t browserPath[MAX_PATH] = {0};
     if (FindBrowserEngine(browserPath, MAX_PATH)) {
@@ -194,13 +212,28 @@ static BOOL LaunchDesktopWindow(WinAppState *state) {
         SHELLEXECUTEINFOW sei;
         ZeroMemory(&sei, sizeof(sei));
         sei.cbSize = sizeof(sei);
-        sei.fMask = SEE_MASK_DOENVSUBST;
+        sei.fMask = SEE_MASK_DOENVSUBST | SEE_MASK_NOCLOSEPROCESS;
         sei.lpVerb = L"open";
         sei.lpFile = browserPath;
         sei.lpParameters = args;
         sei.nShow = SW_SHOWNORMAL;
 
-        return ShellExecuteExW(&sei);
+        if (ShellExecuteExW(&sei)) {
+            if (sei.hProcess) {
+                WaitForSingleObject(sei.hProcess, INFINITE);
+                CloseHandle(sei.hProcess);
+            }
+            if (state->hHostProcess) {
+                TerminateProcess(state->hHostProcess, 0);
+                CloseHandle(state->hHostProcess);
+                state->hHostProcess = NULL;
+            }
+            if (g_hJob) {
+                CloseHandle(g_hJob);
+                g_hJob = NULL;
+            }
+            return TRUE;
+        }
     }
 
     /* Fallback: default web browser */
