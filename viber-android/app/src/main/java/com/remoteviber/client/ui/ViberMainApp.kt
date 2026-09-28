@@ -32,6 +32,8 @@ fun ViberMainApp(
     val sessions by wsClient.sessions.collectAsState()
     val profiles by wsClient.profiles.collectAsState()
     val activeSessionId by wsClient.activeSessionId.collectAsState()
+    val isHistoryTruncated by wsClient.isHistoryTruncated.collectAsState()
+    val syncFullHistory by wsClient.syncFullHistory.collectAsState()
 
     var activeView by remember { mutableStateOf("dashboard") }
     var isLaunchSheetOpen by remember { mutableStateOf(false) }
@@ -118,6 +120,10 @@ fun ViberMainApp(
                     terminalBuffer = terminalBuffer,
                     chatProcessor = wsClient.chatProcessor,
                     xtermController = wsClient.xtermController,
+                    isHistoryTruncated = isHistoryTruncated,
+                    syncFullHistory = syncFullHistory,
+                    onToggleSyncFullHistory = { wsClient.toggleSyncFullHistory() },
+                    onLoadFullHistory = { wsClient.loadFullHistoryNow() },
                     onSelectSession = { id -> wsClient.attachSession(id) },
                     onCloseSession = { id -> wsClient.deleteSession(id) },
                     onNewTerminal = { wsClient.launchTerminal() },

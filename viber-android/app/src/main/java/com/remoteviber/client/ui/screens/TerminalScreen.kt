@@ -54,6 +54,10 @@ fun TerminalScreen(
     terminalBuffer: TerminalBuffer,
     chatProcessor: AgentChatStreamProcessor,
     xtermController: XtermController,
+    isHistoryTruncated: Boolean = false,
+    syncFullHistory: Boolean = false,
+    onToggleSyncFullHistory: () -> Unit = {},
+    onLoadFullHistory: () -> Unit = {},
     onSelectSession: (String) -> Unit,
     onCloseSession: (String) -> Unit,
     onNewTerminal: () -> Unit,
@@ -276,6 +280,48 @@ fun TerminalScreen(
                     )
                     Spacer(modifier = Modifier.width(2.dp))
                     Text(text = "清屏", color = TextMuted, fontSize = 10.sp)
+                }
+
+                Spacer(modifier = Modifier.width(4.dp))
+
+                // Full history sync strategy toggle
+                TextButton(
+                    onClick = onToggleSyncFullHistory,
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                    modifier = Modifier.height(24.dp)
+                ) {
+                    Text(
+                        text = if (syncFullHistory) "📜 完整" else "📜 截断",
+                        color = if (syncFullHistory) ViberEmerald else TextMuted,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+
+        // Truncated History Notice & On-Demand Full Load Banner
+        if (isHistoryTruncated && !syncFullHistory) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF2E1B00))
+                    .border(width = 0.5.dp, color = Color(0xFFD97706))
+                    .padding(horizontal = 10.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "⚡ 历史已默认截断以加速秒开",
+                    color = Color(0xFFFFB74D),
+                    fontSize = 10.sp
+                )
+                TextButton(
+                    onClick = onLoadFullHistory,
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                    modifier = Modifier.height(22.dp)
+                ) {
+                    Text("📥 加载全部历史", color = Color(0xFFFFD54F), fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 }
             }
         }

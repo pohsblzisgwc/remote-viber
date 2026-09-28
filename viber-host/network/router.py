@@ -147,9 +147,10 @@ class ClientConnectionState:
             await self.send_encrypted({"type": "SESSION_FOLDER_UPDATED", "session_id": sid, "folder": folder, "success": ok})
         elif kind == "ATTACH_SESSION":
             last_seq = msg.get("last_seq", 0)
+            full_history = bool(msg.get("full_history", False))
             if type(last_seq) is not int or last_seq < 0:
                 raise ProtocolError("Invalid replay position")
-            await self._attach_session(msg.get("session_id"), last_seq)
+            await self._attach_session(msg.get("session_id"), last_seq, full_history=full_history)
         elif kind == "DETACH_SESSION":
             self._detach_session()
             await self.send_encrypted({"type": "DETACHED"})
@@ -181,11 +182,11 @@ class ClientConnectionState:
         elif kind == "RESTART_SESSION":
             session = self.agent_manager.restart_session(msg.get("session_id"))
             await self.send_encrypted({"type": "SESSION_RESTARTED", "session": session.to_dict()} if session else
-                                      {"type": "AGENT_ERROR", "error": "Session not found"})
+                                       {"type": "AGENT_ERROR", "error": "Session not found"})
         else:
             raise ProtocolError("Unknown application message")
 
-    async def _attach_session(self, session_id, last_seq):
+    async def _attach_session(self, session_id, last_seq, full_history: bool = False):
         session = self.agent_manager.get_session(session_id)
         if not session:
             await self.send_encrypted({"type": "AGENT_ERROR", "error": "Session not found"})
@@ -194,7 +195,11 @@ class ClientConnectionState:
         self.attached_session_id = session_id
         self._replaying = True
         session.subscribe(self._on_terminal_output)
-        needs_reset, chunks, snapshot_seq = session.buffer.snapshot_since(last_seq)
+        max_bytes = None if full_history else 64 * 1024
+        try:
+            needs_reset, chunks, snapshot_seq = session.buffer.snapshot_since(last_seq, max_replay_bytes=max_bytes)
+        except TypeError:
+            needs_reset, chunks, snapshot_seq = session.buffer.snapshot_since(last_seq)
         start_seq = chunks[0][0] - 1 if chunks else snapshot_seq
         with self._output_lock:
             # Output callbacks can race the replay snapshot on Windows PTY threads.
@@ -203,9 +208,14 @@ class ClientConnectionState:
             self._outbox = collections.deque(item for item in self._outbox if item[1] > snapshot_seq)
             self._outbox_bytes = sum(len(item[2]) for item in self._outbox)
         try:
+            total_buffer_chunks = getattr(session.buffer, "chunks", None)
+            total_chunk_count = len(total_buffer_chunks) if total_buffer_chunks else len(chunks)
+            is_truncated = not full_history and len(chunks) < total_chunk_count
+
             # Stream bounded frames instead of a multi-megabyte JSON snapshot.
             await self.send_encrypted({"type": "SESSION_ATTACHED", "session": session.to_dict(),
-                                       "needs_reset": needs_reset, "replay": [], "current_seq": start_seq})
+                                       "needs_reset": needs_reset, "replay": [], "current_seq": start_seq,
+                                       "is_truncated": is_truncated, "full_history": full_history})
             for seq, data in chunks:
                 if len(data) > 256 * 1024:
                     raise ProtocolError("Replay chunk limit exceeded")

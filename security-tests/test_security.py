@@ -431,6 +431,47 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         messages=[client.session.decrypt_json(frame) for frame in self.raw[start:]]
         self.assertEqual([m['seq'] for m in messages if m['type']=='TERMINAL_OUTPUT'],[1,2])
 
+    async def test_attach_session_default_truncation(self):
+        client = await self.authenticate()
+        state = self.state
+        from core.session import TerminalRingBuffer
+        class RealBufferSession:
+            def __init__(self):
+                self.buffer = TerminalRingBuffer(max_bytes=1024*1024)
+                self.callback = None
+            def subscribe(self, callback): self.callback = callback
+            def unsubscribe(self, callback): self.callback = None
+            def to_dict(self): return {'session_id':'s_trunc'}
+        session = RealBufferSession()
+        # Add 20 chunks of 10 KB each (total ~200 KiB > default truncated limit of 64 KiB)
+        for i in range(20):
+            session.buffer.append(f"chunk_{i:02d}_".encode() * 1000)
+        self.manager.get_session = lambda sid: session if sid == 's_trunc' else None
+
+        # 1. Default attach (full_history=False)
+        start = len(self.raw)
+        await state.handle_raw_message(json.dumps(client.session.encrypt_json({'type': 'ATTACH_SESSION', 'session_id': 's_trunc', 'last_seq': 0})))
+        await asyncio.sleep(0.01)
+        messages = [client.session.decrypt_json(frame) for frame in self.raw[start:]]
+        attached = next(m for m in messages if m['type'] == 'SESSION_ATTACHED')
+        self.assertTrue(attached.get('is_truncated'))
+        self.assertFalse(attached.get('full_history'))
+        replayed_chunks = [m for m in messages if m['type'] == 'TERMINAL_OUTPUT']
+        self.assertLess(len(replayed_chunks), 20)
+        self.assertGreater(len(replayed_chunks), 0)
+
+        # 2. Explicit full_history=True attach
+        start = len(self.raw)
+        await state.handle_raw_message(json.dumps(client.session.encrypt_json({'type': 'ATTACH_SESSION', 'session_id': 's_trunc', 'last_seq': 0, 'full_history': True})))
+        await asyncio.sleep(0.01)
+        messages = [client.session.decrypt_json(frame) for frame in self.raw[start:]]
+        attached_full = next(m for m in messages if m['type'] == 'SESSION_ATTACHED')
+        self.assertFalse(attached_full.get('is_truncated'))
+        self.assertTrue(attached_full.get('full_history'))
+        replayed_chunks_full = [m for m in messages if m['type'] == 'TERMINAL_OUTPUT']
+        self.assertEqual(len(replayed_chunks_full), 20)
+
+
 class DirectIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp=tempfile.TemporaryDirectory(); self.config=HostConfig(self.temp.name); self.config.direct_port=0

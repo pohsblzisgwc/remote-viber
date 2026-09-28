@@ -62,6 +62,28 @@ class ViberWebSocketClient(
     private val _activeSessionId = MutableStateFlow<String?>(null)
     val activeSessionId: StateFlow<String?> = _activeSessionId.asStateFlow()
 
+    private val _isHistoryTruncated = MutableStateFlow(false)
+    val isHistoryTruncated: StateFlow<Boolean> = _isHistoryTruncated.asStateFlow()
+
+    private val _syncFullHistory = MutableStateFlow(false)
+    val syncFullHistory: StateFlow<Boolean> = _syncFullHistory.asStateFlow()
+
+    fun toggleSyncFullHistory() {
+        val next = !_syncFullHistory.value
+        _syncFullHistory.value = next
+        _activeSessionId.value?.let { sessId ->
+            if (next) {
+                attachSession(sessId, 0L, true)
+            }
+        }
+    }
+
+    fun loadFullHistoryNow() {
+        _activeSessionId.value?.let { sessId ->
+            attachSession(sessId, 0L, true)
+        }
+    }
+
     private var lastReceivedSeq = 0L
     private var candidateIndex = 0
 
@@ -300,6 +322,7 @@ class ViberWebSocketClient(
                     val sess = AgentSession.fromJsonObject(sessJson)
                     _activeSessionId.value = sess.sessionId
                     lastReceivedSeq = msg.optLong("current_seq", 0L)
+                    _isHistoryTruncated.value = msg.optBoolean("is_truncated", false)
 
                     if (msg.optBoolean("needs_reset", false)) {
                         terminalBuffer.clear()
@@ -490,7 +513,7 @@ class ViberWebSocketClient(
         send(obj)
     }
 
-    fun attachSession(sessionId: String, lastSeq: Long = 0L) {
+    fun attachSession(sessionId: String, lastSeq: Long = 0L, fullHistory: Boolean = _syncFullHistory.value) {
         val switching = _activeSessionId.value != sessionId
         _activeSessionId.value = sessionId
         if (switching) {
@@ -503,6 +526,7 @@ class ViberWebSocketClient(
             put("type", "ATTACH_SESSION")
             put("session_id", sessionId)
             put("last_seq", if (switching) 0L else lastSeq)
+            put("full_history", fullHistory)
         }
         send(obj)
     }

@@ -238,9 +238,9 @@ export class ViberConnection {
   saveProfile(profile) { return this.send({ type: 'SAVE_PROFILE', profile }); }
   deleteProfile(profileId) { return this.send({ type: 'DELETE_PROFILE', profile_id: profileId }); }
   launchAgent(options) { return this.send({ ...options, type: 'LAUNCH_AGENT' }); }
-  attachSession(sessionId, lastSeq = 0) {
+  attachSession(sessionId, lastSeq = 0, fullHistory = false) {
     this.activeSessionId = sessionId;
-    return this.send({ type: 'ATTACH_SESSION', session_id: sessionId, last_seq: lastSeq });
+    return this.send({ type: 'ATTACH_SESSION', session_id: sessionId, last_seq: lastSeq, full_history: Boolean(fullHistory) });
   }
   detachSession() { this.activeSessionId = null; return this.send({ type: 'DETACH_SESSION' }); }
   sendInput(sessionId, base64Data) { return this.send({ type: 'TERMINAL_INPUT', session_id: sessionId, data: base64Data }); }
