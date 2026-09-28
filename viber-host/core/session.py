@@ -15,57 +15,40 @@ from core.pty_factory import create_pty_process, PtyProcess
 
 
 class TerminalRingBuffer:
-    """Thread-safe circular ring buffer with monotonic sequence numbers for reconnect recovery."""
-
-    def __init__(self, max_bytes: int = 16 * 1024 * 1024):  # 16MB replay window for long conversations
+    """Bounded thread-safe replay window; network replay counters are separate."""
+    def __init__(self, max_bytes: int = 16 * 1024 * 1024):
+        import threading
+        if max_bytes <= 0:
+            raise ValueError("Positive replay budget required")
         self.max_bytes = max_bytes
         self.current_bytes = 0
-        self.chunks: collections.deque = collections.deque()
+        self.chunks = collections.deque()
         self.current_seq = 0
         self.min_seq = 0
+        self._lock = threading.RLock()
 
     def append(self, data: bytes) -> int:
-        """Appends new terminal output chunk, increments monotonic seq, and trims oldest if exceeded."""
-        self.current_seq += 1
-        seq = self.current_seq
-        now = time.time()
+        if len(data) > self.max_bytes:
+            raise ValueError("Replay chunk exceeds buffer capacity")
+        with self._lock:
+            self.current_seq += 1
+            self.chunks.append((self.current_seq, time.time(), bytes(data)))
+            self.current_bytes += len(data)
+            while self.current_bytes > self.max_bytes:
+                self.current_bytes -= len(self.chunks.popleft()[2])
+            self.min_seq = self.chunks[0][0] if self.chunks else self.current_seq
+            return self.current_seq
 
-        chunk = (seq, now, data)
-        self.chunks.append(chunk)
-        self.current_bytes += len(data)
+    def get_since(self, last_seq: int):
+        reset, chunks, _ = self.snapshot_since(last_seq)
+        return reset, chunks
 
-        # Enforce max byte limit
-        while self.current_bytes > self.max_bytes and len(self.chunks) > 1:
-            popped = self.chunks.popleft()
-            self.current_bytes -= len(popped[2])
-
-        if self.chunks:
-            self.min_seq = self.chunks[0][0]
-
-        return seq
-
-    def get_since(self, last_seq: int) -> Tuple[bool, List[Tuple[int, bytes]]]:
-        """
-        Retrieves all chunks strictly after last_seq.
-        Returns: (needs_reset: bool, chunks: [(seq, bytes)])
-        If last_seq is 0 or older than the buffer's oldest chunk, needs_reset is True.
-        """
-        if not self.chunks:
-            return (False, [])
-
-        if last_seq <= 0 or last_seq < self.min_seq:
-            # Client has no prior state or fell behind the buffer window
-            all_chunks = [(c[0], c[2]) for c in self.chunks]
-            return (True, all_chunks)
-
-        if last_seq >= self.current_seq:
-            # Client is completely up to date
-            return (False, [])
-
-        # Filter missed chunks
-        missed = [(c[0], c[2]) for c in self.chunks if c[0] > last_seq]
-        return (False, missed)
-
+    def snapshot_since(self, last_seq: int):
+        with self._lock:
+            if not self.chunks:
+                return False, [], self.current_seq
+            reset = last_seq <= 0 or last_seq < self.min_seq - 1 or last_seq > self.current_seq
+            return reset, [(seq, data) for seq, _, data in self.chunks if reset or seq > last_seq], self.current_seq
 
 class AgentSession:
     """
@@ -120,15 +103,9 @@ class AgentSession:
         self.total_bytes_out = 0
         self.total_bytes_in = 0
 
-        # Persistent session log on disk for infinite long conversations
-        log_dir = os.path.expanduser("~/.viber/logs")
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            self.log_file_path = os.path.join(log_dir, f"session_{session_id}.log")
-            self._log_file = open(self.log_file_path, "ab", buffering=0)
-        except Exception:
-            self._log_file = None
-            self.log_file_path = None
+        # Terminal transcripts can contain credentials. No automatic disk logging.
+        self._log_file = None
+        self.log_file_path = None
 
     def start(self) -> int:
         """Launches the agent in its own isolated PTY."""
@@ -147,6 +124,11 @@ class AgentSession:
 
     def _on_pty_data(self, data: bytes) -> None:
         """Invoked when agent outputs data."""
+        # Bound each replay/output frame. Existing transcript files are not erased.
+        if len(data) > 65536:
+            for offset in range(0, len(data), 65536):
+                self._on_pty_data(data[offset:offset + 65536])
+            return
         self.total_bytes_out += len(data)
         self.last_active_at = time.time()
         seq = self.buffer.append(data)

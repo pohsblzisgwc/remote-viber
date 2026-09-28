@@ -1,141 +1,147 @@
-/**
- * RemoteViber WebCrypto E2EE Engine
- * Provides Curve P-256 ECDH + HKDF-SHA256 + AES-256-GCM authenticated encryption.
- * Hardware-accelerated on Android (ARMv8 Crypto) and Desktop (AES-NI).
- */
+/** Protocol v2 only. See SECURITY_UPGRADE.md. */
+export const MAX_SEQUENCE = 0xffffffff;
+const encoder = new TextEncoder();
+const decoder = new TextDecoder('utf-8', { fatal: true });
+const AUTH_LABEL = 'remote-viber-v2/client-auth\n';
+const KDF_LABEL = 'remote-viber-v2 traffic keys';
 
-function arrayBufferToBase64(buffer) {
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
+export function toBase64(bytes) {
+  const data = new Uint8Array(bytes);
+  let text = '';
+  for (let i = 0; i < data.length; i += 32768) {
+    text += String.fromCharCode(...data.subarray(i, i + 32768));
   }
-  return window.btoa(binary);
+  return btoa(text);
 }
-
-function base64ToArrayBuffer(base64) {
-  const binary_string = window.atob(base64);
-  const len = binary_string.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binary_string.charCodeAt(i);
+export function fromBase64(value, size = null) {
+  if (typeof value !== 'string' || value.length > 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+    throw new Error('Invalid base64');
   }
-  return bytes.buffer;
+  const bytes = Uint8Array.from(atob(value), (c) => c.charCodeAt(0));
+  if (toBase64(bytes) !== value || (size !== null && bytes.length !== size)) throw new Error('Invalid encoding');
+  return bytes;
+}
+function strictObject(obj, keys) {
+  if (!obj || Array.isArray(obj) || typeof obj !== 'object' ||
+      Object.keys(obj).sort().join(',') !== [...keys].sort().join(',')) throw new Error('Invalid protocol object');
+}
+function nonce(seq) {
+  const bytes = new Uint8Array(12);
+  new DataView(bytes.buffer).setBigUint64(4, BigInt(seq), false);
+  return bytes;
+}
+function requireCrypto() {
+  if (globalThis.isSecureContext === false || !globalThis.crypto?.subtle) {
+    throw new Error('Authentication requires WebCrypto: use HTTPS or localhost. No plaintext fallback.');
+  }
+  return globalThis.crypto.subtle;
+}
+export async function fingerprint(pub) {
+  const raw = fromBase64(pub, 65);
+  await requireCrypto().importKey('raw', raw, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+  const bytes = new Uint8Array(await requireCrypto().digest('SHA-256', raw));
+  return [...bytes].map((x) => x.toString(16).padStart(2, '0')).join('');
 }
 
 export class ClientCryptoManager {
-  constructor() {
+  constructor() { this.destroy(); }
+  destroy() {
+    this.phase = 'closed';
+    this.supported = !!globalThis.crypto?.subtle;
+    this.aesKey = this.txKey = this.rxKey = null;
     this.keyPair = null;
-    this.publicKeyB64 = null;
-    this.aesKey = null;
-    this.isReady = false;
-    this.supported = typeof window !== 'undefined' && !!(window.crypto && window.crypto.subtle);
+    this.hello = null;
+    this.token = '';
+    this.hostPub = '';
+    this.txSeq = this.rxSeq = 0;
   }
-
-  async initialize() {
-    if (!this.supported) {
-      this.isReady = true;
-      return null;
+  async initialize(config) {
+    this.destroy();
+    const subtle = requireCrypto();
+    if (!config || typeof config.token !== 'string' || !/^[!-~]{32,256}$/.test(config.token)) {
+      throw new Error('Authentication: re-pair with the new high-entropy credential');
     }
-    // Generate ephemeral ECDH keypair
-    this.keyPair = await window.crypto.subtle.generateKey(
-      { name: "ECDH", namedCurve: "P-256" },
-      true,
-      ["deriveBits"]
-    );
-    const rawPub = await window.crypto.subtle.exportKey("raw", this.keyPair.publicKey);
-    this.publicKeyB64 = arrayBufferToBase64(rawPub);
-    return this.publicKeyB64;
+    const pin = fromBase64(config.hostPub, 65);
+    if (pin[0] !== 4) throw new Error('Invalid pinned key');
+    this.hostPub = config.hostPub;
+    this.token = config.token;
+    this.keyPair = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+    const pub = await subtle.exportKey('raw', this.keyPair.publicKey);
+    this.hello = { type: 'HELLO', v: 2, client_pub: toBase64(pub),
+                   client_nonce: toBase64(globalThis.crypto.getRandomValues(new Uint8Array(32))) };
+    this.phase = 'hello';
+    return this.hello;
   }
-
-  async establishSession(hostPublicKeyB64) {
-    if (!this.supported || !hostPublicKeyB64) {
-      this.isReady = true;
-      return;
+  async establishSession(challenge) {
+    if (this.phase !== 'hello') throw new Error('Unexpected handshake');
+    strictObject(challenge, ['type', 'v', 'host_pub', 'server_pub', 'server_nonce', 'signature']);
+    if (challenge.type !== 'CHALLENGE' || challenge.v !== 2 || challenge.host_pub !== this.hostPub) {
+      throw new Error('Host identity mismatch; re-pair only after independent verification');
     }
-
-    if (!this.keyPair) {
-      await this.initialize();
-    }
-
-    const hostPubRaw = base64ToArrayBuffer(hostPublicKeyB64);
-    const hostKey = await window.crypto.subtle.importKey(
-      "raw",
-      hostPubRaw,
-      { name: "ECDH", namedCurve: "P-256" },
-      false,
-      []
-    );
-
-    // Compute shared secret
-    const sharedBits = await window.crypto.subtle.deriveBits(
-      { name: "ECDH", public: hostKey },
-      this.keyPair.privateKey,
-      256
-    );
-
-    // Derive AES-256-GCM key with HKDF
-    const hkdfKey = await window.crypto.subtle.importKey(
-      "raw",
-      sharedBits,
-      "HKDF",
-      false,
-      ["deriveKey"]
-    );
-
-    this.aesKey = await window.crypto.subtle.deriveKey(
-      {
-        name: "HKDF",
-        hash: "SHA-256",
-        salt: new TextEncoder().encode("remote-viber-v1"),
-        info: new TextEncoder().encode("remote-viber-e2ee-session"),
-      },
-      hkdfKey,
-      { name: "AES-GCM", length: 256 },
-      false,
-      ["encrypt", "decrypt"]
-    );
-
-    this.isReady = true;
+    const subtle = requireCrypto();
+    const serverPub = fromBase64(challenge.server_pub, 65);
+    if (serverPub[0] !== 4) throw new Error('Invalid ephemeral key');
+    fromBase64(challenge.server_nonce, 32);
+    const context = encoder.encode(['remote-viber-v2', this.hostPub, this.hello.client_pub,
+      this.hello.client_nonce, challenge.server_pub, challenge.server_nonce].join('\n'));
+    const identity = await subtle.importKey('raw', fromBase64(this.hostPub, 65),
+      { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+    const verified = await subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, identity,
+      fromBase64(challenge.signature, 64), context);
+    if (!verified) throw new Error('Host signature verification failed');
+    const peer = await subtle.importKey('raw', serverPub, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+    const shared = await subtle.deriveBits({ name: 'ECDH', public: peer }, this.keyPair.privateKey, 256);
+    const salt = await subtle.digest('SHA-256', context);
+    const material = await subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+    const keys = new Uint8Array(await subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt,
+      info: encoder.encode(KDF_LABEL) }, material, 512));
+    this.txKey = await subtle.importKey('raw', keys.slice(0, 32), 'AES-GCM', false, ['encrypt']);
+    this.rxKey = await subtle.importKey('raw', keys.slice(32), 'AES-GCM', false, ['decrypt']);
+    this.aesKey = this.txKey;
+    const macKey = await subtle.importKey('raw', encoder.encode(this.token),
+      { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const label = encoder.encode(AUTH_LABEL);
+    const macInput = new Uint8Array(label.length + 32);
+    macInput.set(label); macInput.set(new Uint8Array(salt), label.length);
+    const proof = toBase64(await subtle.sign('HMAC', macKey, macInput));
+    keys.fill(0);
+    this.token = '';
+    this.keyPair = null;
+    this.phase = 'welcome';
+    return { type: 'AUTH', v: 2, proof };
   }
-
-  async encryptJson(payload) {
-    if (!this.supported || !this.aesKey) {
-      return payload;
-    }
-
-    const jsonText = JSON.stringify(payload);
-    const encoded = new TextEncoder().encode(jsonText);
-    const iv = window.crypto.getRandomValues(new Uint8Array(12));
-
-    const ciphertext = await window.crypto.subtle.encrypt(
-      { name: "AES-GCM", iv },
-      this.aesKey,
-      encoded
-    );
-
-    return {
-      iv: arrayBufferToBase64(iv),
-      data: arrayBufferToBase64(ciphertext),
-    };
+  async encryptJson(message) {
+    if (this.phase !== 'ready' || !this.txKey) throw new Error('Authentication required');
+    if (!message || Array.isArray(message) || typeof message.type !== 'string') throw new Error('Invalid message');
+    const data = encoder.encode(JSON.stringify(message));
+    if (data.length > 700000 || this.txSeq >= MAX_SEQUENCE) throw new Error('Session/frame limit reached');
+    const seq = this.txSeq + 1;
+    const ciphertext = await requireCrypto().encrypt({ name: 'AES-GCM', iv: nonce(seq),
+      additionalData: encoder.encode(`remote-viber-v2|c2s|${seq}`), tagLength: 128 }, this.txKey, data);
+    this.txSeq = seq;
+    return { v: 2, seq, data: toBase64(ciphertext) };
   }
-
-  async decryptJson(ivB64, dataB64) {
-    if (!this.supported || !this.aesKey) {
-      return null;
+  async decryptJson(frame) {
+    if (!['welcome', 'ready'].includes(this.phase) || !this.rxKey) throw new Error('No encrypted session');
+    strictObject(frame, ['v', 'seq', 'data']);
+    if (frame.v !== 2 || !Number.isSafeInteger(frame.seq) || frame.seq !== this.rxSeq + 1 || frame.seq > MAX_SEQUENCE) {
+      throw new Error('Replay or out-of-order frame');
     }
-
-    const iv = base64ToArrayBuffer(ivB64);
-    const data = base64ToArrayBuffer(dataB64);
-
-    const decrypted = await window.crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: new Uint8Array(iv) },
-      this.aesKey,
-      data
-    );
-
-    const text = new TextDecoder().decode(decrypted);
-    return JSON.parse(text);
+    const ciphertext = fromBase64(frame.data);
+    if (ciphertext.length < 16 || ciphertext.length > 700016) throw new Error('Invalid ciphertext size');
+    const plaintext = await requireCrypto().decrypt({ name: 'AES-GCM', iv: nonce(frame.seq),
+      additionalData: encoder.encode(`remote-viber-v2|s2c|${frame.seq}`), tagLength: 128 }, this.rxKey, ciphertext);
+    const message = JSON.parse(decoder.decode(plaintext));
+    if (!message || Array.isArray(message) || typeof message.type !== 'string') throw new Error('Invalid message');
+    if (this.phase === 'welcome') {
+      if (message.type !== 'WELCOME' || message.v !== 2 || message.e2ee !== true || message.status !== 'authenticated') {
+        throw new Error('Authenticated WELCOME required');
+      }
+      this.phase = 'ready';
+    } else if (['WELCOME', 'HELLO', 'AUTH', 'CHALLENGE'].includes(message.type)) {
+      throw new Error('Unexpected repeated handshake');
+    }
+    this.rxSeq = frame.seq;
+    return message;
   }
 }

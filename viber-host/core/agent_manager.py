@@ -178,10 +178,6 @@ class AgentManager:
                     shell_bin = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
                 exec_command = [shell_bin, "-l", "-c", cmd_str_exec]
 
-        if extra_args:
-            command.extend(extra_args)
-        if extra_env:
-            env.update(extra_env)
 
         # Resolve working directory safely
         candidate_cwd = cwd or (profile.get("default_cwd") if profile else None) or os.getcwd()

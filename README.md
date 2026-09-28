@@ -1,5 +1,12 @@
-# 声明：项目完全由google antigravity自行生成
+# 🤖 声明：项目完全由 Google Antigravity 自行生成 / AI 辅助开发
+
+> [!IMPORTANT]
+> **AI 创作与辅助声明 (AI-Assisted Project Notice)**：  
+> 本项目（包括架构设计、端到端加密协议 Protocol v2、Android 原生客户端、Web 桌面端、Host 宿主守护进程以及全套安全回归测试）**完全由 AI（Google DeepMind Antigravity / Gemini）在开发者指令下全程辅助编写、重构与加固**。代码已通过全量自动化安全审计与测试，但在用于实际生产环境前，请结合具体业务安全基线进行独立评估。
+
+---
 # RemoteViber (⚡ 远程 Vibe Coder 智能体启动与控制矩阵)
+
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Android%20%7C%20Linux%20%7C%20Windows-brightgreen.svg)](#)

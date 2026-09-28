@@ -1,0 +1,5 @@
+# Versions exercised by this patch's local security/interop tests.
+# Install in the project's virtual environment; retain platform-specific PTY deps.
+cryptography==46.0.4
+websockets==16.0
+psutil==7.2.2

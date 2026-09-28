@@ -1,3 +1,4 @@
+import { loadSessionConfig } from './services/pairing.js';
 import React, { useState, useEffect, useRef } from 'react';
 import TopBar from './components/TopBar';
 import Dashboard from './components/Dashboard';
@@ -7,44 +8,10 @@ import LaunchModal from './components/LaunchModal';
 import PairingModal from './components/PairingModal';
 import { ViberConnection } from './services/viber_connection';
 
-const DEFAULT_CONFIG_KEY = 'viber_host_config';
+const DEFAULT_CONFIG_KEY = 'viber_host_config_v2';
 
 export default function App() {
-  const [hostConfig, setHostConfig] = useState(() => {
-    // 1. Check server-injected active configuration (zero-latency auto-pairing over Tailscale & Localhost)
-    if (typeof window !== 'undefined' && window.__VIBER_PRELOAD__ && window.__VIBER_PRELOAD__.token) {
-      const p = window.__VIBER_PRELOAD__;
-      const cfg = {
-        hostId: p.hostId || 'host-devbox',
-        hostName: p.hostName || '目标开发主机',
-        directPort: p.directPort || 8765,
-        tailscaleIps: p.tailscaleIps || [],
-        lanIps: p.lanIps || ['127.0.0.1'],
-        token: p.token,
-        relayUrl: p.relayUrl || '',
-      };
-      try { localStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(cfg)); } catch (e) {}
-      return cfg;
-    }
-
-    try {
-      const saved = localStorage.getItem(DEFAULT_CONFIG_KEY);
-      if (saved) return JSON.parse(saved);
-    } catch (e) {}
-
-    // Default fallback to local / current host
-    const isBrowser = typeof window !== 'undefined';
-    const host = isBrowser ? window.location.hostname : '127.0.0.1';
-    return {
-      hostId: 'host-devbox',
-      hostName: '目标开发主机',
-      directPort: 8765,
-      tailscaleIps: host.startsWith('100.') ? [host] : [],
-      lanIps: [host || '127.0.0.1'],
-      token: '',
-      relayUrl: '',
-    };
-  });
+  const [hostConfig, setHostConfig] = useState(() => loadSessionConfig(DEFAULT_CONFIG_KEY));
 
   const [activeView, setActiveView] = useState('dashboard'); // 'dashboard' | 'terminal'
   const [connectionState, setConnectionState] = useState('disconnected');
@@ -63,55 +30,12 @@ export default function App() {
 
   const connectionRef = useRef(null);
 
-  // Auto-discover pairing config if opened directly in browser from the host
+  // Pairing is an explicit user action; URLs and HTTP metadata never confer trust.
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-
-    // 1. Check URL parameters: ?token=xxx&hostId=xxx
-    const params = new URLSearchParams(window.location.search);
-    const urlToken = params.get('token');
-    const urlHostId = params.get('hostId') || params.get('host_id');
-
-    if (urlToken) {
-      setHostConfig((prev) => {
-        const next = { ...prev, token: urlToken };
-        if (urlHostId) next.hostId = urlHostId;
-        try { localStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(next)); } catch (e) {}
-        return next;
-      });
-      return;
-    }
-
-    // 2. Fetch /api/pairing to verify or refresh active credentials
-    fetch('/api/pairing')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (data && data.token) {
-          setHostConfig((prev) => {
-            // Only update if token actually changed
-            if (prev.token === data.token) return prev;
-            const next = {
-              ...prev,
-              hostId: data.id || prev.hostId,
-              hostName: data.name || prev.hostName,
-              token: data.token,
-              tailscaleIps: data.tailscale && data.tailscale.length > 0 ? data.tailscale : prev.tailscaleIps,
-              lanIps: data.lan && data.lan.length > 0 ? data.lan : prev.lanIps,
-              directPort: data.port || prev.directPort || 8765,
-            };
-            try { localStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(next)); } catch (e) {}
-            return next;
-          });
-        } else if (!hostConfig.token) {
-          // No token auto-discovered and local config has none -> open pairing dialog
-          setIsPairingModalOpen(true);
-        }
-      })
-      .catch(() => {
-        if (!hostConfig.token) {
-          setIsPairingModalOpen(true);
-        }
-      });
+    const url = new URL(window.location.href);
+    for (const name of ['token', 'hostId', 'host_id']) url.searchParams.delete(name);
+    if (url.href !== window.location.href) window.history.replaceState(null, '', url.href);
+    if (!hostConfig.hostPub || !hostConfig.token) setIsPairingModalOpen(true);
   }, []);
 
   // Initialize or re-create connection when hostConfig changes
@@ -128,15 +52,7 @@ export default function App() {
       setConnectionMode(mode);
     });
 
-    conn.on('ready', ({ hostPub, fingerprint, token }) => {
-      if (token && token !== hostConfig.token) {
-        setHostConfig((prev) => {
-          const next = { ...prev, token };
-          try { localStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(next)); } catch (e) {}
-          return next;
-        });
-      }
-    });
+
 
     conn.on('error', (err) => {
       console.warn('RemoteViber Connection Error:', err);
@@ -340,7 +256,7 @@ export default function App() {
   const handleSaveConfig = (newConfig) => {
     setHostConfig(newConfig);
     try {
-      localStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(newConfig));
+      sessionStorage.setItem(DEFAULT_CONFIG_KEY, JSON.stringify(newConfig));
     } catch (e) {}
   };
 
