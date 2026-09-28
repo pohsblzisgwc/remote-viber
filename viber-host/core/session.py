@@ -43,12 +43,25 @@ class TerminalRingBuffer:
         reset, chunks, _ = self.snapshot_since(last_seq)
         return reset, chunks
 
-    def snapshot_since(self, last_seq: int):
+    def snapshot_since(self, last_seq: int, max_replay_bytes: int = 512 * 1024):
         with self._lock:
             if not self.chunks:
                 return False, [], self.current_seq
             reset = last_seq <= 0 or last_seq < self.min_seq - 1 or last_seq > self.current_seq
-            return reset, [(seq, data) for seq, _, data in self.chunks if reset or seq > last_seq], self.current_seq
+            if not reset:
+                return False, [(seq, data) for seq, _, data in self.chunks if seq > last_seq], self.current_seq
+
+            # Bounded initial replay snapshot: return the most recent chunks within max_replay_bytes
+            # to avoid overwhelming client JS/Compose threads while maintaining rich context.
+            selected = []
+            total_bytes = 0
+            for seq, _, data in reversed(self.chunks):
+                selected.append((seq, data))
+                total_bytes += len(data)
+                if total_bytes >= max_replay_bytes:
+                    break
+            selected.reverse()
+            return True, selected, self.current_seq
 
 class AgentSession:
     """

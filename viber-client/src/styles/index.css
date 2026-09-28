@@ -67,9 +67,40 @@ body {
   animation: attention-pulse 2s infinite;
 }
 
-/* Xterm container tweaks */
-.xterm-viewport {
-  overflow-y: auto !important;
+/* Dedicated High-Visibility, High-Speed Terminal Scrollbar */
+.xterm .xterm-viewport {
+  overflow-y: scroll !important;
+  scrollbar-width: auto;
+  scrollbar-color: #475569 rgba(15, 23, 42, 0.7);
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 14px !important;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.75) !important;
+  border-left: 1px solid rgba(255, 255, 255, 0.08) !important;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: #334155 !important;
+  border-radius: 7px !important;
+  border: 2px solid #0f172a !important;
+  min-height: 48px !important;
+  box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.4) !important;
+  cursor: pointer !important;
+  transition: background-color 0.15s ease, box-shadow 0.15s ease !important;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: #06b6d4 !important;
+  box-shadow: 0 0 12px rgba(6, 182, 212, 0.7), inset 0 0 4px rgba(255, 255, 255, 0.3) !important;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:active {
+  background: #38bdf8 !important;
+  box-shadow: 0 0 16px rgba(56, 189, 248, 0.9) !important;
 }
 
 /* Hide scrollbar for clean tab rows */

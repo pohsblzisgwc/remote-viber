@@ -23,7 +23,7 @@ import java.util.Locale
  * 4. Optimistic Local Echo for immediate command feedback without waiting for network round-trip.
  * 5. Run-Length Span Encoding to keep memory footprint minimal.
  */
-class TerminalBuffer(private val maxLines: Int = 10000) {
+class TerminalBuffer(private val maxLines: Int = 2500) {
     // Committed lines in the scrollback buffer
     val lines = mutableStateListOf<AnnotatedString>()
 

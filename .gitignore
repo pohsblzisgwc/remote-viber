@@ -57,6 +57,7 @@ yarn-debug.log*
 yarn-error.log*
 
 # --- Android Gradle & IDE ---
+.android/
 .gradle/
 viber-android/.gradle/
 viber-android/build/

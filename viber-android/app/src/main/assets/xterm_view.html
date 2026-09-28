@@ -30,18 +30,49 @@
       background: rgba(56, 189, 248, 0.3);
       border-radius: 2px;
     }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
   </style>
 </head>
 <body>
-  <div id="terminal-container"></div>
+  <div id="loading-overlay" style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background-color: #090d16; z-index: 10; font-family: monospace; transition: opacity 0.2s ease;">
+    <div style="width: 36px; height: 36px; border: 2.5px solid rgba(6, 182, 212, 0.2); border-top-color: #06b6d4; border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 12px;"></div>
+    <div style="color: #e2e8f0; font-size: 12px; font-weight: 500; display: flex; align-items: center; gap: 6px;">
+      <span style="display: inline-block; width: 6px; height: 6px; border-radius: 50%; background-color: #06b6d4;"></span>
+      正在同步 2D 终端会话历史...
+    </div>
+    <div style="color: #64748b; font-size: 10px; margin-top: 4px;">直达最新输出上下文</div>
+  </div>
+  <div id="terminal-container" style="width: 100%; height: 100%; opacity: 0; transition: opacity 0.12s ease-in;"></div>
 
   <script src="xterm.js"></script>
   <script src="addon-fit.js"></script>
   <script>
     let term;
     let fitAddon;
+    let pendingJsQueue = [];
+
+    function flushPendingData() {
+      if (!term) return;
+      if (pendingJsQueue.length > 0) {
+        const chunks = pendingJsQueue;
+        pendingJsQueue = [];
+        for (let i = 0; i < chunks.length; i++) {
+          window.writeB64Data(chunks[i]);
+        }
+      }
+      setTimeout(() => {
+        if (term) term.scrollToBottom();
+        const el = document.getElementById('terminal-container');
+        if (el) el.style.opacity = '1';
+        const loader = document.getElementById('loading-overlay');
+        if (loader) loader.style.display = 'none';
+      }, 50);
+    }
 
     function initTerminal(fontSize = 12) {
+      if (term) return;
       term = new Terminal({
         cursorBlink: true,
         cursorStyle: 'bar',
@@ -71,7 +102,7 @@
           brightCyan: '#22d3ee',
           brightWhite: '#ffffff',
         },
-        scrollback: 10000,
+        scrollback: 5000,
         alternateScreenScroll: true,
         scrollOnUserInput: true,
         allowProposedApi: true,
@@ -82,7 +113,7 @@
 
       const container = document.getElementById('terminal-container');
       term.open(container);
-      fitAddon.fit();
+      try { fitAddon.fit(); } catch (e) {}
 
       // Handle user key inputs and forward to Android bridge
       term.onData((data) => {
@@ -103,7 +134,10 @@
       };
 
       window.addEventListener('resize', notifyResize);
-      setTimeout(notifyResize, 100);
+      setTimeout(notifyResize, 50);
+      setTimeout(notifyResize, 200);
+
+      flushPendingData();
 
       if (window.AndroidBridge && window.AndroidBridge.onReady) {
         window.AndroidBridge.onReady();
@@ -112,7 +146,10 @@
 
     // Called from Android Kotlin to write binary / base64 output into 2D terminal
     window.writeB64Data = function(b64) {
-      if (!term) return;
+      if (!term) {
+        pendingJsQueue.push(b64);
+        return;
+      }
       try {
         const binStr = window.atob(b64);
         const len = binStr.length;
@@ -127,13 +164,14 @@
     };
 
     window.clearTerminal = function() {
+      pendingJsQueue = [];
       if (term) term.clear();
     };
 
     window.setFontSize = function(size) {
       if (term && fitAddon) {
         term.options.fontSize = size;
-        fitAddon.fit();
+        try { fitAddon.fit(); } catch (e) {}
         if (window.AndroidBridge && window.AndroidBridge.onResize) {
           window.AndroidBridge.onResize(term.rows, term.cols);
         }
@@ -151,9 +189,25 @@
       }
     };
 
-    document.addEventListener('DOMContentLoaded', () => {
+    window.scrollToBottom = function() {
+      if (term) term.scrollToBottom();
+      const el = document.getElementById('terminal-container');
+      if (el) el.style.opacity = '1';
+      const loader = document.getElementById('loading-overlay');
+      if (loader) loader.style.display = 'none';
+    };
+
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
       initTerminal(12);
-    });
+    } else {
+      document.addEventListener('DOMContentLoaded', () => {
+        initTerminal(12);
+      });
+      window.addEventListener('load', () => {
+        if (!term) initTerminal(12);
+        else { try { fitAddon.fit(); } catch (e) {} }
+      });
+    }
   </script>
 </body>
 </html>

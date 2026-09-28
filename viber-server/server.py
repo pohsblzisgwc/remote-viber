@@ -12,13 +12,14 @@ from websockets.http11 import Response
 from websockets.datastructures import Headers
 from registry import HostRegistry
 from secure_protocol import (ProtocolError, b64, registration_message, verify_signature,
+                             MAX_CLIENT_FRAME_BYTES, MAX_RELAY_FRAME_BYTES,
                              MAX_FRAME_BYTES, HANDSHAKE_TIMEOUT)
 
 logger = logging.getLogger("viber.server")
 
 
 def parse_message(raw):
-    if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_FRAME_BYTES:
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_RELAY_FRAME_BYTES:
         raise ProtocolError("Invalid relay frame")
     try:
         msg = json.loads(raw)
@@ -43,7 +44,7 @@ class RelayServer:
         self.server = await serve(self._handle_connection, self.host, self.port,
                                   process_request=self._handle_http, open_timeout=10, close_timeout=3,
                                   ping_interval=25, ping_timeout=25,
-                                  max_size=MAX_FRAME_BYTES, max_queue=16, compression=None)
+                                  max_size=MAX_RELAY_FRAME_BYTES, max_queue=16, compression=None)
         if self.port == 0:
             self.port = self.server.sockets[0].getsockname()[1]
 
@@ -125,8 +126,11 @@ class RelayServer:
                     continue
                 if frame.get("type") == "RELAY_FORWARD":
                     payload = frame.get("payload")
-                    if not isinstance(payload, str) or len(payload.encode("utf-8")) > MAX_FRAME_BYTES:
-                        raise ProtocolError("Invalid forwarding payload")
+                    if not isinstance(payload, str) or len(payload.encode("utf-8")) > MAX_CLIENT_FRAME_BYTES:
+                        logger.warning("Host forwarded oversized payload for client %s", cid)
+                        if target:
+                            await target.close(1009, "Message too big")
+                        continue
                     try:
                         await self._send(target, payload)
                     except (ConnectionClosed, asyncio.TimeoutError):
@@ -157,9 +161,25 @@ class RelayServer:
         try:
             await self._send(host_ws, {"type": "CLIENT_OPEN", "client_id": cid})
             async for raw in ws:
-                if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_FRAME_BYTES:
-                    raise ProtocolError("Invalid client frame")
-                await self._send(host_ws, {"type": "CLIENT_DATA", "client_id": cid, "payload": raw})
+                if not isinstance(raw, str):
+                    await ws.close(1003, "Text frames required")
+                    break
+                raw_bytes = raw.encode("utf-8")
+                if len(raw_bytes) > MAX_CLIENT_FRAME_BYTES:
+                    logger.warning("Client %s payload exceeds client limit (%d > %d)", cid, len(raw_bytes), MAX_CLIENT_FRAME_BYTES)
+                    await ws.close(1009, "Message too big")
+                    break
+                envelope = {"type": "CLIENT_DATA", "client_id": cid, "payload": raw}
+                serialized = json.dumps(envelope)
+                serialized_bytes = serialized.encode("utf-8")
+                if len(serialized_bytes) > MAX_RELAY_FRAME_BYTES:
+                    logger.warning("Client %s envelope exceeds relay limit (%d > %d)", cid, len(serialized_bytes), MAX_RELAY_FRAME_BYTES)
+                    await ws.close(1009, "Message too big")
+                    break
+                try:
+                    await self._send(host_ws, serialized)
+                except (ConnectionClosed, asyncio.TimeoutError):
+                    break
         finally:
             self.host_to_clients.get(host_ws, {}).pop(cid, None)
             self.client_to_host.pop(ws, None)

@@ -20,7 +20,9 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 VERSION = 2
-MAX_FRAME_BYTES = 1024 * 1024
+MAX_CLIENT_FRAME_BYTES = 512 * 1024
+MAX_RELAY_FRAME_BYTES = 2 * 1024 * 1024
+MAX_FRAME_BYTES = MAX_RELAY_FRAME_BYTES
 MAX_SEQUENCE = (1 << 32) - 1
 HANDSHAKE_TIMEOUT = 10.0
 AUTH_LABEL = b"remote-viber-v2/client-auth\n"

@@ -33,6 +33,9 @@ def normalize_origin(value):
     return f"{u.scheme}://{authority}"
 
 
+MAX_STATIC_BYTES = 32 * 1024 * 1024
+
+
 def static_bytes(root: Path, relative: str):
     """Read a regular file without following symlinks; openat protects POSIX races."""
     parts = relative.split("/")
@@ -51,11 +54,11 @@ def static_bytes(root: Path, relative: str):
                 directory = nxt
             fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 16 * 1024 * 1024:
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STATIC_BYTES:
                 raise PermissionError("Not a permitted static file")
             with os.fdopen(fd, "rb") as f:
                 fd = None
-                data = f.read(16 * 1024 * 1024 + 1)
+                data = f.read(MAX_STATIC_BYTES + 1)
         finally:
             if fd is not None:
                 os.close(fd)
@@ -71,8 +74,8 @@ def static_bytes(root: Path, relative: str):
         with target.open("rb") as f:
             if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
                 raise PermissionError("Not a regular file")
-            data = f.read(16 * 1024 * 1024 + 1)
-    if len(data) > 16 * 1024 * 1024:
+            data = f.read(MAX_STATIC_BYTES + 1)
+    if len(data) > MAX_STATIC_BYTES:
         raise PermissionError("Static file too large")
     return data
 

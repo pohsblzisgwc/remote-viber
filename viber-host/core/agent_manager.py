@@ -4,15 +4,18 @@ Handles predefined and custom Agent CLI profiles, one-click launches,
 and session lifecycle supervision.
 """
 
+import logging
 import os
 import sys
 import json
+from pathlib import Path
 import uuid
 from typing import Dict, List, Optional, Any, Union
 
 from core.session import AgentSession
-from core.config import get_persistent_dir
+from core.config import get_persistent_dir, read_private_json, write_private_json
 
+logger = logging.getLogger("viber.agent_manager")
 
 DEFAULT_PROFILES: List[Dict[str, Any]] = []
 
@@ -21,7 +24,10 @@ class AgentManager:
     """Manages Agent CLI profiles and active running sessions."""
 
     def __init__(self, config_path: Optional[str] = None):
-        self.config_path = config_path or os.path.join(get_persistent_dir(), "viber_profiles.json")
+        if config_path and os.path.isdir(config_path):
+            self.config_path = os.path.join(config_path, "viber_profiles.json")
+        else:
+            self.config_path = config_path or os.path.join(get_persistent_dir(), "viber_profiles.json")
         self.profiles: Dict[str, Dict[str, Any]] = {}
         self.sessions: Dict[str, AgentSession] = {}
         self._load_profiles()
@@ -39,31 +45,34 @@ class AgentManager:
 
         if os.path.exists(load_path):
             try:
-                with open(load_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                data = read_private_json(Path(load_path))
+                if isinstance(data, list):
                     for p in data:
-                        # Exclude old hardcoded default templates per user request
-                        if p.get("id") in {"claude-code", "aider-architect", "antigravity-cli", "quick-shell"}:
-                            continue
-                        self.profiles[p["id"]] = p
-                # If loaded from legacy path, persist to the new parallel file location
-                if load_path != self.config_path:
-                    self._save_profiles()
-                return
-            except Exception:
-                pass
+                        if isinstance(p, dict) and p.get("id"):
+                            # Exclude old hardcoded default templates per user request
+                            if p.get("id") in {"claude-code", "aider-architect", "antigravity-cli", "quick-shell"}:
+                                continue
+                            self.profiles[p["id"]] = p
+                    # If loaded from legacy path, persist to the new parallel file location
+                    if load_path != self.config_path:
+                        self._save_profiles()
+                    return
+            except PermissionError:
+                raise
+            except Exception as e:
+                logger.warning("Failed to load profiles from %s: %s", load_path, e)
+                raise
 
         self.profiles = {}
         self._save_profiles()
 
     def _save_profiles(self) -> None:
-        """Saves current profiles to disk parallel to executable."""
+        """Saves current profiles to disk securely with atomic write and 0600 mode."""
         try:
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(list(self.profiles.values()), f, indent=2)
-        except Exception:
-            pass
+            write_private_json(Path(self.config_path), list(self.profiles.values()))
+        except Exception as e:
+            logger.error("Failed to securely save profiles to %s: %s", self.config_path, e)
+            raise
 
     def list_profiles(self) -> List[Dict[str, Any]]:
         return list(self.profiles.values())

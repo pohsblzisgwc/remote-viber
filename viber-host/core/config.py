@@ -7,8 +7,28 @@ import socket
 import stat
 import sys
 import tempfile
-from typing import Optional
+from typing import Optional, Union, Any
 from core.crypto import HostKeyManager, host_id_for, validate_token
+
+
+def is_safe_config_dir(d: Path) -> bool:
+    try:
+        if not d.is_dir() or d.is_symlink():
+            return False
+        if not os.access(d, os.W_OK):
+            return False
+        if os.name == "posix":
+            st = d.stat()
+            if os.getuid() != 0 and st.st_uid != os.getuid():
+                return False
+            cfg = d / "viber_config.json"
+            if cfg.exists():
+                cst = cfg.stat()
+                if os.getuid() != 0 and cst.st_uid != os.getuid():
+                    return False
+        return True
+    except (OSError, PermissionError):
+        return False
 
 
 def get_persistent_dir() -> str:
@@ -18,7 +38,7 @@ def get_persistent_dir() -> str:
     if override:
         return str(Path(override).expanduser().absolute())
     base = Path(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]).absolute().parent
-    if base.is_dir() and os.access(base, os.W_OK):
+    if is_safe_config_dir(base):
         return str(base)
     return str(Path.home() / ".viber")
 
@@ -29,8 +49,16 @@ def _check_directory(directory: Path) -> None:
         raise ValueError("Configuration directory must be a real directory")
     if os.name == "posix":
         st = directory.stat()
-        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+        if os.getuid() != 0 and st.st_uid != os.getuid():
             raise PermissionError("Configuration directory must be owned by this user and not group/world writable")
+        if st.st_mode & 0o022:
+            try:
+                os.chmod(directory, st.st_mode & ~0o022)
+                st = directory.stat()
+            except OSError:
+                pass
+            if st.st_mode & 0o002:
+                raise PermissionError("Configuration directory must be owned by this user and not group/world writable")
 
 
 def read_private_json(path: Path) -> dict:
@@ -40,33 +68,43 @@ def read_private_json(path: Path) -> dict:
     fd = os.open(path, flags)
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > 64 * 1024:
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > 512 * 1024:
             raise PermissionError("Unsafe configuration file")
         if os.name == "posix":
-            if st.st_uid != os.getuid():
+            if os.getuid() != 0 and st.st_uid != os.getuid():
                 raise PermissionError("Configuration has a different owner")
-            os.fchmod(fd, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
         with os.fdopen(fd, "r", encoding="utf-8") as f:
             fd = -1
             value = json.load(f)
-        if not isinstance(value, dict):
-            raise ValueError("Configuration must be an object")
+        if not isinstance(value, (dict, list)):
+            raise ValueError("Configuration must be an object or list")
         return value
     finally:
         if fd >= 0:
             os.close(fd)
 
 
-def write_private_json(path: Path, data: dict) -> None:
+def write_private_json(path: Path, data: Any) -> None:
     _check_directory(path.parent)
     if path.is_symlink():
         raise PermissionError("Refusing symlink configuration")
+    serialized = json.dumps(data, ensure_ascii=False, indent=2)
+    serialized_bytes = serialized.encode("utf-8")
+    if len(serialized_bytes) > 512 * 1024:
+        raise ValueError(f"Configuration data exceeds maximum allowed size ({len(serialized_bytes)} > {512 * 1024})")
     fd, temp = tempfile.mkstemp(prefix=".viber-config-", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             if os.name == "posix":
-                os.fchmod(f.fileno(), 0o600)
-            json.dump(data, f, ensure_ascii=False, indent=2)
+                try:
+                    os.fchmod(f.fileno(), 0o600)
+                except OSError:
+                    pass
+            f.write(serialized)
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp, path)
@@ -142,6 +180,92 @@ class HostConfig:
                 "tailscale": endpoints.get("tailscale", []),
                 "lan": endpoints.get("lan", []) if self.allow_lan else ["127.0.0.1"]}
 
-    def generate_pairing_url(self, endpoints):
+    def generate_pairing_code(self, endpoints):
         raw = json.dumps(self.generate_pairing_payload(endpoints)).encode("utf-8")
-        return "viber://connect?data=" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    def generate_pairing_url(self, endpoints):
+        return "viber://connect?data=" + self.generate_pairing_code(endpoints)
+
+
+class HostLock:
+    """Advisory process lock to coordinate Host daemon executions and prevent
+
+    desynchronized offline credential rotations while an active Host is running.
+    Uses kernel file locking (fcntl.flock on POSIX, msvcrt.locking on Windows)
+    so abnormal termination automatically cleans up without leaving stale lockfiles.
+    """
+
+    def __init__(self, directory: Union[str, Path]):
+        self.lock_path = Path(directory) / ".viber_host.lock"
+        self._fd: Optional[int] = None
+
+    def acquire(self, non_blocking: bool = True) -> bool:
+        """Attempts to acquire the exclusive lock. Returns True if acquired, False otherwise."""
+        _check_directory(self.lock_path.parent)
+        flags = os.O_CREAT | os.O_RDWR
+        try:
+            fd = os.open(str(self.lock_path), flags, 0o600)
+        except OSError:
+            return False
+
+        try:
+            if os.name == "posix":
+                import fcntl
+                lock_mode = fcntl.LOCK_EX
+                if non_blocking:
+                    lock_mode |= fcntl.LOCK_NB
+                fcntl.flock(fd, lock_mode)
+            elif os.name == "nt":
+                import msvcrt
+                mode = msvcrt.LK_NBLCK if non_blocking else msvcrt.LK_LOCK
+                msvcrt.locking(fd, mode, 1)
+            self._fd = fd
+            try:
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+            except OSError:
+                pass
+            return True
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return False
+
+    def release(self):
+        """Releases the lock."""
+        if self._fd is not None:
+            try:
+                if os.name == "posix":
+                    import fcntl
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+                elif os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    def is_locked(self_or_dir: Union[str, Path, "HostLock"]) -> bool:
+        """Checks if another process currently holds the lock."""
+        if isinstance(self_or_dir, HostLock):
+            inst = self_or_dir
+        else:
+            inst = HostLock(self_or_dir)
+        if inst.acquire(non_blocking=True):
+            inst.release()
+            return False
+        return True
+
+    def __enter__(self):
+        if not self.acquire(non_blocking=True):
+            raise BlockingIOError("Host lock is held by another process")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
