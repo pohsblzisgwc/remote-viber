@@ -5,7 +5,8 @@ import logging
 import re
 from urllib.parse import urlsplit
 from websockets.asyncio.client import connect
-from core.crypto import ProtocolError, MAX_FRAME_BYTES, HANDSHAKE_TIMEOUT
+from core.crypto import (ProtocolError, MAX_CLIENT_FRAME_BYTES,
+                         MAX_RELAY_FRAME_BYTES, MAX_FRAME_BYTES, HANDSHAKE_TIMEOUT)
 from network.router import ClientConnectionState
 
 logger = logging.getLogger("viber.relay")
@@ -42,7 +43,7 @@ class RelayClient:
             try:
                 url = validate_relay_url(self.config.relay_url) + "/register/host"
                 async with connect(url, open_timeout=10, close_timeout=3, ping_interval=20,
-                                   ping_timeout=20, max_size=MAX_FRAME_BYTES, max_queue=16, compression=None) as ws:
+                                   ping_timeout=20, max_size=MAX_RELAY_FRAME_BYTES, max_queue=16, compression=None) as ws:
                     await self._serve_relay(ws)
                     backoff = 2
             except asyncio.CancelledError:
@@ -58,8 +59,9 @@ class RelayClient:
     async def _serve_relay(self, ws):
         send_lock = asyncio.Lock()
         async def send_control(message):
+            text = message if isinstance(message, str) else json.dumps(message)
             async with send_lock:
-                await asyncio.wait_for(ws.send(json.dumps(message)), 5)
+                await asyncio.wait_for(ws.send(text), 5)
 
         raw = await asyncio.wait_for(ws.recv(), HANDSHAKE_TIMEOUT)
         message = json.loads(raw)
@@ -112,7 +114,17 @@ class RelayClient:
                     await send_control({"type": "CLIENT_CLOSE", "client_id": cid})
                     continue
                 async def send_peer(text, peer_id=cid):
-                    await send_control({"type": "RELAY_FORWARD", "client_id": peer_id, "payload": text})
+                    if len(text.encode("utf-8")) > MAX_CLIENT_FRAME_BYTES:
+                        logger.warning("Outbound payload for peer %s exceeds client limit", peer_id)
+                        await send_control({"type": "CLIENT_CLOSE", "client_id": peer_id})
+                        return
+                    envelope = {"type": "RELAY_FORWARD", "client_id": peer_id, "payload": text}
+                    serialized = json.dumps(envelope)
+                    if len(serialized.encode("utf-8")) > MAX_RELAY_FRAME_BYTES:
+                        logger.warning("Outbound envelope for peer %s exceeds relay limit", peer_id)
+                        await send_control({"type": "CLIENT_CLOSE", "client_id": peer_id})
+                        return
+                    await send_control(serialized)
                 async def close_peer(peer_id=cid):
                     await send_control({"type": "CLIENT_CLOSE", "client_id": peer_id})
                 state = ClientConnectionState(self.config.key_manager, self.agent_manager, self.monitor,
@@ -125,13 +137,19 @@ class RelayClient:
                 if not peer:
                     continue
                 payload = message.get("payload")
-                if not isinstance(payload, str) or len(payload.encode("utf-8")) > MAX_FRAME_BYTES:
-                    raise ProtocolError("Invalid payload")
+                if not isinstance(payload, str) or len(payload.encode("utf-8")) > MAX_CLIENT_FRAME_BYTES:
+                    logger.warning("Peer %s sent invalid/oversized payload", cid)
+                    peer[0].cleanup()
+                    peer[2].cancel()
+                    self.peers.pop(cid, None)
+                    await send_control({"type": "CLIENT_CLOSE", "client_id": cid})
+                    continue
                 try:
                     peer[1].put_nowait(payload)
                 except asyncio.QueueFull:
                     peer[0].cleanup()
                     peer[2].cancel()
+                    self.peers.pop(cid, None)
                     await send_control({"type": "CLIENT_CLOSE", "client_id": cid})
             elif kind == "CLIENT_CLOSE":
                 peer = self.peers.pop(cid, None)

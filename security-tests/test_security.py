@@ -21,8 +21,10 @@ SOURCE = Path(os.environ.get('VIBER_SOURCE_ROOT', BUNDLE if (BUNDLE / 'viber-hos
 sys.path[:0] = [str(SOURCE / 'viber-host'), str(SOURCE / 'viber-server')]
 from core.crypto import (HostKeyManager, ServerHandshake, E2EESession, ProtocolError,
                          public_raw, transcript, derive_keys, auth_proof, b64,
-                         verify_signature, host_id_for, MAX_SEQUENCE)
-from core.config import HostConfig, read_private_json
+                         verify_signature, host_id_for, MAX_SEQUENCE,
+                         MAX_CLIENT_FRAME_BYTES, MAX_RELAY_FRAME_BYTES)
+from core.config import HostConfig, read_private_json, write_private_json, is_safe_config_dir, HostLock
+from core.agent_manager import AgentManager
 from core.monitor import SystemMonitor
 from network.router import ClientConnectionState
 from network.direct_server import DirectServer, static_bytes, normalize_origin
@@ -157,6 +159,22 @@ class StorageAndPathTests(unittest.TestCase):
             path=Path(td)/'viber_config.json'; path.write_text('broken')
             with self.assertRaises(ValueError): HostConfig(td)
             self.assertEqual(path.read_text(),'broken')
+    @unittest.skipUnless(os.name=='posix','POSIX permissions')
+    def test_config_group_writable_directory_auto_tightened(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            p.chmod(0o775)
+            self.assertTrue(bool(p.stat().st_mode & 0o020))
+            config = HostConfig(td)
+            self.assertIsNotNone(config.host_id)
+            self.assertFalse(bool(p.stat().st_mode & 0o022))
+    def test_is_safe_config_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            self.assertTrue(is_safe_config_dir(p))
+            symlink = p / 'symlink_dir'
+            symlink.symlink_to(p, target_is_directory=True)
+            self.assertFalse(is_safe_config_dir(symlink))
     def test_static_regular_file(self):
         with tempfile.TemporaryDirectory() as td:
             p=Path(td); (p/'index.html').write_bytes(b'OK')
@@ -189,6 +207,165 @@ class StorageAndPathTests(unittest.TestCase):
         registry.hosts[hid].connection=new
         registry.unregister_connection(old)
         self.assertIs(registry.get_host(hid).connection,new)
+
+    # --- RV-03: Profile permissions, atomic write, migration ---
+    @unittest.skipUnless(os.name == 'posix', 'POSIX permissions')
+    def test_profile_permissions_0600_under_loose_umask(self):
+        old_umask = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                mgr = AgentManager(td)
+                profile = mgr.save_profile({
+                    'name': 'SecureEnvProfile',
+                    'command': 'bash',
+                    'env': {'SUPER_SECRET_KEY': '12345-secret'}
+                })
+                profile_path = Path(td) / 'viber_profiles.json'
+                self.assertTrue(profile_path.exists())
+                mode = stat.S_IMODE(profile_path.stat().st_mode)
+                self.assertEqual(mode, 0o600)
+                
+                mgr2 = AgentManager(td)
+                loaded = mgr2.list_profiles()
+                self.assertEqual(len(loaded), 1)
+                self.assertEqual(loaded[0]['env']['SUPER_SECRET_KEY'], '12345-secret')
+        finally:
+            os.umask(old_umask)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX permissions')
+    def test_profile_auto_migration_from_0644_to_0600(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / 'viber_profiles.json'
+            profile_path.write_text(json.dumps([{'id': 'p1', 'name': 'MigrateMe', 'command': 'bash', 'env': {'SECRET': 'xyz'}}]))
+            profile_path.chmod(0o644)
+            self.assertEqual(stat.S_IMODE(profile_path.stat().st_mode), 0o644)
+            
+            mgr = AgentManager(td)
+            self.assertEqual(stat.S_IMODE(profile_path.stat().st_mode), 0o600)
+            profiles = mgr.list_profiles()
+            self.assertEqual(len(profiles), 1)
+            self.assertEqual(profiles[0]['env']['SECRET'], 'xyz')
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX permissions')
+    def test_profile_symlink_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            victim = p / 'victim.txt'
+            victim.write_text('SAFE_VICTIM_CONTENT')
+            symlink = p / 'viber_profiles.json'
+            symlink.symlink_to(victim)
+            
+            with self.assertRaises(PermissionError):
+                AgentManager(td)
+            self.assertEqual(victim.read_text(), 'SAFE_VICTIM_CONTENT')
+
+    def test_profile_atomic_write_preserves_original_on_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            mgr = AgentManager(td)
+            mgr.save_profile({'name': 'OriginalProfile', 'command': 'bash'})
+            profile_path = Path(td) / 'viber_profiles.json'
+            original_content = profile_path.read_text()
+            
+            class NonSerializable:
+                pass
+            with self.assertRaises(TypeError):
+                write_private_json(profile_path, [{'bad': NonSerializable()}])
+            
+            self.assertEqual(profile_path.read_text(), original_content)
+
+    def test_write_private_json_rejects_oversized(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'oversized.json'
+            oversized_data = [{'big': 'x' * (600 * 1024)}]
+            with self.assertRaises(ValueError):
+                write_private_json(p, oversized_data)
+
+    # --- RV-04: HostLock and offline credential rotation coordination ---
+    def test_host_lock_mutual_exclusion(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock1 = HostLock(td)
+            self.assertTrue(lock1.acquire())
+            self.assertTrue(HostLock.is_locked(td))
+            
+            lock2 = HostLock(td)
+            self.assertFalse(lock2.acquire())
+            
+            lock1.release()
+            self.assertFalse(HostLock.is_locked(td))
+            
+            self.assertTrue(lock2.acquire())
+            lock2.release()
+            self.assertFalse(HostLock.is_locked(td))
+
+    def test_offline_rotation_refused_while_host_locked(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = HostConfig(td)
+            original_secret = config.pairing_secret
+            original_pub = config.key_manager.public_key_b64
+            
+            daemon_lock = HostLock(td)
+            self.assertTrue(daemon_lock.acquire())
+            self.assertTrue(HostLock.is_locked(td))
+            
+            env = {**os.environ, 'VIBER_CONFIG_DIR': td}
+            proc = subprocess.run([sys.executable, str(SOURCE / 'viber-host/main.py'), '--rotate-credentials'],
+                                  capture_output=True, text=True, env=env)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("无法在 Host 守护进程运行期间执行离线凭据轮换", proc.stderr + proc.stdout)
+            
+            disk_config = HostConfig(td)
+            self.assertEqual(disk_config.pairing_secret, original_secret)
+            self.assertEqual(disk_config.key_manager.public_key_b64, original_pub)
+            
+            daemon_lock.release()
+            self.assertFalse(HostLock.is_locked(td))
+            
+            proc2 = subprocess.run([sys.executable, str(SOURCE / 'viber-host/main.py'), '--rotate-credentials'],
+                                   capture_output=True, text=True, env=env)
+            self.assertEqual(proc2.returncode, 0)
+            
+            rotated_config = HostConfig(td)
+            self.assertNotEqual(rotated_config.pairing_secret, original_secret)
+            self.assertNotEqual(rotated_config.key_manager.public_key_b64, original_pub)
+
+    def test_host_lock_released_on_process_crash(self):
+        with tempfile.TemporaryDirectory() as td:
+            code = (
+                f"import sys, os; sys.path.insert(0, '{SOURCE}/viber-host'); "
+                f"from core.config import HostLock; "
+                f"lock = HostLock(r'{td}'); "
+                f"assert lock.acquire(); "
+                f"print('LOCKED', flush=True); "
+                f"import time; time.sleep(30)"
+            )
+            proc = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE, text=True)
+            try:
+                line = proc.stdout.readline()
+                self.assertIn('LOCKED', line)
+                self.assertTrue(HostLock.is_locked(td))
+                proc.kill()
+                proc.wait()
+                self.assertFalse(HostLock.is_locked(td))
+                new_lock = HostLock(td)
+                self.assertTrue(new_lock.acquire())
+                new_lock.release()
+            finally:
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+    # --- RV-02: Android Manifest verification ---
+    def test_android_manifest_no_external_pairing_scheme(self):
+        manifest_path = SOURCE / 'viber-android/app/src/main/AndroidManifest.xml'
+        if manifest_path.exists():
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(manifest_path)
+            root = tree.getroot()
+            for data_elem in root.iter('data'):
+                scheme = data_elem.attrib.get('{http://schemas.android.com/apk/res/android}scheme')
+                self.assertNotEqual(scheme, 'viber', 'AndroidManifest.xml must not expose viber:// scheme to external intents')
 
 class RouterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -350,6 +527,81 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await duplicate.send(json.dumps(self.config.key_manager.sign_registration(challenge['challenge'])))
             with self.assertRaises(ConnectionClosed): await duplicate.recv()
         self.assertIs(self.server.registry.get_host(self.config.host_id).connection,original)
+
+    # --- RV-01: Envelope expansion & isolation tests ---
+    async def test_client_oversized_payload_rejected_isolated(self):
+        async with connect(self.url) as ws1, connect(self.url) as ws2:
+            c2 = await self.pair(ws2)
+            oversized_raw = "A" * (MAX_CLIENT_FRAME_BYTES + 1024)
+            await ws1.send(oversized_raw)
+            with self.assertRaises(ConnectionClosed) as cm:
+                await ws1.recv()
+            code = cm.exception.rcvd.code if hasattr(cm.exception, 'rcvd') and cm.exception.rcvd else ws1.close_code
+            self.assertEqual(code, 1009)
+            
+            # Shared host remains connected and registered
+            self.assertIsNotNone(self.server.registry.get_host(self.config.host_id))
+            
+            # ws2 continues unaffected
+            await ws2.send(json.dumps(c2.session.encrypt_json({'type': 'PING', 'ts': 123})))
+            res = c2.session.decrypt_json(json.loads(await ws2.recv()))
+            self.assertEqual(res['type'], 'PONG')
+            self.assertEqual(res['ts'], 123)
+
+    async def test_client_escape_expansion_isolation(self):
+        async with connect(self.url) as ws1, connect(self.url) as ws2:
+            c1, c2 = await asyncio.gather(self.pair(ws1), self.pair(ws2))
+            escape_text = '\\"\\n\\r\\t' * 1000 + "中文测试" * 1000
+            await ws1.send(json.dumps(c1.session.encrypt_json({'type': 'PING', 'ts': 111, 'data': escape_text})))
+            res1 = c1.session.decrypt_json(json.loads(await ws1.recv()))
+            self.assertEqual(res1['type'], 'PONG')
+            self.assertEqual(res1['ts'], 111)
+            
+            # Now ws1 sends payload exceeding client frame limit
+            await ws1.send(json.dumps({'type': 'OVERSIZED', 'data': 'x' * (MAX_CLIENT_FRAME_BYTES + 10)}))
+            with self.assertRaises(ConnectionClosed) as cm:
+                await ws1.recv()
+            code = cm.exception.rcvd.code if hasattr(cm.exception, 'rcvd') and cm.exception.rcvd else ws1.close_code
+            self.assertEqual(code, 1009)
+            
+            # Shared host is still registered and active
+            self.assertIsNotNone(self.server.registry.get_host(self.config.host_id))
+            
+            # ws2 can still complete message roundtrip
+            await ws2.send(json.dumps(c2.session.encrypt_json({'type': 'PING', 'ts': 999})))
+            res2 = c2.session.decrypt_json(json.loads(await ws2.recv()))
+            self.assertEqual(res2['type'], 'PONG')
+            self.assertEqual(res2['ts'], 999)
+
+    async def test_unauthenticated_client_oversized_frame_rejected(self):
+        async with connect(self.url) as bad_client, connect(self.url) as good_client:
+            await bad_client.send("X" * (MAX_CLIENT_FRAME_BYTES + 2048))
+            with self.assertRaises(ConnectionClosed) as cm:
+                await bad_client.recv()
+            code = cm.exception.rcvd.code if hasattr(cm.exception, 'rcvd') and cm.exception.rcvd else bad_client.close_code
+            self.assertEqual(code, 1009)
+            
+            c = await self.pair(good_client)
+            await good_client.send(json.dumps(c.session.encrypt_json({'type': 'PING', 'ts': 777})))
+            res = c.session.decrypt_json(json.loads(await good_client.recv()))
+            self.assertEqual(res['type'], 'PONG')
+            self.assertEqual(res['ts'], 777)
+            self.assertIsNotNone(self.server.registry.get_host(self.config.host_id))
+
+    async def test_near_limit_multibyte_utf8_relayed(self):
+        async with connect(self.url) as ws:
+            c = await self.pair(ws)
+            # Create a UTF-8 payload with multi-byte Chinese chars that produces ~400 KiB wire frame
+            chunk = "测试中文数据字符串" * 10
+            repeat = (180 * 1024) // len(chunk.encode('utf-8'))
+            payload_str = chunk * repeat
+            wire_msg = json.dumps(c.session.encrypt_json({'type': 'PING', 'ts': 888, 'content': payload_str}))
+            self.assertGreater(len(wire_msg.encode('utf-8')), 350 * 1024)
+            self.assertLess(len(wire_msg.encode('utf-8')), MAX_CLIENT_FRAME_BYTES)
+            await ws.send(wire_msg)
+            res = c.session.decrypt_json(json.loads(await ws.recv()))
+            self.assertEqual(res['type'], 'PONG')
+            self.assertEqual(res['ts'], 888)
 
 @unittest.skipUnless(shutil.which('node'),'Node.js is required for JS interop tests')
 class JavaScriptInteropTests(unittest.TestCase):
