@@ -6,6 +6,8 @@
 .gemini/
 .npm/
 .viber/
+.cache/
+.local/
 .bash_history
 .wget-hsts
 .remote-viber-security-backup-*/
