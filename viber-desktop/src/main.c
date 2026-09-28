@@ -1,7 +1,8 @@
 /*
- * RemoteViber Native Linux Desktop Application
+ * RemoteViber Native Linux Desktop Client
  * Powered by GTK+ 3.0 & WebKit2GTK 4.1
- * High elasticity, smooth animations, ultra-low resource usage, asynchronous & non-blocking.
+ * Completely decoupled from the server; client and server run independently.
+ * Ultra-low resource usage, smooth animations, asynchronous & non-blocking.
  */
 
 #define _GNU_SOURCE
@@ -17,10 +18,6 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/prctl.h>
 #include <libgen.h>
 
 #define DEFAULT_HOST "127.0.0.1"
@@ -47,11 +44,8 @@ typedef struct {
     char target_url[512];
     char app_dir[1024];
     
-    pid_t spawned_host_pid;
     gboolean is_fullscreen;
-    gboolean keep_host_on_exit;
     gboolean page_loaded;
-    int connect_attempts;
     guint poll_timer_id;
 } AppState;
 
@@ -95,200 +89,52 @@ static gboolean is_port_open(const char *ip, int port) {
     return FALSE;
 }
 
-/* Gracefully terminate spawned host process and its entire process group */
-static void stop_spawned_host(AppState *state) {
-    if (state->keep_host_on_exit) {
-        g_print("[RemoteViber] 配置为保留后台服务 (--keep-host)，跳过关闭。\n");
-        return;
-    }
-    if (state->spawned_host_pid > 0) {
-        pid_t pid = state->spawned_host_pid;
-        state->spawned_host_pid = 0;
-        g_print("[RemoteViber] 正在关闭后台服务进程 (PID: %d)...\n", pid);
-
-        /* Send SIGTERM to the process group so all child workers receive it */
-        kill(-pid, SIGTERM);
-        kill(pid, SIGTERM);
-
-        /* Wait up to 1.5 seconds for graceful shutdown */
-        for (int i = 0; i < 15; i++) {
-            int status = 0;
-            pid_t r = waitpid(pid, &status, WNOHANG);
-            if (r == pid || r == -1) {
-                g_print("[RemoteViber] 后台服务已成功安全退出。\n");
-                return;
-            }
-            g_usleep(100000); /* 100ms */
-        }
-
-        /* If still alive after 1.5s, forcefully terminate */
-        g_print("[RemoteViber] 服务未在时限内退出，执行强制终止 (SIGKILL)...\n");
-        kill(-pid, SIGKILL);
-        kill(pid, SIGKILL);
-        int status = 0;
-        waitpid(pid, &status, 0);
-        g_print("[RemoteViber] 后台服务已清理完毕。\n");
-    }
-}
-
-/* Global signal handler for SIGINT, SIGTERM, SIGHUP */
-static void signal_handler(int sig) {
-    (void)sig;
-    stop_spawned_host(&app_state);
-    _exit(0);
-}
-
-/* Locate and asynchronously spawn viber-host if not running */
-static gboolean try_spawn_host(AppState *state) {
-    const char *candidates[] = {
-        "./dist-bin/viber-host-linux-x86_64",
-        "../dist-bin/viber-host-linux-x86_64",
-        "./viber-host-linux-x86_64",
-        "/usr/local/bin/viber-host-linux-x86_64",
-        NULL
-    };
-
-    char resolved_path[2048] = {0};
-    for (int i = 0; candidates[i] != NULL; i++) {
-        if (access(candidates[i], X_OK) == 0) {
-            snprintf(resolved_path, sizeof(resolved_path), "%s", candidates[i]);
-            break;
-        }
-    }
-
-    /* Check relative to executable dir */
-    if (resolved_path[0] == '\0' && state->app_dir[0] != '\0') {
-        char test_path[2048];
-        snprintf(test_path, sizeof(test_path), "%s/viber-host-linux-x86_64", state->app_dir);
-        if (access(test_path, X_OK) == 0) {
-            snprintf(resolved_path, sizeof(resolved_path), "%s", test_path);
-        } else {
-            snprintf(test_path, sizeof(test_path), "%s/../dist-bin/viber-host-linux-x86_64", state->app_dir);
-            if (access(test_path, X_OK) == 0) {
-                snprintf(resolved_path, sizeof(resolved_path), "%s", test_path);
-            }
-        }
-    }
-
-    if (resolved_path[0] != '\0') {
-        g_print("[RemoteViber] 正在后台启动原生服务: %s\n", resolved_path);
-        pid_t pid = fork();
-        if (pid == 0) {
-            /* Child process: become process group leader */
-            setpgid(0, 0);
-#ifdef __linux__
-            /* Automatically receive SIGTERM if parent process dies */
-            prctl(PR_SET_PDEATHSIG, SIGTERM);
-#endif
-            int devnull = open("/dev/null", O_RDWR);
-            if (devnull >= 0) {
-                dup2(devnull, STDIN_FILENO);
-                dup2(devnull, STDOUT_FILENO);
-                dup2(devnull, STDERR_FILENO);
-                close(devnull);
-            }
-            char port_str[16];
-            snprintf(port_str, sizeof(port_str), "%d", state->port);
-            char *args[] = { resolved_path, "--port", port_str, NULL };
-            execv(resolved_path, args);
-            _exit(1);
-        } else if (pid > 0) {
-            state->spawned_host_pid = pid;
-            return TRUE;
-        }
-    }
-
-    /* Fallback: try python3 viber-host/main.py */
-    const char *py_candidates[] = {
-        "viber-host/main.py",
-        "../viber-host/main.py",
-        NULL
-    };
-    for (int i = 0; py_candidates[i] != NULL; i++) {
-        if (access(py_candidates[i], R_OK) == 0) {
-            g_print("[RemoteViber] 启动 Python 核心服务: %s\n", py_candidates[i]);
-            pid_t pid = fork();
-            if (pid == 0) {
-                setpgid(0, 0);
-#ifdef __linux__
-                prctl(PR_SET_PDEATHSIG, SIGTERM);
-#endif
-                int devnull = open("/dev/null", O_RDWR);
-                if (devnull >= 0) {
-                    dup2(devnull, STDIN_FILENO);
-                    dup2(devnull, STDOUT_FILENO);
-                    dup2(devnull, STDERR_FILENO);
-                    close(devnull);
-                }
-                char port_str[16];
-                snprintf(port_str, sizeof(port_str), "%d", state->port);
-                char *args[] = { (char *)"python3", (char *)py_candidates[i], (char *)"--port", port_str, NULL };
-                execvp("python3", args);
-                _exit(1);
-            } else if (pid > 0) {
-                state->spawned_host_pid = pid;
-                return TRUE;
-            }
-        }
-    }
-
-    return FALSE;
-}
-
-/* Polling callback to check when host becomes ready */
+/* Polling callback: wait for host server to become available */
 static gboolean check_host_ready_cb(gpointer user_data) {
     AppState *state = (AppState *)user_data;
-    state->connect_attempts++;
 
     if (is_port_open(state->host, state->port)) {
-        g_print("[RemoteViber] 本地服务就绪 (127.0.0.1:%d)，正在加载终端工作台...\n", state->port);
+        g_print("[RemoteViber] 服务端已连接 (http://%s:%d/)，正在加载工作台...\n", state->host, state->port);
         gtk_label_set_markup(GTK_LABEL(state->spinner_label),
-            "<span size='small' foreground='#38bdf8'>本地服务已连接，正在加载终端网格...</span>");
+            "<span size='small' foreground='#38bdf8'>已检测到服务端，正在加载终端拼图网格...</span>");
         
         char status_str[128];
         snprintf(status_str, sizeof(status_str),
             "<span color='#10b981' font_weight='bold'>●</span> <span color='#94a3b8' font_size='small'>%d 准备中</span>", state->port);
         gtk_label_set_markup(GTK_LABEL(state->status_label), status_str);
 
-        /* Start loading URL into WebKit; transition stack only on WEBKIT_LOAD_FINISHED to prevent black screen! */
+        /* Load URL; transition to webview once WEBKIT_LOAD_FINISHED fires */
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
         state->poll_timer_id = 0;
         return G_SOURCE_REMOVE;
     }
 
-    if (state->connect_attempts == 1) {
-        try_spawn_host(state);
-    }
+    /* Server not reachable yet: update waiting screen */
+    char wait_msg[1024];
+    snprintf(wait_msg, sizeof(wait_msg),
+        "<span size='medium' weight='bold' foreground='#38bdf8'>正在等待连接服务端 (http://%s:%d/)...</span>\n\n"
+        "<span size='small' foreground='#94a3b8'>客户端与服务端已脱离，请在终端独立启动服务端：</span>\n"
+        "<span font_family='monospace' size='small' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
+        "<span size='small' foreground='#64748b'>（服务端启动后客户端将自动感应并呈现终端工作台）</span>",
+        state->host, state->port, state->port);
+    gtk_label_set_markup(GTK_LABEL(state->spinner_label), wait_msg);
 
-    if (state->connect_attempts > 60) { /* 15 seconds */
-        gtk_spinner_stop(GTK_SPINNER(state->spinner));
-        char err_msg[384];
-        snprintf(err_msg, sizeof(err_msg),
-            "<span size='small' foreground='#ef4444'>无法连接到本地服务 (127.0.0.1:%d)</span>\n"
-            "<span size='small' foreground='#64748b'>请检查端口是否被占用，或点击下方重新尝试启动。</span>", state->port);
-        gtk_label_set_markup(GTK_LABEL(state->spinner_label), err_msg);
-        gtk_widget_show(state->retry_btn);
-
-        gtk_label_set_markup(GTK_LABEL(state->status_label),
-            "<span color='#ef4444' font_weight='bold'>✕</span> <span color='#94a3b8' font_size='small'>连接失败</span>");
-        state->poll_timer_id = 0;
-        return G_SOURCE_REMOVE;
-    }
+    char badge_str[128];
+    snprintf(badge_str, sizeof(badge_str),
+        "<span color='#f59e0b' font_weight='bold'>○</span> <span color='#94a3b8' font_size='small'>等待服务 (%d)</span>", state->port);
+    gtk_label_set_markup(GTK_LABEL(state->status_label), badge_str);
 
     return G_SOURCE_CONTINUE;
 }
 
-/* Retry button handler */
+/* Retry / Reconnect button handler */
 static void on_retry_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
     gtk_widget_hide(state->retry_btn);
-    gtk_label_set_markup(GTK_LABEL(state->spinner_label),
-        "<span size='small' foreground='#94a3b8'>正在重新尝试唤醒本地服务...</span>");
     gtk_spinner_start(GTK_SPINNER(state->spinner));
-    state->connect_attempts = 0;
     if (state->poll_timer_id == 0) {
-        state->poll_timer_id = g_timeout_add(250, check_host_ready_cb, state);
+        state->poll_timer_id = g_timeout_add(1000, check_host_ready_cb, state);
     }
 }
 
@@ -313,18 +159,30 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
 static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, gchar *failing_uri, GError *error, gpointer user_data) {
     (void)web_view; (void)event;
     AppState *state = (AppState *)user_data;
-    g_printerr("[RemoteViber] 页面加载失败: %s (错误: %s)\n", failing_uri, error ? error->message : "未知错误");
+    g_printerr("[RemoteViber] 连接断开或页面加载失败: %s (原因: %s)\n", failing_uri, error ? error->message : "无法连接");
 
+    state->page_loaded = FALSE;
     gtk_stack_set_visible_child(GTK_STACK(state->stack), state->loading_box);
-    gtk_spinner_stop(GTK_SPINNER(state->spinner));
+    gtk_spinner_start(GTK_SPINNER(state->spinner));
 
-    char err_msg[512];
+    char err_msg[1024];
     snprintf(err_msg, sizeof(err_msg),
-        "<span size='small' foreground='#ef4444'>页面加载失败: %s</span>\n"
-        "<span size='small' foreground='#64748b'>请确认服务正在正常运行或点击下方重试</span>",
-        error ? error->message : "无法连接到本地服务");
+        "<span size='medium' weight='bold' foreground='#ef4444'>与服务端的连接已断开</span>\n\n"
+        "<span size='small' foreground='#94a3b8'>请确认服务端正在独立运行：</span>\n"
+        "<span font_family='monospace' size='small' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
+        "<span size='small' foreground='#64748b'>正在自动检测重新连接...</span>",
+        state->port);
     gtk_label_set_markup(GTK_LABEL(state->spinner_label), err_msg);
-    gtk_widget_show(state->retry_btn);
+
+    char badge_str[128];
+    snprintf(badge_str, sizeof(badge_str),
+        "<span color='#ef4444' font_weight='bold'>✕</span> <span color='#94a3b8' font_size='small'>已断开 (%d)</span>", state->port);
+    gtk_label_set_markup(GTK_LABEL(state->status_label), badge_str);
+
+    /* Resume polling to auto-reconnect when server is restarted */
+    if (state->poll_timer_id == 0) {
+        state->poll_timer_id = g_timeout_add(1000, check_host_ready_cb, state);
+    }
 
     return TRUE; /* Handled */
 }
@@ -332,7 +190,7 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
 /* WebKit WebProcess crash handler */
 static void on_web_process_terminated(WebKitWebView *web_view, WebKitWebProcessTerminationReason reason, gpointer user_data) {
     AppState *state = (AppState *)user_data;
-    g_printerr("[RemoteViber] 网页渲染进程异常退出 (原因代码: %d)，正在自动重启...\n", reason);
+    g_printerr("[RemoteViber] 网页渲染进程异常退出 (原因代码: %d)，正在自动重连...\n", reason);
 
     gtk_stack_set_visible_child(GTK_STACK(state->stack), state->loading_box);
     gtk_label_set_markup(GTK_LABEL(state->spinner_label),
@@ -421,9 +279,8 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer use
     (void)widget;
     AppState *state = (AppState *)user_data;
 
-    /* Ctrl+Q: Clean exit and stop host */
+    /* Ctrl+Q: Close client window (does not affect standalone server) */
     if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_q || event->keyval == GDK_KEY_Q)) {
-        stop_spawned_host(state);
         gtk_window_close(GTK_WINDOW(state->window));
         return TRUE;
     }
@@ -452,7 +309,11 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer use
     /* Ctrl+R or F5: Reload */
     if ((event->keyval == GDK_KEY_F5) ||
         ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_r || event->keyval == GDK_KEY_R))) {
-        webkit_web_view_reload(WEBKIT_WEB_VIEW(state->web_view));
+        if (is_port_open(state->host, state->port)) {
+            webkit_web_view_reload(WEBKIT_WEB_VIEW(state->web_view));
+        } else {
+            on_load_failed(WEBKIT_WEB_VIEW(state->web_view), WEBKIT_LOAD_FINISHED, state->target_url, NULL, state);
+        }
         return TRUE;
     }
 
@@ -464,7 +325,11 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer use
 static void on_reload_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
-    webkit_web_view_reload(WEBKIT_WEB_VIEW(state->web_view));
+    if (is_port_open(state->host, state->port)) {
+        webkit_web_view_reload(WEBKIT_WEB_VIEW(state->web_view));
+    } else {
+        on_load_failed(WEBKIT_WEB_VIEW(state->web_view), WEBKIT_LOAD_FINISHED, state->target_url, NULL, state);
+    }
 }
 
 static void on_fullscreen_clicked(GtkButton *btn, gpointer user_data) {
@@ -503,15 +368,13 @@ static void on_shortcuts_clicked(GtkButton *btn, gpointer user_data) {
 static void on_quit_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
-    stop_spawned_host(state);
     gtk_window_close(GTK_WINDOW(state->window));
 }
 
-/* Clean exit handler */
+/* Clean exit handler: closes client only; server is independent */
 static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
     (void)widget;
-    AppState *state = (AppState *)user_data;
-    stop_spawned_host(state);
+    (void)user_data;
     gtk_main_quit();
 }
 
@@ -538,21 +401,21 @@ int main(int argc, char *argv[]) {
             strncpy(app_state.host, argv[++i], sizeof(app_state.host) - 1);
         } else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc) {
             strncpy(app_state.target_url, argv[++i], sizeof(app_state.target_url) - 1);
-        } else if (strcmp(argv[i], "--keep-host") == 0) {
-            app_state.keep_host_on_exit = TRUE;
         } else if (strcmp(argv[i], "--no-gpu") == 0 || strcmp(argv[i], "--software") == 0) {
             force_software_rendering = TRUE;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            g_print("RemoteViber 原生桌面工作台 (Linux Native App)\n"
-                    "基于 GTK+ 3.0 & WebKit2GTK 4.1 原生图形库打造\n\n"
+            g_print("RemoteViber 原生桌面工作台 (Linux Native Desktop Client)\n"
+                    "基于 GTK+ 3.0 & WebKit2GTK 4.1 原生图形库打造 (客户端与服务端完全独立解耦)\n\n"
                     "用法: viber-desktop-linux [选项]\n\n"
                     "选项:\n"
-                    "  --port <port>   指定服务端口 (默认: 8765)\n"
-                    "  --host <ip>     指定服务IP (默认: 127.0.0.1)\n"
-                    "  --url <url>     直接指定加载 URL\n"
-                    "  --keep-host     退出应用时保留后台服务继续运行\n"
-                    "  --no-gpu        强制使用 CPU 纯软件渲染 (避免 GPU 驱动黑屏)\n"
-                    "  --help, -h      显示帮助信息\n");
+                    "  --port <port>   指定服务端连接端口 (默认: 8765)\n"
+                    "  --host <ip>     指定服务端连接IP (默认: 127.0.0.1)\n"
+                    "  --url <url>     直接指定连接完整 URL (例如 http://192.168.1.100:8765/)\n"
+                    "  --no-gpu        强制使用 CPU 纯软件渲染 (兼容老旧驱动/虚拟机)\n"
+                    "  --help, -h      显示帮助信息\n\n"
+                    "说明:\n"
+                    "  客户端不再自动拉起后台服务；请在终端独立启动服务端:\n"
+                    "    ./dist-bin/viber-host-linux-x86_64 --port 8765\n");
             return 0;
         }
     }
@@ -569,11 +432,6 @@ int main(int argc, char *argv[]) {
     if (force_software_rendering) {
         setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", 1);
     }
-
-    /* Register termination signals so background host is always cleaned up */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    signal(SIGHUP, signal_handler);
 
     if (!gtk_init_check(&argc, &argv)) {
         g_printerr("[RemoteViber] 未检测到图形桌面环境 (DISPLAY 或 WAYLAND_DISPLAY 未设置)。\n"
@@ -622,8 +480,10 @@ int main(int argc, char *argv[]) {
     app_state.status_badge = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.status_badge), "status-pill");
     app_state.status_label = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(app_state.status_label),
-        "<span color='#f59e0b' font_weight='bold'>○</span> <span color='#94a3b8' font_size='small'>启动服务中...</span>");
+    char init_badge[128];
+    snprintf(init_badge, sizeof(init_badge),
+        "<span color='#f59e0b' font_weight='bold'>○</span> <span color='#94a3b8' font_size='small'>检测服务 (%d)</span>", app_state.port);
+    gtk_label_set_markup(GTK_LABEL(app_state.status_label), init_badge);
     gtk_box_pack_start(GTK_BOX(app_state.status_badge), app_state.status_label, FALSE, FALSE, 4);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.status_badge);
 
@@ -677,17 +537,22 @@ int main(int argc, char *argv[]) {
     
     GtkWidget *sub_lbl = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(sub_lbl),
-        "<span size='small' foreground='#64748b'>高弹性 · 磁吸吸附拼图 · 零外部依赖原生桌面核心</span>");
+        "<span size='small' foreground='#64748b'>高弹性 · 磁吸吸附拼图 · 原生独立客户端</span>");
 
     app_state.spinner = gtk_spinner_new();
     gtk_widget_set_size_request(app_state.spinner, 42, 42);
     gtk_spinner_start(GTK_SPINNER(app_state.spinner));
 
     app_state.spinner_label = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(app_state.spinner_label),
-        "<span size='small' foreground='#94a3b8'>正在唤醒本地服务并加载终端网格...</span>");
+    char initial_wait_text[1024];
+    snprintf(initial_wait_text, sizeof(initial_wait_text),
+        "<span size='medium' weight='bold' foreground='#38bdf8'>正在连接服务端 (http://%s:%d/)...</span>\n\n"
+        "<span size='small' foreground='#94a3b8'>若服务端尚未启动，请在独立终端中执行：</span>\n"
+        "<span font_family='monospace' size='small' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>",
+        app_state.host, app_state.port, app_state.port);
+    gtk_label_set_markup(GTK_LABEL(app_state.spinner_label), initial_wait_text);
 
-    app_state.retry_btn = gtk_button_new_with_label("重新连接本地服务");
+    app_state.retry_btn = gtk_button_new_with_label("立即重试连接");
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.retry_btn), "retry-btn");
     gtk_widget_set_no_show_all(app_state.retry_btn, TRUE);
     gtk_widget_hide(app_state.retry_btn);
@@ -732,8 +597,11 @@ int main(int argc, char *argv[]) {
 
     gtk_widget_show_all(app_state.window);
 
-    /* Start non-blocking polling timer for host readiness */
-    app_state.poll_timer_id = g_timeout_add(250, check_host_ready_cb, &app_state);
+    /* Start non-blocking polling timer for host availability (polling every 1 second) */
+    app_state.poll_timer_id = g_timeout_add(1000, check_host_ready_cb, &app_state);
+
+    /* Trigger immediate initial check */
+    check_host_ready_cb(&app_state);
 
     gtk_main();
 
