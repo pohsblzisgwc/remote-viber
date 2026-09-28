@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import TopBar from './components/TopBar';
 import Dashboard from './components/Dashboard';
 import TerminalView from './components/TerminalView';
+import MosaicTerminalGrid from './components/MosaicTerminalGrid';
 import SessionTabs from './components/SessionTabs';
 import LaunchModal from './components/LaunchModal';
 import PairingModal from './components/PairingModal';
@@ -328,11 +329,14 @@ export default function App() {
               onTerminateSession={handleTerminateSession}
               onDeleteSession={handleDeleteSession}
             />
-            <TerminalView
+            <MosaicTerminalGrid
+              sessions={sessions}
+              activeSessionId={activeSessionId || activeSession?.session_id}
+              onSelectSession={(id) => setActiveSessionId(id)}
               connection={connectionRef.current}
-              activeSession={activeSession}
               connectionState={connectionState}
               onSwitchToDashboard={() => setActiveView('dashboard')}
+              onNewTerminal={() => handleQuickTerminal()}
               onTerminateSession={handleTerminateSession}
               onRestartSession={handleRestartSession}
               onDeleteSession={handleDeleteSession}
