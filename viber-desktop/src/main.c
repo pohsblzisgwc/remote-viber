@@ -96,11 +96,12 @@ static gboolean check_host_ready_cb(gpointer user_data) {
     if (is_port_open(state->host, state->port)) {
         g_print("[RemoteViber] 服务端已连接 (http://%s:%d/)，正在加载工作台...\n", state->host, state->port);
         gtk_label_set_markup(GTK_LABEL(state->spinner_label),
-            "<span size='small' foreground='#38bdf8'>已检测到服务端，正在加载终端拼图网格...</span>");
+            "<span size='medium' weight='bold' foreground='#38bdf8'>已连接服务端！</span>\n\n"
+            "<span size='small' foreground='#94a3b8'>正在载入终端拼图网格工作台...</span>");
         
         char status_str[128];
         snprintf(status_str, sizeof(status_str),
-            "<span color='#10b981' font_weight='bold'>●</span> <span color='#94a3b8' font_size='small'>%d 准备中</span>", state->port);
+            "<span color='#10b981' font_weight='bold'>●</span> <span color='#38bdf8' font_size='small'>%d 准备中</span>", state->port);
         gtk_label_set_markup(GTK_LABEL(state->status_label), status_str);
 
         /* Load URL; transition to webview once WEBKIT_LOAD_FINISHED fires */
@@ -113,9 +114,9 @@ static gboolean check_host_ready_cb(gpointer user_data) {
     char wait_msg[1024];
     snprintf(wait_msg, sizeof(wait_msg),
         "<span size='medium' weight='bold' foreground='#38bdf8'>正在等待连接服务端 (http://%s:%d/)...</span>\n\n"
-        "<span size='small' foreground='#94a3b8'>客户端与服务端已脱离，请在终端独立启动服务端：</span>\n"
-        "<span font_family='monospace' size='small' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
-        "<span size='small' foreground='#64748b'>（服务端启动后客户端将自动感应并呈现终端工作台）</span>",
+        "<span size='small' foreground='#94a3b8'>客户端与服务端已独立脱离，请在终端独立启动服务端：</span>\n\n"
+        "<span font_family='monospace' size='medium' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
+        "<span size='small' foreground='#64748b'>服务端启动后客户端将毫秒级自动感应并呈现拼图终端</span>",
         state->host, state->port, state->port);
     gtk_label_set_markup(GTK_LABEL(state->spinner_label), wait_msg);
 
@@ -131,11 +132,18 @@ static gboolean check_host_ready_cb(gpointer user_data) {
 static void on_retry_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
-    gtk_widget_hide(state->retry_btn);
     gtk_spinner_start(GTK_SPINNER(state->spinner));
     if (state->poll_timer_id == 0) {
         state->poll_timer_id = g_timeout_add(1000, check_host_ready_cb, state);
     }
+    check_host_ready_cb(state);
+}
+
+/* Open in system browser button handler */
+static void on_open_browser_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    gtk_show_uri_on_window(GTK_WINDOW(state->window), state->target_url, GDK_CURRENT_TIME, NULL);
 }
 
 /* WebKit load-changed handler: only switch view when page has actually loaded! */
@@ -143,14 +151,18 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
     (void)web_view;
     AppState *state = (AppState *)user_data;
 
-    if (event == WEBKIT_LOAD_COMMITTED || event == WEBKIT_LOAD_FINISHED) {
+    if (event == WEBKIT_LOAD_COMMITTED) {
+        gtk_label_set_markup(GTK_LABEL(state->spinner_label),
+            "<span size='medium' weight='bold' foreground='#38bdf8'>已建立通信连接</span>\n\n"
+            "<span size='small' foreground='#94a3b8'>正在解析渲染拼图工作台视图...</span>");
+    } else if (event == WEBKIT_LOAD_FINISHED) {
         state->page_loaded = TRUE;
         gtk_spinner_stop(GTK_SPINNER(state->spinner));
         gtk_stack_set_visible_child(GTK_STACK(state->stack), state->web_view);
         
         char status_str[128];
         snprintf(status_str, sizeof(status_str),
-            "<span color='#10b981' font_weight='bold'>●</span> <span color='#94a3b8' font_size='small'>%d 在线</span>", state->port);
+            "<span color='#10b981' font_weight='bold'>●</span> <span color='#38bdf8' font_size='small'>%d 在线</span>", state->port);
         gtk_label_set_markup(GTK_LABEL(state->status_label), status_str);
     }
 }
@@ -200,65 +212,179 @@ static void on_web_process_terminated(WebKitWebView *web_view, WebKitWebProcessT
     webkit_web_view_reload(web_view);
 }
 
-/* CSS Theme for Sleek Dark Glass UI */
+/* CSS Theme for Sleek Obsidian Glassmorphic UI with Cyberpunk Accents */
 static void apply_dark_theme(void) {
+    /* Enforce dark theme preferences globally on GTK */
+    GtkSettings *gtk_settings = gtk_settings_get_default();
+    if (gtk_settings) {
+        g_object_set(gtk_settings,
+                     "gtk-application-prefer-dark-theme", TRUE,
+                     "gtk-theme-name", "Adwaita-dark",
+                     NULL);
+    }
+
     GtkCssProvider *provider = gtk_css_provider_new();
     const char *css =
-        "window.remote-viber-window {"
-        "  background-color: #090d16;"
+        "* {"
+        "  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans CJK SC', 'Noto Sans', sans-serif;"
         "  color: #f1f5f9;"
         "}"
-        "headerbar.remote-viber-header {"
-        "  background-color: #0b0f19;"
+        "window, window.background, window.remote-viber-window {"
+        "  background-color: #060911;"
+        "  background-image: radial-gradient(circle at 50% 0%, rgba(56, 189, 248, 0.08) 0%, transparent 65%);"
+        "  color: #f1f5f9;"
+        "}"
+        "stack, box, viewport, scrolledwindow {"
+        "  background-color: transparent;"
+        "}"
+        "headerbar, .titlebar, headerbar.titlebar, headerbar.remote-viber-header,"
+        "headerbar:backdrop, .titlebar:backdrop {"
+        "  background-color: #080c16;"
+        "  background-image: linear-gradient(180deg, #0d1424 0%, #080c16 100%);"
         "  border-bottom: 1px solid rgba(255, 255, 255, 0.08);"
-        "  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);"
-        "  padding: 4px 10px;"
-        "  min-height: 44px;"
+        "  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);"
+        "  padding: 5px 12px;"
+        "  min-height: 46px;"
+        "  color: #f8fafc;"
+        "}"
+        "headerbar .title, .titlebar .title {"
+        "  font-weight: 700;"
+        "  font-size: 13px;"
+        "  color: #f8fafc;"
+        "  letter-spacing: 0.3px;"
+        "}"
+        "headerbar .subtitle, .titlebar .subtitle {"
+        "  font-size: 11px;"
+        "  color: #64748b;"
         "}"
         ".status-pill {"
-        "  background-color: rgba(15, 23, 42, 0.7);"
-        "  border: 1px solid rgba(255, 255, 255, 0.1);"
+        "  background-color: rgba(15, 23, 42, 0.85);"
+        "  border: 1px solid rgba(56, 189, 248, 0.25);"
         "  border-radius: 9999px;"
-        "  padding: 3px 10px;"
+        "  padding: 3px 12px;"
+        "  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.06);"
         "}"
-        ".action-btn {"
-        "  background-color: rgba(30, 41, 59, 0.6);"
+        "headerbar button, .titlebar button, button.action-btn {"
+        "  background-color: rgba(255, 255, 255, 0.05);"
+        "  background-image: none;"
         "  border: 1px solid rgba(255, 255, 255, 0.08);"
         "  border-radius: 8px;"
         "  color: #94a3b8;"
-        "  padding: 4px 10px;"
-        "  margin: 0 2px;"
-        "  transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);"
+        "  font-size: 12px;"
+        "  font-weight: 500;"
+        "  padding: 4px 11px;"
+        "  margin: 0 3px;"
+        "  box-shadow: none;"
+        "  text-shadow: none;"
+        "  transition: all 180ms cubic-bezier(0.16, 1, 0.3, 1);"
         "}"
-        ".action-btn:hover {"
-        "  background-color: rgba(51, 65, 85, 0.8);"
+        "headerbar button:hover, .titlebar button:hover, button.action-btn:hover {"
+        "  background-color: rgba(56, 189, 248, 0.12);"
+        "  background-image: none;"
+        "  border-color: rgba(56, 189, 248, 0.4);"
         "  color: #38bdf8;"
-        "  border-color: rgba(56, 189, 248, 0.3);"
+        "  box-shadow: 0 0 14px rgba(56, 189, 248, 0.22);"
         "}"
-        ".action-btn:active {"
-        "  background-color: rgba(56, 189, 248, 0.2);"
+        "headerbar button:active, .titlebar button:active, button.action-btn:active {"
+        "  background-color: rgba(56, 189, 248, 0.25);"
+        "  border-color: #38bdf8;"
+        "  color: #ffffff;"
         "}"
-        ".quit-btn:hover {"
-        "  background-color: rgba(239, 68, 68, 0.2);"
+        "headerbar button.quit-btn:hover, button.action-btn.quit-btn:hover {"
+        "  background-color: rgba(239, 68, 68, 0.16);"
+        "  background-image: none;"
+        "  border-color: rgba(239, 68, 68, 0.45);"
         "  color: #ef4444;"
-        "  border-color: rgba(239, 68, 68, 0.3);"
+        "  box-shadow: 0 0 14px rgba(239, 68, 68, 0.25);"
+        "}"
+        "headerbar button.titlebutton, .titlebar button.titlebutton {"
+        "  background-color: transparent;"
+        "  background-image: none;"
+        "  border: none;"
+        "  color: #94a3b8;"
+        "  border-radius: 6px;"
+        "  padding: 6px;"
+        "}"
+        "headerbar button.titlebutton:hover, .titlebar button.titlebutton:hover {"
+        "  background-color: rgba(255, 255, 255, 0.08);"
+        "  color: #ffffff;"
+        "}"
+        "headerbar button.titlebutton.close:hover, .titlebar button.titlebutton.close:hover {"
+        "  background-color: #ef4444;"
+        "  color: #ffffff;"
+        "}"
+        ".glass-card {"
+        "  background-color: rgba(13, 20, 36, 0.88);"
+        "  background-image: linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0.01) 100%);"
+        "  border: 1px solid rgba(56, 189, 248, 0.22);"
+        "  border-radius: 20px;"
+        "  padding: 36px 48px;"
+        "  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.65), 0 0 40px rgba(56, 189, 248, 0.08);"
+        "  min-width: 520px;"
+        "}"
+        ".tag-badge {"
+        "  background-color: rgba(56, 189, 248, 0.12);"
+        "  border: 1px solid rgba(56, 189, 248, 0.3);"
+        "  border-radius: 9999px;"
+        "  padding: 3px 14px;"
+        "}"
+        ".cmd-box {"
+        "  background-color: #030712;"
+        "  border: 1px solid rgba(52, 211, 153, 0.35);"
+        "  border-radius: 10px;"
+        "  padding: 10px 18px;"
+        "  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.6);"
         "}"
         ".retry-btn {"
         "  background-color: #0284c7;"
+        "  background-image: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);"
+        "  border: 1px solid rgba(56, 189, 248, 0.4);"
+        "  border-radius: 10px;"
         "  color: #ffffff;"
-        "  border-radius: 8px;"
-        "  padding: 6px 16px;"
-        "  font-weight: bold;"
+        "  font-weight: 600;"
+        "  font-size: 13px;"
+        "  padding: 8px 22px;"
+        "  box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);"
+        "  transition: all 180ms ease-in-out;"
         "}"
         ".retry-btn:hover {"
-        "  background-color: #0369a1;"
+        "  background-color: #0ea5e9;"
+        "  background-image: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);"
+        "  box-shadow: 0 6px 20px rgba(14, 165, 233, 0.5);"
+        "}"
+        ".retry-btn:active {"
+        "  background-color: #0284c7;"
+        "}"
+        ".secondary-btn {"
+        "  background-color: rgba(30, 41, 59, 0.6);"
+        "  background-image: none;"
+        "  border: 1px solid rgba(255, 255, 255, 0.12);"
+        "  border-radius: 10px;"
+        "  color: #cbd5e1;"
+        "  font-weight: 500;"
+        "  font-size: 13px;"
+        "  padding: 8px 18px;"
+        "  box-shadow: none;"
+        "  text-shadow: none;"
+        "  transition: all 180ms ease-in-out;"
+        "}"
+        ".secondary-btn:hover {"
+        "  background-color: rgba(51, 65, 85, 0.85);"
+        "  background-image: none;"
+        "  color: #38bdf8;"
+        "  border-color: rgba(56, 189, 248, 0.35);"
+        "  box-shadow: 0 0 12px rgba(56, 189, 248, 0.18);"
+        "}"
+        ".secondary-btn:active {"
+        "  background-color: rgba(30, 41, 59, 0.9);"
+        "  background-image: none;"
         "}";
 
     gtk_css_provider_load_from_data(provider, css, -1, NULL);
     gtk_style_context_add_provider_for_screen(
         gdk_screen_get_default(),
         GTK_STYLE_PROVIDER(provider),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION
+        GTK_STYLE_PROVIDER_PRIORITY_USER
     );
     g_object_unref(provider);
 }
@@ -314,6 +440,12 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer use
         } else {
             on_load_failed(WEBKIT_WEB_VIEW(state->web_view), WEBKIT_LOAD_FINISHED, state->target_url, NULL, state);
         }
+        return TRUE;
+    }
+
+    /* 'r' or 'R' when in waiting/loading state: trigger immediate retry */
+    if (!state->page_loaded && (event->keyval == GDK_KEY_r || event->keyval == GDK_KEY_R)) {
+        on_retry_clicked(NULL, state);
         return TRUE;
     }
 
@@ -421,12 +553,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Prevent WebProcess bwrap sandbox permission failures in containers/unprivileged Linux accounts */
-    if (!getenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS")) {
-        setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 0);
-    }
-    if (!getenv("WEBKIT_FORCE_SANDBOX")) {
-        setenv("WEBKIT_FORCE_SANDBOX", "0", 0);
-    }
+    setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
 
     /* If software rendering requested, disable compositing mode */
     if (force_software_rendering) {
@@ -526,44 +653,74 @@ int main(int argc, char *argv[]) {
     gtk_stack_set_transition_type(GTK_STACK(app_state.stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
     gtk_stack_set_transition_duration(GTK_STACK(app_state.stack), 300);
 
-    /* Loading / Splash View */
-    app_state.loading_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    /* Loading / Waiting View: Encapsulated inside a high-end Glassmorphic Floating Panel */
+    app_state.loading_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_set_valign(app_state.loading_box, GTK_ALIGN_CENTER);
     gtk_widget_set_halign(app_state.loading_box, GTK_ALIGN_CENTER);
 
+    GtkWidget *glass_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
+    gtk_style_context_add_class(gtk_widget_get_style_context(glass_card), "glass-card");
+
+    /* Tag badge on top */
+    GtkWidget *tag_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_halign(tag_box, GTK_ALIGN_CENTER);
+    GtkWidget *tag_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(tag_label),
+        "<span size='smaller' weight='bold' foreground='#38bdf8'>⚡ REMOTE VIBER · NATIVE CLIENT</span>");
+    gtk_style_context_add_class(gtk_widget_get_style_context(tag_box), "tag-badge");
+    gtk_box_pack_start(GTK_BOX(tag_box), tag_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(glass_card), tag_box, FALSE, FALSE, 0);
+
+    /* Main Title */
     app_state.spinner_title = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(app_state.spinner_title),
-        "<span size='large' weight='bold' foreground='#38bdf8'>RemoteViber 终端拼图工作台</span>");
-    
+        "<span size='x-large' weight='bold' foreground='#f8fafc'>RemoteViber 终端拼图工作台</span>");
+    gtk_box_pack_start(GTK_BOX(glass_card), app_state.spinner_title, FALSE, FALSE, 0);
+
+    /* Subtitle */
     GtkWidget *sub_lbl = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(sub_lbl),
-        "<span size='small' foreground='#64748b'>高弹性 · 磁吸吸附拼图 · 原生独立客户端</span>");
+        "<span size='small' foreground='#94a3b8'>高弹性终端矩阵 · 自动磁吸吸附 · 纯原生零 Chrome 依赖</span>");
+    gtk_box_pack_start(GTK_BOX(glass_card), sub_lbl, FALSE, FALSE, 0);
 
+    /* Spinner */
     app_state.spinner = gtk_spinner_new();
-    gtk_widget_set_size_request(app_state.spinner, 42, 42);
+    gtk_widget_set_size_request(app_state.spinner, 38, 38);
+    gtk_widget_set_halign(app_state.spinner, GTK_ALIGN_CENTER);
     gtk_spinner_start(GTK_SPINNER(app_state.spinner));
+    gtk_box_pack_start(GTK_BOX(glass_card), app_state.spinner, FALSE, FALSE, 4);
 
+    /* Wait / Status message */
     app_state.spinner_label = gtk_label_new(NULL);
+    gtk_label_set_justify(GTK_LABEL(app_state.spinner_label), GTK_JUSTIFY_CENTER);
+    gtk_label_set_line_wrap(GTK_LABEL(app_state.spinner_label), TRUE);
     char initial_wait_text[1024];
     snprintf(initial_wait_text, sizeof(initial_wait_text),
-        "<span size='medium' weight='bold' foreground='#38bdf8'>正在连接服务端 (http://%s:%d/)...</span>\n\n"
-        "<span size='small' foreground='#94a3b8'>若服务端尚未启动，请在独立终端中执行：</span>\n"
-        "<span font_family='monospace' size='small' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>",
+        "<span size='medium' weight='bold' foreground='#38bdf8'>正在等待连接服务端 (http://%s:%d/)...</span>\n\n"
+        "<span size='small' foreground='#94a3b8'>客户端与服务端已独立脱离，请在终端独立启动服务端：</span>\n\n"
+        "<span font_family='monospace' size='medium' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
+        "<span size='small' foreground='#64748b'>服务端启动后客户端将毫秒级自动感应并呈现拼图终端</span>",
         app_state.host, app_state.port, app_state.port);
     gtk_label_set_markup(GTK_LABEL(app_state.spinner_label), initial_wait_text);
+    gtk_box_pack_start(GTK_BOX(glass_card), app_state.spinner_label, FALSE, FALSE, 4);
 
-    app_state.retry_btn = gtk_button_new_with_label("立即重试连接");
+    /* Action button row */
+    GtkWidget *btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_halign(btn_row, GTK_ALIGN_CENTER);
+
+    app_state.retry_btn = gtk_button_new_with_label("立即重试连接 (R)");
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.retry_btn), "retry-btn");
-    gtk_widget_set_no_show_all(app_state.retry_btn, TRUE);
-    gtk_widget_hide(app_state.retry_btn);
     g_signal_connect(app_state.retry_btn, "clicked", G_CALLBACK(on_retry_clicked), &app_state);
+    gtk_box_pack_start(GTK_BOX(btn_row), app_state.retry_btn, FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(app_state.loading_box), app_state.spinner_title, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(app_state.loading_box), sub_lbl, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(app_state.loading_box), app_state.spinner, FALSE, FALSE, 8);
-    gtk_box_pack_start(GTK_BOX(app_state.loading_box), app_state.spinner_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(app_state.loading_box), app_state.retry_btn, FALSE, FALSE, 12);
+    GtkWidget *btn_browser = gtk_button_new_with_label("打开系统浏览器");
+    gtk_style_context_add_class(gtk_widget_get_style_context(btn_browser), "secondary-btn");
+    g_signal_connect(btn_browser, "clicked", G_CALLBACK(on_open_browser_clicked), &app_state);
+    gtk_box_pack_start(GTK_BOX(btn_row), btn_browser, FALSE, FALSE, 0);
 
+    gtk_box_pack_start(GTK_BOX(glass_card), btn_row, FALSE, FALSE, 6);
+
+    gtk_box_pack_start(GTK_BOX(app_state.loading_box), glass_card, FALSE, FALSE, 0);
     gtk_stack_add_named(GTK_STACK(app_state.stack), app_state.loading_box, "loading");
 
     /* WebKitWebView Setup (ON_DEMAND acceleration prevents black screen on Linux systems without DRI3) */
@@ -577,6 +734,25 @@ int main(int argc, char *argv[]) {
 
     app_state.web_view = webkit_web_view_new_with_settings(settings);
     g_object_unref(settings);
+
+    /* Set transparent base background so dark obsidian GTK window shows through with zero white flash */
+    GdkRGBA trans_bg = { 0.0, 0.0, 0.0, 0.0 };
+    webkit_web_view_set_background_color(WEBKIT_WEB_VIEW(app_state.web_view), &trans_bg);
+
+    /* Inject user dark theme CSS to guarantee dark styling across all HTML/body elements and subframes */
+    WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(app_state.web_view));
+    WebKitUserStyleSheet *sheet = webkit_user_style_sheet_new(
+        "html, body { background-color: #060911 !important; color-scheme: dark !important; }"
+        "::-webkit-scrollbar { width: 8px; height: 8px; }"
+        "::-webkit-scrollbar-track { background: #060911; }"
+        "::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }"
+        "::-webkit-scrollbar-thumb:hover { background: #334155; }",
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_STYLE_LEVEL_USER,
+        NULL, NULL
+    );
+    webkit_user_content_manager_add_style_sheet(ucm, sheet);
+    webkit_user_style_sheet_unref(sheet);
 
     app_state.inspector = webkit_web_view_get_inspector(WEBKIT_WEB_VIEW(app_state.web_view));
 
