@@ -17,20 +17,28 @@ import com.remoteviber.client.ui.theme.ViberBg
 class XtermController {
     var webViewRef: WebView? = null
     var isReady = false
-    private val pendingQueue = mutableListOf<String>()
+    private val historyList = mutableListOf<String>()
 
     fun writeBase64(b64: String) {
+        val clean = b64.replace("\r", "").replace("\n", "").trim()
+        if (clean.isEmpty()) return
+        synchronized(historyList) {
+            historyList.add(clean)
+            if (historyList.size > 5000) {
+                historyList.removeAt(0)
+            }
+        }
         if (isReady && webViewRef != null) {
             webViewRef?.post {
-                webViewRef?.evaluateJavascript("window.writeB64Data('$b64');", null)
+                webViewRef?.evaluateJavascript("window.writeB64Data('$clean');", null)
             }
-        } else {
-            pendingQueue.add(b64)
         }
     }
 
     fun clear() {
-        pendingQueue.clear()
+        synchronized(historyList) {
+            historyList.clear()
+        }
         webViewRef?.post {
             webViewRef?.evaluateJavascript("window.clearTerminal();", null)
         }
@@ -50,13 +58,17 @@ class XtermController {
 
     internal fun onTerminalReady() {
         isReady = true
-        if (pendingQueue.isNotEmpty() && webViewRef != null) {
-            val copy = ArrayList(pendingQueue)
-            pendingQueue.clear()
+        val copy = synchronized(historyList) { ArrayList(historyList) }
+        if (copy.isNotEmpty() && webViewRef != null) {
             webViewRef?.post {
                 for (chunk in copy) {
                     webViewRef?.evaluateJavascript("window.writeB64Data('$chunk');", null)
                 }
+                webViewRef?.evaluateJavascript("if (window.scrollToBottom) window.scrollToBottom();", null)
+            }
+        } else {
+            webViewRef?.post {
+                webViewRef?.evaluateJavascript("if (window.scrollToBottom) window.scrollToBottom();", null)
             }
         }
     }

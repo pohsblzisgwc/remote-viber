@@ -5,12 +5,18 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Sync
@@ -19,6 +25,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
@@ -36,6 +43,8 @@ import com.remoteviber.client.ui.components.VirtualKeyboardBar
 import com.remoteviber.client.ui.components.Xterm2DView
 import com.remoteviber.client.ui.components.XtermController
 import com.remoteviber.client.ui.theme.*
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @Composable
 fun TerminalScreen(
@@ -54,10 +63,45 @@ fun TerminalScreen(
     onSendInputBase64: (String) -> Unit,
     onResizeTerminal: (Int, Int) -> Unit
 ) {
-    // Mode switcher: "chat" (Agent 对话卡片流 - 默认推荐) vs "xterm" (2D 虚拟终端)
-    var displayMode by remember { mutableStateOf("chat") }
+    // Mode switcher: "terminal" (Native Compose 终端 - 默认推荐，稳定高效) vs "xterm" (2D 虚拟终端) vs "chat" (Agent 对话卡片流)
+    var displayMode by remember { mutableStateOf("terminal") }
     var fontSizeSp by remember { mutableStateOf(12) }
     var localCommandInput by remember { mutableStateOf("") }
+
+    val lineCount = terminalBuffer.lines.size
+    val activeLineText = terminalBuffer.activeLine.text
+    val initialIndex = remember { (terminalBuffer.lines.size - 1).coerceAtLeast(0) }
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = initialIndex)
+    val coroutineScope = rememberCoroutineScope()
+    var isTerminalReady by remember(activeSessionId) { mutableStateOf(false) }
+
+    // Anchor to bottom on session switch / initial enter before revealing
+    LaunchedEffect(activeSessionId) {
+        isTerminalReady = false
+        delay(60)
+        val total = terminalBuffer.lines.size + if (terminalBuffer.activeLine.text.isNotEmpty()) 1 else 0
+        if (total > 0) {
+            listState.scrollToItem(total - 1)
+        }
+        isTerminalReady = true
+    }
+
+    // Auto-select first session if none selected
+    LaunchedEffect(activeSessionId, sessions) {
+        if (activeSessionId == null && sessions.isNotEmpty()) {
+            onSelectSession(sessions.first().sessionId)
+        }
+    }
+
+    // Auto-scroll to bottom on new terminal output in native terminal mode
+    LaunchedEffect(lineCount, activeLineText) {
+        if (displayMode == "terminal") {
+            val total = lineCount + if (activeLineText.isNotEmpty()) 1 else 0
+            if (total > 0) {
+                listState.scrollToItem(total - 1)
+            }
+        }
+    }
 
     val submitCommand = {
         val text = localCommandInput.trim()
@@ -84,7 +128,7 @@ fun TerminalScreen(
             onReturnToDashboard = onReturnToDashboard
         )
 
-        // Dual-Mode Segmented Controller & Status Sub-header
+        // Tri-Mode Segmented Controller & Status Sub-header
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -103,32 +147,32 @@ fun TerminalScreen(
                     .padding(2.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Mode A: Agent Chat & Action Stream (Default)
+                // Mode 1: Native Terminal (Default)
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
-                        .background(if (displayMode == "chat") ViberCyan else Color.Transparent)
-                        .clickable { displayMode = "chat" }
-                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                        .background(if (displayMode == "terminal") ViberCyan else Color.Transparent)
+                        .clickable { displayMode = "terminal" }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
-                            imageVector = Icons.Default.Forum,
-                            contentDescription = "Chat Mode",
-                            tint = if (displayMode == "chat") Color.Black else TextMuted,
+                            imageVector = Icons.Default.Terminal,
+                            contentDescription = "Native Terminal",
+                            tint = if (displayMode == "terminal") Color.Black else TextMuted,
                             modifier = Modifier.size(12.dp)
                         )
-                        Spacer(modifier = Modifier.width(4.dp))
+                        Spacer(modifier = Modifier.width(3.dp))
                         Text(
-                            text = "智能对话流",
-                            color = if (displayMode == "chat") Color.Black else TextMuted,
+                            text = "原生终端",
+                            color = if (displayMode == "terminal") Color.Black else TextMuted,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
                         )
                     }
                 }
 
-                // Mode B: Full 2D xterm Virtual Terminal
+                // Mode 2: Full 2D xterm Virtual Terminal
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
@@ -137,19 +181,44 @@ fun TerminalScreen(
                             displayMode = "xterm"
                             xtermController.refit()
                         }
-                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
-                            imageVector = Icons.Default.Terminal,
+                            imageVector = Icons.Default.Code,
                             contentDescription = "xterm 2D Mode",
                             tint = if (displayMode == "xterm") Color.Black else TextMuted,
                             modifier = Modifier.size(12.dp)
                         )
-                        Spacer(modifier = Modifier.width(4.dp))
+                        Spacer(modifier = Modifier.width(3.dp))
                         Text(
                             text = "2D 终端",
                             color = if (displayMode == "xterm") Color.Black else TextMuted,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                // Mode 3: Agent Chat Stream
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (displayMode == "chat") ViberCyan else Color.Transparent)
+                        .clickable { displayMode = "chat" }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Forum,
+                            contentDescription = "Chat Mode",
+                            tint = if (displayMode == "chat") Color.Black else TextMuted,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Spacer(modifier = Modifier.width(3.dp))
+                        Text(
+                            text = "智能流",
+                            color = if (displayMode == "chat") Color.Black else TextMuted,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -159,19 +228,7 @@ fun TerminalScreen(
 
             // Quick Info & Actions
             Row(verticalAlignment = Alignment.CenterVertically) {
-                if (displayMode == "chat") {
-                    Text(
-                        text = "自动去破损换行",
-                        color = ViberEmerald,
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(ViberEmerald.copy(alpha = 0.12f))
-                            .padding(horizontal = 5.dp, vertical = 2.dp)
-                    )
-                } else {
-                    // Zoom buttons for 2D Terminal
+                if (displayMode != "chat") {
                     TextButton(
                         onClick = { if (fontSizeSp > 8) fontSizeSp -= 1 },
                         contentPadding = PaddingValues(0.dp),
@@ -186,6 +243,17 @@ fun TerminalScreen(
                     ) {
                         Text("A+", color = ViberCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                     }
+                } else {
+                    Text(
+                        text = "自动去破损换行",
+                        color = ViberEmerald,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(ViberEmerald.copy(alpha = 0.12f))
+                            .padding(horizontal = 5.dp, vertical = 2.dp)
+                    )
                 }
 
                 Spacer(modifier = Modifier.width(4.dp))
@@ -193,12 +261,9 @@ fun TerminalScreen(
                 // Clear current view
                 TextButton(
                     onClick = {
-                        if (displayMode == "chat") {
-                            chatProcessor.clear()
-                        } else {
-                            xtermController.clear()
-                            terminalBuffer.clear()
-                        }
+                        chatProcessor.clear()
+                        xtermController.clear()
+                        terminalBuffer.clear()
                     },
                     contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
                     modifier = Modifier.height(24.dp)
@@ -249,7 +314,7 @@ fun TerminalScreen(
             }
         }
 
-        // Viewport Area (Switchable between Chat & 2D xterm)
+        // Viewport Area (Native Compose Terminal / xterm 2D / Agent Chat)
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -260,33 +325,185 @@ fun TerminalScreen(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(text = "未选中终端会话", color = TextSecondary, fontSize = 12.sp)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Button(onClick = onNewTerminal) {
-                            Text("开启新终端")
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(16.dp)
+                    ) {
+                        Text(text = "未选中终端会话", color = TextSecondary, fontSize = 14.sp)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        if (sessions.isNotEmpty()) {
+                            Text(text = "选择已有会话：", color = TextMuted, fontSize = 12.sp)
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.horizontalScroll(rememberScrollState())
+                            ) {
+                                sessions.forEach { s ->
+                                    Button(
+                                        onClick = { onSelectSession(s.sessionId) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = ViberCard)
+                                    ) {
+                                        Text(s.name, color = ViberCyan)
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
+                        Button(
+                            onClick = onNewTerminal,
+                            colors = ButtonDefaults.buttonColors(containerColor = ViberCyan)
+                        ) {
+                            Text("开启新终端", color = Color.Black, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
             } else {
-                if (displayMode == "chat") {
-                    AgentChatView(
-                        chatProcessor = chatProcessor,
-                        modifier = Modifier.fillMaxSize(),
-                        onSendDecision = { decision ->
-                            chatProcessor.appendUserPrompt(decision.trimEnd())
-                            terminalBuffer.appendLocalEcho(decision.trimEnd())
-                            onSendPrompt(decision)
+                when (displayMode) {
+                    "terminal" -> {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            // Loading Indicator Overlay - 拒绝静默加载，提供清晰的同步状态动画
+                            if (!isTerminalReady) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(ViberBg),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.Center
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            CircularProgressIndicator(
+                                                color = ViberCyan,
+                                                strokeWidth = 2.5.dp,
+                                                modifier = Modifier.size(42.dp)
+                                            )
+                                            Icon(
+                                                imageVector = Icons.Default.Terminal,
+                                                contentDescription = null,
+                                                tint = ViberCyan,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.height(14.dp))
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(6.dp)
+                                                    .clip(CircleShape)
+                                                    .background(ViberCyan)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "正在同步终端会话历史...",
+                                                color = Color(0xFFE2E8F0),
+                                                fontSize = 12.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = "已优化上下文行数，直接定格于最新输出",
+                                            color = TextMuted,
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+                                }
+                            }
+
+                            LazyColumn(
+                                state = listState,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    .alpha(if (isTerminalReady) 1f else 0f)
+                            ) {
+                                items(terminalBuffer.lines) { line ->
+                                    Text(
+                                        text = line,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = fontSizeSp.sp,
+                                        lineHeight = (fontSizeSp * 1.25).sp,
+                                        color = Color(0xFFE2E8F0),
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+                                if (activeLineText.isNotEmpty()) {
+                                    item {
+                                        Row(modifier = Modifier.fillMaxWidth()) {
+                                            Text(
+                                                text = terminalBuffer.activeLine,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontSize = fontSizeSp.sp,
+                                                lineHeight = (fontSizeSp * 1.25).sp,
+                                                color = Color(0xFFE2E8F0)
+                                            )
+                                            Text(
+                                                text = "█",
+                                                fontFamily = FontFamily.Monospace,
+                                                fontSize = fontSizeSp.sp,
+                                                color = ViberCyan
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Scroll to bottom FAB
+                            val isAtBottom = remember {
+                                derivedStateOf {
+                                    val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                                    lastVisible >= lineCount - 2
+                                }
+                            }
+
+                            if (!isAtBottom.value && lineCount > 0) {
+                                SmallFloatingActionButton(
+                                    onClick = {
+                                        coroutineScope.launch {
+                                            listState.animateScrollToItem(lineCount)
+                                        }
+                                    },
+                                    containerColor = ViberCyan,
+                                    contentColor = Color.Black,
+                                    shape = CircleShape,
+                                    modifier = Modifier
+                                        .align(Alignment.BottomEnd)
+                                        .padding(10.dp)
+                                        .size(34.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.ArrowDownward,
+                                        contentDescription = "Scroll to bottom",
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
                         }
-                    )
-                } else {
-                    Xterm2DView(
-                        controller = xtermController,
-                        fontSizeSp = fontSizeSp,
-                        modifier = Modifier.fillMaxSize(),
-                        onSendInputBase64 = onSendInputBase64,
-                        onResize = onResizeTerminal
-                    )
+                    }
+                    "xterm" -> {
+                        Xterm2DView(
+                            controller = xtermController,
+                            fontSizeSp = fontSizeSp,
+                            modifier = Modifier.fillMaxSize(),
+                            onSendInputBase64 = onSendInputBase64,
+                            onResize = onResizeTerminal
+                        )
+                    }
+                    "chat" -> {
+                        AgentChatView(
+                            chatProcessor = chatProcessor,
+                            modifier = Modifier.fillMaxSize(),
+                            onSendDecision = { decision ->
+                                chatProcessor.appendUserPrompt(decision.trimEnd())
+                                terminalBuffer.appendLocalEcho(decision.trimEnd())
+                                onSendPrompt(decision)
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -335,7 +552,7 @@ fun TerminalScreen(
             }
         }
 
-        // Local Optimistic Command Bar (Eliminates single-key network latency)
+        // Local Optimistic Command Bar
         Surface(
             color = ViberSurface,
             modifier = Modifier
@@ -394,8 +611,8 @@ fun TerminalScreen(
             }
         }
 
-        // Virtual Accessory Keyboard Bar (Only displayed in xterm 2D mode where terminal keys are critical)
-        if (displayMode == "xterm") {
+        // Virtual Accessory Keyboard Bar (Available in terminal and xterm modes)
+        if (displayMode != "chat") {
             VirtualKeyboardBar(
                 onSendKey = onSendKey,
                 onSendPrompt = onSendPrompt,

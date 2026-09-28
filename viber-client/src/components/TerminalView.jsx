@@ -2,7 +2,15 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { RefreshCw, Terminal as TerminalIcon } from 'lucide-react';
+import {
+  RefreshCw,
+  Terminal as TerminalIcon,
+  ChevronsUp,
+  ChevronsDown,
+  ChevronUp,
+  ChevronDown,
+  ArrowDownToLine,
+} from 'lucide-react';
 import MobileToolbar from './MobileToolbar';
 
 function stringToBase64(str) {
@@ -35,13 +43,53 @@ export default function TerminalView({
   const containerRef = useRef(null);
   const xtermRef = useRef(null);
   const fitAddonRef = useRef(null);
-  const [isReady, setIsReady] = useState(false);
+  const [isInitialScrollReady, setIsInitialScrollReady] = useState(false);
+  const [linesScrolledUp, setLinesScrolledUp] = useState(0);
   const [fontSize, setFontSize] = useState(() => {
     return (typeof window !== 'undefined' && window.innerWidth < 640) ? 11 : 13;
   });
-  const [preventAltScreen, setPreventAltScreen] = useState(false);
+  const [preventAltScreen, setPreventAltScreen] = useState(() => {
+    try {
+      const saved = localStorage.getItem('viber_prevent_alt_screen');
+      return saved !== null ? saved === 'true' : true;
+    } catch (e) {
+      return true;
+    }
+  });
   const preventAltScreenRef = useRef(preventAltScreen);
   preventAltScreenRef.current = preventAltScreen;
+
+  const handleToggleAltScreen = () => {
+    setPreventAltScreen((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('viber_prevent_alt_screen', String(next));
+      } catch (e) {}
+      if (next && xtermRef.current) {
+        try {
+          xtermRef.current.write('\x1b[?1049l');
+        } catch (e) {}
+      }
+      return next;
+    });
+  };
+
+  const handleScrollToTop = () => {
+    xtermRef.current?.scrollToTop();
+  };
+
+  const handleScrollPageUp = () => {
+    xtermRef.current?.scrollLines(-25);
+  };
+
+  const handleScrollPageDown = () => {
+    xtermRef.current?.scrollLines(25);
+  };
+
+  const handleScrollToBottom = () => {
+    xtermRef.current?.scrollToBottom();
+    setLinesScrolledUp(0);
+  };
 
   const handleZoomIn = () => {
     setFontSize((prev) => {
@@ -95,10 +143,11 @@ export default function TerminalView({
 
   useEffect(() => {
     if (!containerRef.current || !activeSession) return;
+    setIsInitialScrollReady(false);
 
     const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
 
-    // Create fresh Xterm instance with 50,000 lines scrollback and alternateScreenScroll
+    // Create fresh Xterm instance with 10,000 lines scrollback and ultra-responsive scrolling
     const term = new XTerminal({
       cursorBlink: true,
       cursorStyle: 'bar',
@@ -128,8 +177,11 @@ export default function TerminalView({
         brightCyan: '#22d3ee',
         brightWhite: '#ffffff',
       },
-      scrollback: 50000,
-      alternateScreenScroll: true,
+      scrollback: 10000,
+      scrollSensitivity: 3,
+      fastScrollSensitivity: 8,
+      smoothScrollDuration: 0,
+      alternateScreenScroll: false,
       scrollOnUserInput: true,
       allowProposedApi: true,
     });
@@ -141,22 +193,67 @@ export default function TerminalView({
         return false;
       });
 
-      // Anti-Truncation: when enabled, suppress entering alternate screen buffer (1049 / 47)
-      // This forces full-screen TUI (like Codex) into the primary buffer where scrollback and scrollbar never vanish
+      // Anti-Truncation: when enabled, suppress entering alternate screen buffer (1049 / 47 / 1047)
+      // This forces full-screen TUI (like Codex / Ratatui) into the primary buffer where scrollback and scrollbar never vanish
       term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => {
-        if (preventAltScreenRef.current && (params[0] === 1049 || params[0] === 47)) {
-          return true;
-        }
-        return false;
-      });
-
-      term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => {
-        if (preventAltScreenRef.current && (params[0] === 1049 || params[0] === 47)) {
+        if (preventAltScreenRef.current && (params[0] === 1049 || params[0] === 47 || params[0] === 1047)) {
           return true;
         }
         return false;
       });
     } catch (e) {}
+
+    // Custom wheel handler: high-speed local 60fps scrolling without PTY lag
+    try {
+      term.attachCustomWheelEventHandler((e) => {
+        if (e.ctrlKey) return true; // Let browser zoom work
+        if (preventAltScreenRef.current || e.shiftKey) {
+          const multiplier = e.shiftKey ? 16 : 4;
+          term.scrollLines(e.deltaY > 0 ? multiplier : -multiplier);
+          return false;
+        }
+        return true;
+      });
+    } catch (e) {}
+
+    // Custom key handler: PageUp / PageDown / Shift+Home / Shift+End
+    try {
+      term.attachCustomKeyEventHandler((e) => {
+        if (e.type === 'keydown') {
+          if (e.key === 'PageUp' && (e.shiftKey || preventAltScreenRef.current)) {
+            term.scrollPages(-1);
+            return false;
+          }
+          if (e.key === 'PageDown' && (e.shiftKey || preventAltScreenRef.current)) {
+            term.scrollPages(1);
+            return false;
+          }
+          if (e.key === 'Home' && (e.shiftKey || e.ctrlKey)) {
+            term.scrollToTop();
+            return false;
+          }
+          if (e.key === 'End' && (e.shiftKey || e.ctrlKey)) {
+            term.scrollToBottom();
+            return false;
+          }
+        }
+        return true;
+      });
+    } catch (e) {}
+
+    let scrollRafId = null;
+    const scrollDisposable = term.onScroll(() => {
+      if (scrollRafId) return;
+      scrollRafId = requestAnimationFrame(() => {
+        scrollRafId = null;
+        if (!xtermRef.current) return;
+        const currentTerm = xtermRef.current;
+        const baseY = currentTerm.buffer?.active?.baseY || 0;
+        const viewportY = currentTerm.buffer?.active?.viewportY || 0;
+        const diff = Math.max(0, baseY - viewportY);
+        setLinesScrolledUp((prev) => (prev !== diff ? diff : prev));
+      });
+    });
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
@@ -171,7 +268,6 @@ export default function TerminalView({
 
     xtermRef.current = term;
     fitAddonRef.current = fitAddon;
-    setIsReady(true);
 
     // Forward terminal input to backend PTY
     const onDataDisposable = term.onData((data) => {
@@ -198,12 +294,53 @@ export default function TerminalView({
       window.visualViewport.addEventListener('resize', handleFit);
     }
 
+    let isReplaying = true;
+    let replayTimer = null;
+    let pendingBatch = '';
+
+    const flushBatch = () => {
+      if (!pendingBatch) return;
+      const data = pendingBatch;
+      pendingBatch = '';
+      term.write(data, () => {
+        try {
+          term.scrollToBottom();
+        } catch (e) {}
+      });
+    };
+
+    const finishReplay = () => {
+      if (!isReplaying) return;
+      flushBatch();
+      isReplaying = false;
+      try {
+        term.scrollToBottom();
+      } catch (e) {}
+      setIsInitialScrollReady(true);
+    };
+
+    // Failsafe timer to reveal terminal even if no replay output is received
+    replayTimer = setTimeout(finishReplay, 100);
+
+    const writeChunk = (text) => {
+      if (isReplaying) {
+        pendingBatch += text;
+        clearTimeout(replayTimer);
+        if (pendingBatch.length >= 32768) {
+          flushBatch();
+        }
+        replayTimer = setTimeout(finishReplay, 45);
+      } else {
+        term.write(text);
+      }
+    };
+
     // Handle incoming terminal output from PTY
     const unsubOutput = connection.on('terminal_output', (msg) => {
       if (msg.session_id === activeSession.session_id && msg.data) {
         try {
           const text = base64ToString(msg.data);
-          term.write(text);
+          writeChunk(text);
         } catch (e) {
           console.error('Error writing terminal output:', e);
         }
@@ -216,19 +353,15 @@ export default function TerminalView({
         if (msg.needs_reset) {
           term.reset();
         }
-        if (msg.replay && Array.isArray(msg.replay)) {
-          // Batch replay text into consolidated writes to prevent freezing the UI thread on long histories
+        if (msg.replay && Array.isArray(msg.replay) && msg.replay.length > 0) {
           let batch = '';
           for (let i = 0; i < msg.replay.length; i++) {
             try {
               batch += base64ToString(msg.replay[i].data);
             } catch (e) {}
-            if (batch.length >= 65536 || i === msg.replay.length - 1) {
-              if (batch) {
-                term.write(batch);
-                batch = '';
-              }
-            }
+          }
+          if (batch) {
+            writeChunk(batch);
           }
         }
       }
@@ -238,6 +371,9 @@ export default function TerminalView({
     connection.attachSession(activeSession.session_id, 0);
 
     return () => {
+      if (scrollRafId) cancelAnimationFrame(scrollRafId);
+      scrollDisposable?.dispose?.();
+      clearTimeout(replayTimer);
       onDataDisposable.dispose();
       resizeObserver.disconnect();
       if (window.visualViewport) {
@@ -308,23 +444,109 @@ export default function TerminalView({
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <button
-            onClick={() => setPreventAltScreen(!preventAltScreen)}
-            title="强制锁定主屏幕缓冲区：拦截全屏 TUI (如 Codex/Ratatui) 切换备用屏，确保侧边滚动条永不消失、长对话历史永不截断丢失"
-            className={`px-2 py-0.5 rounded text-[10px] font-medium border transition-all flex items-center gap-1.5 cursor-pointer ${
+            onClick={handleToggleAltScreen}
+            title="锁定主屏幕缓冲区：拦截全屏 TUI (如 Codex/Ratatui) 切换备用屏，确保侧边 14px 宽滚动条永不消失、滚轮 60fps 平滑滚动与长对话历史完整保留"
+            className={`px-2.5 py-0.5 rounded text-[10px] font-medium border transition-all flex items-center gap-1.5 cursor-pointer ${
               preventAltScreen
                 ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/60 shadow-sm shadow-cyan-900/30'
                 : 'bg-slate-800/60 text-slate-400 border-slate-700/60 hover:text-slate-200 hover:border-slate-600'
             }`}
           >
-            <span>🛡️ 防截断回滚模式</span>
+            <span>⚡ Codex 高速滚动与防截断</span>
             <span className={`w-1.5 h-1.5 rounded-full ${preventAltScreen ? 'bg-cyan-400 animate-pulse' : 'bg-slate-600'}`} />
           </button>
         </div>
       </div>
 
       {/* Terminal Viewport */}
-      <div className="flex-1 relative p-1 md:p-2 overflow-hidden">
-        <div ref={containerRef} className="w-full h-full" />
+      <div className="flex-1 relative p-1 md:p-2 overflow-hidden bg-[#090d16]">
+        {/* Loading Indicator Overlay - 拒绝静默加载，提供清晰的同步状态动画 */}
+        {!isInitialScrollReady && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#090d16]/95 backdrop-blur-sm pointer-events-none select-none transition-opacity duration-200">
+            <div className="relative flex items-center justify-center mb-4">
+              <div className="w-12 h-12 rounded-full border-2 border-cyan-500/20 border-t-cyan-400 animate-spin" />
+              <TerminalIcon className="w-5 h-5 text-cyan-400 absolute animate-pulse" />
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="inline-block w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+              <span className="text-xs font-mono font-medium text-slate-200 tracking-wide">
+                正在同步终端会话历史...
+              </span>
+            </div>
+            <p className="text-[11px] font-mono text-slate-500 mt-1.5">
+              已优化上下文行数，准备就绪后直达最新输出
+            </p>
+          </div>
+        )}
+
+        {/* Floating High-Speed Scroll Rail & Navigation Control */}
+        {isInitialScrollReady && (
+          <div className="absolute right-5 top-4 z-20 flex flex-col items-center bg-[#070d18]/90 backdrop-blur-md border border-slate-700/70 rounded-xl p-1 shadow-2xl transition-all group">
+            <button
+              onClick={handleScrollToTop}
+              title="直达顶部 (Shift+Home)"
+              className="w-7 h-7 flex items-center justify-center rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-slate-800/80 active:scale-95 transition-all cursor-pointer"
+            >
+              <ChevronsUp className="w-4 h-4" />
+            </button>
+            <button
+              onClick={handleScrollPageUp}
+              title="高速向上翻页 (PageUp / Shift+滚轮)"
+              className="w-7 h-7 flex items-center justify-center rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-slate-800/80 active:scale-95 transition-all cursor-pointer"
+            >
+              <ChevronUp className="w-4 h-4" />
+            </button>
+
+            {/* Position / Offset Indicator */}
+            {linesScrolledUp > 0 && (
+              <div
+                onClick={handleScrollToBottom}
+                title="当前查看历史，点击回到底部"
+                className="my-0.5 px-1 py-0.5 rounded text-[9px] font-mono font-bold bg-cyan-950/80 text-cyan-300 border border-cyan-500/40 cursor-pointer text-center leading-tight hover:bg-cyan-900 transition-colors"
+              >
+                +{linesScrolledUp > 999 ? `${(linesScrolledUp / 1000).toFixed(1)}k` : linesScrolledUp}
+              </div>
+            )}
+
+            <button
+              onClick={handleScrollPageDown}
+              title="高速向下翻页 (PageDown)"
+              className="w-7 h-7 flex items-center justify-center rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-slate-800/80 active:scale-95 transition-all cursor-pointer"
+            >
+              <ChevronDown className="w-4 h-4" />
+            </button>
+            <button
+              onClick={handleScrollToBottom}
+              title="直达最新输出 (Shift+End)"
+              className={`w-7 h-7 flex items-center justify-center rounded-lg active:scale-95 transition-all cursor-pointer ${
+                linesScrolledUp > 0
+                  ? 'text-cyan-400 hover:text-cyan-200 hover:bg-cyan-950/60 animate-pulse'
+                  : 'text-slate-400 hover:text-cyan-300 hover:bg-slate-800/80'
+              }`}
+            >
+              <ChevronsDown className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {/* Floating Jump to Bottom Pill */}
+        {isInitialScrollReady && linesScrolledUp > 0 && (
+          <button
+            onClick={handleScrollToBottom}
+            className="absolute bottom-5 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-cyan-950/95 border border-cyan-500/70 text-cyan-300 shadow-xl shadow-cyan-950/80 hover:bg-cyan-900 hover:border-cyan-400 text-xs font-mono transition-all animate-bounce cursor-pointer group backdrop-blur-md"
+            title="点击直接跳回最新输出 (Shift+End)"
+          >
+            <ArrowDownToLine className="w-4 h-4 group-hover:translate-y-0.5 transition-transform" />
+            <span>回到底部最新输出 (+{linesScrolledUp} 行)</span>
+          </button>
+        )}
+
+        <div
+          ref={containerRef}
+          className={`w-full h-full transition-opacity duration-150 ${
+            isInitialScrollReady ? 'opacity-100' : 'opacity-0 pointer-events-none'
+          }`}
+        />
       </div>
 
       {/* Mobile Touch Toolbar & Quick Prompter */}

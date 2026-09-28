@@ -63,13 +63,66 @@ class ViberWebSocketClient(
     val activeSessionId: StateFlow<String?> = _activeSessionId.asStateFlow()
 
     private var lastReceivedSeq = 0L
+    private var candidateIndex = 0
+
+    data class CandidateEndpoint(val url: String, val mode: ConnectionMode)
+
+    private fun getCandidateEndpoints(host: HostProfile): List<CandidateEndpoint> {
+        val list = mutableListOf<CandidateEndpoint>()
+        val seen = mutableSetOf<String>()
+
+        fun add(url: String, mode: ConnectionMode) {
+            if (url.isNotBlank() && seen.add(url)) {
+                list.add(CandidateEndpoint(url, mode))
+            }
+        }
+
+        val direct = com.remoteviber.client.data.HostManager.directUrl(host.id).orEmpty()
+        if (direct.isNotBlank()) {
+            add(direct, ConnectionMode.UNKNOWN)
+        }
+
+        for (ip in host.tailscaleIps) {
+            if (ip.isNotBlank() && !ip.contains(Regex("[\\s/?#@%]"))) {
+                val formatted = if (ip.contains(':') && !ip.startsWith('[')) "[$ip]" else ip
+                add("ws://$formatted:${host.port}/ws", ConnectionMode.TAILSCALE)
+            }
+        }
+
+        for (ip in host.lanIps) {
+            if (ip.isNotBlank() && ip != "127.0.0.1" && ip != "localhost" && ip != "::1" && !ip.contains(Regex("[\\s/?#@%]"))) {
+                val formatted = if (ip.contains(':') && !ip.startsWith('[')) "[$ip]" else ip
+                add("ws://$formatted:${host.port}/ws", ConnectionMode.LAN)
+            }
+        }
+
+        if (host.relayUrl.isNotBlank()) {
+            val relayBase = host.relayUrl.trimEnd('/')
+            add("$relayBase/connect/client?host_id=${host.id}", ConnectionMode.RELAY)
+        }
+
+        for (ip in host.lanIps) {
+            if (ip == "127.0.0.1" || ip == "localhost" || ip == "::1") {
+                add("ws://$ip:${host.port}/ws", ConnectionMode.LOCALHOST)
+            }
+        }
+
+        if (list.isEmpty()) {
+            val address = host.getPrimaryAddress()
+            val formatted = if (address.contains(':') && !address.startsWith('[')) "[$address]" else address
+            add("ws://$formatted:${host.port}/ws", ConnectionMode.UNKNOWN)
+        }
+        return list
+    }
 
     fun connect(host: HostProfile) {
         val changed = activeHost?.id != host.id
         disconnect()
         synchronized(securityLock) {
             activeHost = host
-            if (changed) { _activeSessionId.value = null; lastReceivedSeq = 0L }
+            _activeSessionId.value = null
+            lastReceivedSeq = 0L
+            candidateIndex = 0
             shouldReconnect = true
             _status.value = ConnectionStatus.CONNECTING
             val generation = connectionGeneration
@@ -85,22 +138,22 @@ class ViberWebSocketClient(
                 val crypto = ProtocolV2(pin, host.token)
                 secureSession = crypto
                 val generation = ++connectionGeneration
-                val address = host.getPrimaryAddress()
-                require(address.isNotBlank() && !address.contains(Regex("[\\s/?#@%]")))
-                val formatted = if (address.contains(':') && !address.startsWith('[')) "[$address]" else address
-                val url = com.remoteviber.client.data.HostManager.directUrl(host.id).orEmpty()
-                    .ifEmpty { "ws://$formatted:${host.port}/ws" }
-                _mode.value = when {
-                    address == "127.0.0.1" || address == "localhost" || address == "::1" -> ConnectionMode.LOCALHOST
-                    else -> ConnectionMode.UNKNOWN // Display only; never a trust decision.
-                }
-                val request = Request.Builder().url(url).build()
+                val candidates = getCandidateEndpoints(host)
+                val target = candidates[candidateIndex % candidates.size]
+                _mode.value = target.mode
+                Log.d(TAG, "Attempting connection to ${target.url} [${target.mode}] (candidate $candidateIndex/${candidates.size})")
+                val request = Request.Builder().url(target.url).build()
                 webSocket = okHttpClient.newWebSocket(request, createWebSocketListener(generation, crypto))
-            } catch (_: Exception) {
-                shouldReconnect = false
-                secureSession?.close(); secureSession = null
-                _status.value = ConnectionStatus.ERROR
-                Log.e(TAG, "Secure connection configuration is invalid; re-pair required")
+            } catch (e: Exception) {
+                if (e.message == "Re-pair required") {
+                    shouldReconnect = false
+                    secureSession?.close(); secureSession = null
+                    _status.value = ConnectionStatus.ERROR
+                    Log.e(TAG, "Secure connection configuration is invalid; re-pair required", e)
+                } else {
+                    Log.w(TAG, "Connection initiation failed for current candidate, trying next", e)
+                    handleDisconnect()
+                }
             }
         }
     }
@@ -218,6 +271,18 @@ class ViberWebSocketClient(
                         list.add(AgentSession.fromJsonObject(sessionsArr.getJSONObject(i)))
                     }
                     _sessions.value = list
+                    if (_activeSessionId.value == null && list.isNotEmpty()) {
+                        attachSession(list.first().sessionId, 0L)
+                    } else if (_activeSessionId.value != null && list.none { it.sessionId == _activeSessionId.value }) {
+                        if (list.isNotEmpty()) {
+                            attachSession(list.first().sessionId, 0L)
+                        } else {
+                            _activeSessionId.value = null
+                            terminalBuffer.clear()
+                            chatProcessor.clear()
+                            xtermController.clear()
+                        }
+                    }
                 }
             }
             "PROFILES" -> {
@@ -300,6 +365,7 @@ class ViberWebSocketClient(
         webSocket = null
         if (_status.value == ConnectionStatus.ERROR) return
         if (!shouldReconnect) { _status.value = ConnectionStatus.DISCONNECTED; return }
+        candidateIndex++
         _status.value = ConnectionStatus.RECONNECTING
         scheduleReconnect()
     }
@@ -307,7 +373,7 @@ class ViberWebSocketClient(
         reconnectJob?.cancel()
         val generation = connectionGeneration
         reconnectJob = scope.launch {
-            delay(3000)
+            delay(1500)
             synchronized(securityLock) {
                 val host = activeHost
                 if (host != null && shouldReconnect && connectionGeneration == generation && _status.value != ConnectionStatus.CONNECTED) {
@@ -425,11 +491,18 @@ class ViberWebSocketClient(
     }
 
     fun attachSession(sessionId: String, lastSeq: Long = 0L) {
+        val switching = _activeSessionId.value != sessionId
         _activeSessionId.value = sessionId
+        if (switching) {
+            terminalBuffer.clear()
+            chatProcessor.clear()
+            xtermController.clear()
+            lastReceivedSeq = 0L
+        }
         val obj = JSONObject().apply {
             put("type", "ATTACH_SESSION")
             put("session_id", sessionId)
-            put("last_seq", lastSeq)
+            put("last_seq", if (switching) 0L else lastSeq)
         }
         send(obj)
     }

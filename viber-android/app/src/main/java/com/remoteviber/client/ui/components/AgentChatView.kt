@@ -44,15 +44,22 @@ fun AgentChatView(
     modifier: Modifier = Modifier,
     onSendDecision: (String) -> Unit
 ) {
-    val listState = rememberLazyListState()
+    val initialIndex = remember { (chatProcessor.messages.size - 1).coerceAtLeast(0) }
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = initialIndex)
     val coroutineScope = rememberCoroutineScope()
     val messages = chatProcessor.messages
     val messageCount = messages.size
+    var isInitialSettled by remember { mutableStateOf(false) }
 
-    // Auto-scroll on new message
+    // Auto-scroll on new message: instant bottom anchor on enter, smooth animation only for subsequent incoming messages
     LaunchedEffect(messageCount) {
         if (messageCount > 0) {
-            listState.animateScrollToItem(messageCount - 1)
+            if (!isInitialSettled) {
+                listState.scrollToItem(messageCount - 1)
+                isInitialSettled = true
+            } else {
+                listState.animateScrollToItem(messageCount - 1)
+            }
         }
     }
 
