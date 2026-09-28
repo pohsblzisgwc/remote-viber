@@ -1,508 +1,255 @@
-/**
- * RemoteViber Connection & Session Protocol Client
- * Handles connection fallbacks (Tailscale Direct -> LAN -> Relay),
- * E2EE frame encryption/decryption, heartbeat ping measurement, and seamless auto-recovery.
- */
-
-import { ClientCryptoManager } from '../crypto/e2ee';
+/** Per-socket protocol state; async receive/send operations are serialized. */
+import { ClientCryptoManager } from '../crypto/e2ee.js';
 
 export class ViberConnection {
   constructor(config = {}) {
-    this.config = config; // { hostId, hostName, tailscaleIps, lanIps, directPort, relayUrl, token, hostPub }
-    this.crypto = new ClientCryptoManager();
+    this.config = config;
     this.ws = null;
-    this.status = 'disconnected'; // 'disconnected' | 'connecting' | 'handshake' | 'connected' | 'reconnecting'
-    this.connectionMode = 'unknown'; // 'tailscale' | 'lan' | 'relay' | 'localhost'
+    this.crypto = null;
+    this.status = 'disconnected';
+    this.connectionMode = 'unknown';
     this.pingMs = 0;
-    this.lastPingTs = 0;
     this.pingTimer = null;
     this.listeners = new Map();
     this.reconnectTimer = null;
     this.shouldReconnect = true;
     this.activeSessionId = null;
     this.lastReceivedSeq = 0;
+    this._generation = 0;
+    this._connecting = false;
+    this._ctx = null;
   }
-
   on(event, callback) {
-    if (!this.listeners.has(event)) {
-      this.listeners.set(event, new Set());
-    }
+    if (!this.listeners.has(event)) this.listeners.set(event, new Set());
     this.listeners.get(event).add(callback);
     return () => this.listeners.get(event)?.delete(callback);
   }
-
   emit(event, ...args) {
-    this.listeners.get(event)?.forEach((cb) => {
-      try {
-        cb(...args);
-      } catch (e) {
-        console.error(`Error in event listener for ${event}:`, e);
-      }
+    this.listeners.get(event)?.forEach((fn) => {
+      try { fn(...args); } catch (error) { console.error('Event handler failed', error); }
     });
   }
-
   async connect() {
+    if (this._connecting || this.status === 'connected') return;
     this.shouldReconnect = true;
+    if (!this.config.hostPub || !this.config.token) {
+      this.shouldReconnect = false;
+      this._setStatus('error');
+      this.emit('error', 'Authentication: import a protocol-v2 pairing bundle from the host');
+      return;
+    }
+    this._connecting = true;
+    const generation = ++this._generation;
     this._setStatus('connecting');
-
-    // Build ordered list of candidate URLs
-    const candidates = this._buildCandidateUrls();
-    let connected = false;
-
-    for (const candidate of candidates) {
-      try {
-        await this._attemptSocket(candidate.url, candidate.mode);
-        connected = true;
-        break;
-      } catch (err) {
-        console.warn(`Failed to connect via ${candidate.mode} (${candidate.url}):`, err.message);
-      }
-    }
-
-    if (!connected) {
-      if (this.status !== 'error') {
-        this._setStatus('disconnected');
-      }
-      if (this.shouldReconnect) {
-        this._scheduleReconnect();
-      }
-    }
-  }
-
-  _buildCandidateUrls() {
-    const defaultPort = 8765;
-    const port = this.config.directPort || (typeof window !== 'undefined' && window.location.port ? parseInt(window.location.port) : defaultPort);
-    const list = [];
-    const seen = new Set();
-
-    const formatHost = (h) => {
-      if (!h) return '';
-      return (h.includes(':') && !h.startsWith('[')) ? `[${h}]` : h;
-    };
-
-    const addCandidate = (url, mode) => {
-      if (!url || seen.has(url)) return;
-      seen.add(url);
-      list.push({ url, mode });
-    };
-
-    // 1. Current page origin (highest priority if loaded via web app)
-    if (typeof window !== 'undefined' && window.location && window.location.hostname) {
-      const locHost = window.location.hostname;
-      const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const locPort = window.location.port || port;
-      const isTs = locHost.startsWith('100.') || locHost.includes('.ts.net') || locHost.includes('tailscale') || locHost.toLowerCase().includes('fd7a:');
-      const isLocal = locHost === 'localhost' || locHost === '127.0.0.1' || locHost === '[::1]';
-      addCandidate(`${wsProto}//${formatHost(locHost)}:${locPort}/ws`, isTs ? 'tailscale' : (isLocal ? 'localhost' : 'lan'));
-    }
-
-    // 2. Explicit Tailscale candidates
-    if (this.config.tailscaleIps && this.config.tailscaleIps.length > 0) {
-      for (const ip of this.config.tailscaleIps) {
-        if (!ip || ip.toLowerCase().startsWith('fe80:')) continue;
-        addCandidate(`ws://${formatHost(ip)}:${port}/ws`, 'tailscale');
-      }
-    }
-
-    // 3. LAN candidates
-    if (this.config.lanIps && this.config.lanIps.length > 0) {
-      for (const ip of this.config.lanIps) {
-        if (!ip || ip.toLowerCase().startsWith('fe80:')) continue;
-        addCandidate(`ws://${formatHost(ip)}:${port}/ws`, 'lan');
-      }
-    }
-
-    // 4. Localhost fallback
-    addCandidate(`ws://127.0.0.1:${port}/ws`, 'localhost');
-
-    // 5. Central Relay Server fallback
-    if (this.config.relayUrl && this.config.hostId) {
-      const relayWs = this.config.relayUrl.replace(/^http/, 'ws');
-      addCandidate(`${relayWs}/connect/client?host_id=${encodeURIComponent(this.config.hostId)}`, 'relay');
-    }
-
-    return list;
-  }
-
-  _attemptSocket(url, mode) {
-    return new Promise((resolve, reject) => {
-      let resolved = false;
-      let socket = null;
-      try {
-        socket = new WebSocket(url);
-      } catch (err) {
-        return reject(err);
-      }
-
-      const timeout = setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          cleanupListeners();
-          try { socket.close(); } catch (e) {}
-          reject(new Error(`连接超时: ${url}`));
-        }
-      }, 5000);
-
-      const cleanupListeners = () => {
-        this.listeners.get('_handshake_ok')?.delete(onHandshakeOk);
-        this.listeners.get('_handshake_err')?.delete(onHandshakeErr);
-      };
-
-      const onHandshakeOk = () => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timeout);
-          cleanupListeners();
-          resolve();
-        }
-      };
-
-      const onHandshakeErr = (err) => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timeout);
-          cleanupListeners();
-          reject(new Error(err || '握手失败'));
-        }
-      };
-
-      this.on('_handshake_ok', onHandshakeOk);
-      this.on('_handshake_err', onHandshakeErr);
-
-      socket.onopen = async () => {
-        this.ws = socket;
-        this.connectionMode = mode;
-        this._setupSocketListeners();
-        try {
-          await this._performHandshake();
-        } catch (e) {
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timeout);
-            cleanupListeners();
-            socket.close();
-            reject(e);
-          }
-        }
-      };
-
-      socket.onerror = (e) => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timeout);
-          cleanupListeners();
-          reject(new Error(`WebSocket connection failed`));
-        }
-      };
-
-      socket.onclose = () => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timeout);
-          cleanupListeners();
-          reject(new Error(`连接在完成握手前已关闭`));
-        }
-      };
-    });
-  }
-
-  async _performHandshake() {
-    this._setStatus('handshake');
-    let clientPub = null;
     try {
-      clientPub = await this.crypto.initialize();
-    } catch (e) {
-      console.warn('[Viber] WebCrypto unavailable in browser context:', e.message);
-    }
-
-    const hello = {
-      type: 'HELLO',
-      client_id: 'client-' + Math.random().toString(36).substring(2, 8),
-      client_pub: clientPub || '',
-      e2ee: !!clientPub,
-      token: this.config.token || '',
-    };
-
-    this.ws.send(JSON.stringify(hello));
-  }
-
-  _setupSocketListeners() {
-    this.ws.onmessage = async (event) => {
-      try {
-        const raw = event.data;
-        const msg = JSON.parse(raw);
-
-        // Pre-handshake WELCOME
-        if (msg.type === 'WELCOME') {
-          if (msg.host_pub && this.crypto.supported && msg.e2ee !== false) {
-            await this.crypto.establishSession(msg.host_pub);
-          }
-          this._setStatus('connected');
-          this._startHeartbeat();
-          if (msg.token) {
-            this.config.token = msg.token;
-          }
-          this.emit('ready', { hostPub: msg.host_pub, fingerprint: msg.fingerprint, token: msg.token, e2ee: msg.e2ee !== false });
-          this.emit('_handshake_ok');
-
-          // Auto-reattach if recovering from disconnect
-          if (this.activeSessionId) {
-            this.attachSession(this.activeSessionId, this.lastReceivedSeq);
-          } else {
-            this.getStats();
-            this.listProfiles();
-          }
+      const candidates = this._buildCandidateUrls();
+      for (const candidate of candidates) {
+        if (generation !== this._generation || !this.shouldReconnect) return;
+        try {
+          await this._attemptSocket(candidate.url, candidate.mode, generation);
           return;
-        }
-
-        if (msg.type === 'ERROR') {
-          console.error('RemoteViber Error:', msg.error);
-          this.emit('_handshake_err', msg.error);
-          this.emit('error', msg.error);
-          if (msg.error && (msg.error.includes('token') || msg.error.includes('Authentication'))) {
+        } catch (error) {
+          if (error.security) {
             this.shouldReconnect = false;
             this._setStatus('error');
+            this.emit('error', `Authentication: ${error.message}`);
+            return;
           }
-          if (this.ws) {
-            this.ws.close();
-          }
-          return;
         }
-
-        // Encrypted frames (E2EE active)
-        if (msg.iv && msg.data) {
-          if (this.crypto.supported && this.crypto.aesKey) {
-            const decrypted = await this.crypto.decryptJson(msg.iv, msg.data);
-            if (decrypted) {
-              this._handleDecryptedMessage(decrypted);
-            }
-          }
-        } else if (msg.type && msg.type !== 'WELCOME' && msg.type !== 'ERROR') {
-          // Direct JSON frames over trusted Tailscale/Localhost channel
-          this._handleDecryptedMessage(msg);
-        }
-      } catch (err) {
-        console.error('Failed to process message:', err);
       }
-    };
-
-    this.ws.onclose = () => {
-      this._stopHeartbeat();
-      if (this.status === 'handshake') {
-        this._setStatus('error');
-      } else if (this.shouldReconnect) {
-        this._setStatus('reconnecting');
-        this._scheduleReconnect();
-      } else {
+      if (generation === this._generation) {
         this._setStatus('disconnected');
+        this._scheduleReconnect();
       }
-    };
+    } catch (error) {
+      if (generation === this._generation) {
+        this.shouldReconnect = false;
+        this._setStatus('error');
+        this.emit('error', error.message);
+      }
+    } finally {
+      if (generation === this._generation) this._connecting = false;
+    }
   }
-
+  _buildCandidateUrls() {
+    const port = this.config.directPort || 8765;
+    const result = [], seen = new Set();
+    const add = (value, mode) => {
+      if (!value) return;
+      const u = new URL(value);
+      if (!['ws:', 'wss:'].includes(u.protocol) || u.username || u.password || u.hash) throw new Error('Invalid endpoint URL');
+      if (mode === 'relay' && u.protocol !== 'wss:' && !['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname)) {
+        throw new Error('Remote relay requires wss://');
+      }
+      if (!seen.has(u.href)) { seen.add(u.href); result.push({ url: u.href, mode }); }
+    };
+    if (this.config.directUrl) add(this.config.directUrl, 'direct');
+    if (typeof window !== 'undefined' && ['http:', 'https:'].includes(window.location.protocol)) {
+      add(`${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`, 'direct');
+    }
+    const addHost = (host, mode) => {
+      if (typeof host !== 'string' || !host || /[\s/?#@%]/.test(host)) throw new Error('Invalid host address');
+      const formatted = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+      add(`ws://${formatted}:${port}/ws`, mode);
+    };
+    for (const ip of this.config.tailscaleIps || []) addHost(ip, 'tailscale');
+    for (const ip of this.config.lanIps || []) addHost(ip, ['localhost', '127.0.0.1', '::1'].includes(ip) ? 'localhost' : 'lan');
+    if (this.config.relayUrl && this.config.hostId) {
+      const base = this.config.relayUrl.replace(/^http/, 'ws').replace(/\/$/, '');
+      add(`${base}/connect/client?host_id=${encodeURIComponent(this.config.hostId)}`, 'relay');
+    }
+    return result;
+  }
+  _attemptSocket(url, mode, generation) {
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(url);
+      const crypto = new ClientCryptoManager();
+      const ctx = { socket, crypto, txTail: Promise.resolve(), pending: 0 };
+      this.ws = socket; this.crypto = crypto; this._ctx = ctx;
+      let settled = false, connected = false, failed = false;
+      let rxTail = Promise.resolve(), pendingReceives = 0;
+      const current = () => generation === this._generation && this._ctx === ctx;
+      const fail = (error, security = false) => {
+        if (failed) return;
+        failed = true;
+        clearTimeout(timer);
+        const wasCurrent = current();
+        crypto.destroy();
+        try { socket.close(security ? 1008 : 1000, 'Session closed'); } catch (_) { /* already closed */ }
+        if (wasCurrent) { this.ws = null; this._ctx = null; }
+        error.security = security;
+        if (!settled) { settled = true; reject(error); }
+        if (connected && wasCurrent) {
+          this._stopHeartbeat();
+          if (security) {
+            this.shouldReconnect = false;
+            this._setStatus('error');
+            this.emit('error', 'Authentication: invalid encrypted session');
+          } else if (this.shouldReconnect) {
+            this._setStatus('reconnecting'); this._scheduleReconnect();
+          } else this._setStatus('disconnected');
+        }
+      };
+      ctx.fail = fail;
+      const timer = setTimeout(() => fail(new Error('Handshake timed out')), 10000);
+      socket.onopen = async () => {
+        if (!current()) return;
+        this.connectionMode = mode;
+        this._setStatus('handshake');
+        try {
+          const hello = await crypto.initialize(this.config);
+          if (current() && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(hello));
+        } catch (error) { if (current()) fail(error, true); }
+      };
+      socket.onmessage = (event) => {
+        if (!current() || failed) return;
+        if (++pendingReceives > 64) { fail(new Error('Receive queue limit exceeded'), true); return; }
+        rxTail = rxTail.then(async () => {
+          if (!current() || failed) return;
+          if (typeof event.data !== 'string' || event.data.length > 1024 * 1024) throw new Error('Invalid frame');
+          const frame = JSON.parse(event.data);
+          if (crypto.phase === 'hello') {
+            const auth = await crypto.establishSession(frame);
+            if (current() && !failed) socket.send(JSON.stringify(auth));
+            return;
+          }
+          const msg = await crypto.decryptJson(frame);
+          if (!current() || failed) return;
+          if (!connected) {
+            // decryptJson accepts only an authenticated WELCOME at this phase.
+            connected = true; settled = true; clearTimeout(timer);
+            this._setStatus('connected');
+            this.emit('ready', { hostPub: this.config.hostPub, fingerprint: msg.fingerprint, e2ee: true });
+            this._startHeartbeat(); resolve();
+            if (this.activeSessionId) this.attachSession(this.activeSessionId, this.lastReceivedSeq);
+            else { this.getStats(); this.listProfiles(); }
+          } else this._handleDecryptedMessage(msg);
+        }).catch((error) => { if (current()) fail(error, true); }).finally(() => { pendingReceives--; });
+      };
+      socket.onerror = () => fail(new Error('WebSocket connection failed'));
+      socket.onclose = () => fail(new Error('WebSocket disconnected'));
+    });
+  }
   _handleDecryptedMessage(msg) {
     const type = msg.type;
-
-    if (type === 'PONG') {
-      const now = Date.now();
-      if (msg.ts) {
-        this.pingMs = Math.max(1, now - msg.ts);
-        this.emit('ping', this.pingMs);
-      }
-    } else if (type === 'STATS') {
-      this.emit('stats', msg);
-    } else if (type === 'PROFILES') {
-      this.emit('profiles', msg.profiles);
+    if (type === 'PONG' && msg.ts) {
+      this.pingMs = Math.max(1, Date.now() - msg.ts); this.emit('ping', this.pingMs);
     } else if (type === 'SESSION_ATTACHED') {
-      this.activeSessionId = msg.session.session_id;
-      this.lastReceivedSeq = msg.current_seq;
+      this.activeSessionId = msg.session.session_id; this.lastReceivedSeq = msg.current_seq;
       this.emit('session_attached', msg);
     } else if (type === 'TERMINAL_OUTPUT') {
-      if (msg.seq) {
-        this.lastReceivedSeq = Math.max(this.lastReceivedSeq, msg.seq);
-      }
+      if (msg.session_id === this.activeSessionId && msg.seq) this.lastReceivedSeq = Math.max(this.lastReceivedSeq, msg.seq);
       this.emit('terminal_output', msg);
-    } else if (type === 'AGENT_LAUNCHED') {
-      this.emit('agent_launched', msg.session);
-    } else if (type === 'AGENT_TERMINATED') {
-      this.emit('agent_terminated', msg);
-    } else if (type === 'PROFILE_SAVED') {
-      this.emit('profile_saved', msg.profile);
-    } else if (type === 'DIR_LIST') {
-      this.emit('dir_list', msg);
-    } else if (type === 'DIR_CREATED') {
-      this.emit('dir_created', msg);
-    } else if (type === 'SESSION_FOLDER_UPDATED') {
-      this.emit('session_folder_updated', msg);
-    } else if (type === 'SESSION_DELETED') {
-      this.emit('session_deleted', msg);
-    } else if (type === 'SESSION_RESTARTED') {
-      this.emit('session_restarted', msg.session);
-    } else if (type === 'AGENT_ERROR') {
-      this.emit('agent_error', msg.error);
-    }
-  }
-
-  async send(msg) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return false;
-    }
-    if (this.crypto.supported && this.crypto.aesKey) {
-      const encrypted = await this.crypto.encryptJson(msg);
-      this.ws.send(JSON.stringify(encrypted));
     } else {
-      this.ws.send(JSON.stringify(msg));
+      const mapping = {
+        STATS: ['stats', msg], PROFILES: ['profiles', msg.profiles],
+        AGENT_LAUNCHED: ['agent_launched', msg.session], AGENT_TERMINATED: ['agent_terminated', msg],
+        PROFILE_SAVED: ['profile_saved', msg.profile], DIR_LIST: ['dir_list', msg], DIR_CREATED: ['dir_created', msg],
+        SESSION_FOLDER_UPDATED: ['session_folder_updated', msg], SESSION_DELETED: ['session_deleted', msg],
+        SESSION_RESTARTED: ['session_restarted', msg.session], AGENT_ERROR: ['agent_error', msg.error],
+      };
+      if (mapping[type]) this.emit(...mapping[type]);
     }
-    return true;
   }
-
+  send(message) {
+    const ctx = this._ctx;
+    if (!ctx || this.status !== 'connected' || ctx.socket.readyState !== WebSocket.OPEN || ctx.pending >= 64) return Promise.resolve(false);
+    ctx.pending++;
+    const work = ctx.txTail.then(async () => {
+      if (this._ctx !== ctx || ctx.socket.readyState !== WebSocket.OPEN) return false;
+      if (ctx.socket.bufferedAmount > 1024 * 1024) throw new Error('Slow connection');
+      const frame = await ctx.crypto.encryptJson(message);
+      if (this._ctx !== ctx || ctx.socket.readyState !== WebSocket.OPEN) return false;
+      ctx.socket.send(JSON.stringify(frame));
+      return true;
+    }).catch((error) => {
+      if (this._ctx === ctx) ctx.fail(error, true);
+      return false;
+    }).finally(() => { ctx.pending--; });
+    ctx.txTail = work;
+    return work;
+  }
   _startHeartbeat() {
     this._stopHeartbeat();
-    this.pingTimer = setInterval(() => {
-      if (this.status === 'connected') {
-        this.send({ type: 'PING', ts: Date.now() });
-      }
-    }, 4000);
+    this.pingTimer = setInterval(() => { if (this.status === 'connected') this.send({ type: 'PING', ts: Date.now() }); }, 4000);
   }
-
-  _stopHeartbeat() {
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
-    }
-  }
-
+  _stopHeartbeat() { if (this.pingTimer) clearInterval(this.pingTimer); this.pingTimer = null; }
   _scheduleReconnect() {
-    if (this.reconnectTimer) return;
+    if (!this.shouldReconnect || this.reconnectTimer) return;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      if (this.shouldReconnect && this.status !== 'connected') {
-        this.connect();
-      }
+      if (this.shouldReconnect && this.status !== 'connected') this.connect();
     }, 3000);
   }
-
-  _setStatus(newStatus) {
-    this.status = newStatus;
-    this.emit('status_change', { status: newStatus, mode: this.connectionMode });
-  }
-
+  _setStatus(status) { this.status = status; this.emit('status_change', { status, mode: this.connectionMode }); }
   disconnect() {
     this.shouldReconnect = false;
+    ++this._generation;
+    this._connecting = false;
     this._stopHeartbeat();
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
+    clearTimeout(this.reconnectTimer); this.reconnectTimer = null;
+    const ctx = this._ctx;
+    this._ctx = null; this.ws = null;
+    if (ctx) ctx.fail(new Error('User disconnected'));
     this._setStatus('disconnected');
   }
-
-  // High-level Actions
-  getStats() {
-    return this.send({ type: 'GET_STATS' });
-  }
-
-  listProfiles() {
-    return this.send({ type: 'LIST_PROFILES' });
-  }
-
-  saveProfile(profile) {
-    return this.send({ type: 'SAVE_PROFILE', profile });
-  }
-
-  deleteProfile(profileId) {
-    return this.send({ type: 'DELETE_PROFILE', profile_id: profileId });
-  }
-
-  launchAgent(options) {
-    return this.send({
-      type: 'LAUNCH_AGENT',
-      ...options,
-    });
-  }
-
+  getStats() { return this.send({ type: 'GET_STATS' }); }
+  listProfiles() { return this.send({ type: 'LIST_PROFILES' }); }
+  saveProfile(profile) { return this.send({ type: 'SAVE_PROFILE', profile }); }
+  deleteProfile(profileId) { return this.send({ type: 'DELETE_PROFILE', profile_id: profileId }); }
+  launchAgent(options) { return this.send({ ...options, type: 'LAUNCH_AGENT' }); }
   attachSession(sessionId, lastSeq = 0) {
     this.activeSessionId = sessionId;
-    return this.send({
-      type: 'ATTACH_SESSION',
-      session_id: sessionId,
-      last_seq: lastSeq,
-    });
+    return this.send({ type: 'ATTACH_SESSION', session_id: sessionId, last_seq: lastSeq });
   }
-
-  detachSession() {
-    this.activeSessionId = null;
-    return this.send({ type: 'DETACH_SESSION' });
-  }
-
-  sendInput(sessionId, base64Data) {
-    return this.send({
-      type: 'TERMINAL_INPUT',
-      session_id: sessionId,
-      data: base64Data,
-    });
-  }
-
-  resizeTerminal(sessionId, rows, cols) {
-    return this.send({
-      type: 'RESIZE_TERMINAL',
-      session_id: sessionId,
-      rows,
-      cols,
-    });
-  }
-
-  terminateAgent(sessionId) {
-    return this.send({
-      type: 'TERMINATE_AGENT',
-      session_id: sessionId,
-    });
-  }
-
-  listDirectory(path = '', reqId = '') {
-    return this.send({
-      type: 'LIST_DIR',
-      path: path,
-      req_id: reqId,
-    });
-  }
-
-  createDirectory(path) {
-    return this.send({
-      type: 'CREATE_DIR',
-      path: path,
-    });
-  }
-
-  launchTerminal(options = {}) {
-    return this.send({
-      type: 'LAUNCH_TERMINAL',
-      ...options,
-    });
-  }
-
-  updateSessionFolder(sessionId, folder) {
-    return this.send({
-      type: 'UPDATE_SESSION_FOLDER',
-      session_id: sessionId,
-      folder: folder,
-    });
-  }
-
-  deleteSession(sessionId) {
-    return this.send({
-      type: 'DELETE_SESSION',
-      session_id: sessionId,
-    });
-  }
-
-  restartSession(sessionId) {
-    return this.send({
-      type: 'RESTART_SESSION',
-      session_id: sessionId,
-    });
-  }
+  detachSession() { this.activeSessionId = null; return this.send({ type: 'DETACH_SESSION' }); }
+  sendInput(sessionId, base64Data) { return this.send({ type: 'TERMINAL_INPUT', session_id: sessionId, data: base64Data }); }
+  resizeTerminal(sessionId, rows, cols) { return this.send({ type: 'RESIZE_TERMINAL', session_id: sessionId, rows, cols }); }
+  terminateAgent(sessionId) { return this.send({ type: 'TERMINATE_AGENT', session_id: sessionId }); }
+  listDirectory(path = '', reqId = '') { return this.send({ type: 'LIST_DIR', path, req_id: reqId }); }
+  createDirectory(path) { return this.send({ type: 'CREATE_DIR', path }); }
+  launchTerminal(options = {}) { return this.send({ ...options, type: 'LAUNCH_TERMINAL' }); }
+  updateSessionFolder(sessionId, folder) { return this.send({ type: 'UPDATE_SESSION_FOLDER', session_id: sessionId, folder }); }
+  deleteSession(sessionId) { return this.send({ type: 'DELETE_SESSION', session_id: sessionId }); }
+  restartSession(sessionId) { return this.send({ type: 'RESTART_SESSION', session_id: sessionId }); }
 }

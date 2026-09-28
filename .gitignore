@@ -8,6 +8,9 @@
 .viber/
 .bash_history
 .wget-hsts
+.remote-viber-security-backup-*/
+.remote-viber-security-v2.json
+bugfix/
 __pycache__/
 *.py[cod]
 *$py.class

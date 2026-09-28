@@ -29,6 +29,10 @@ class ViberWebSocketClient(
         .build()
 
     private var webSocket: WebSocket? = null
+    private val securityLock = Any()
+    private var connectionGeneration = 0L
+    private var secureSession: ProtocolV2? = null
+    private var handshakeJob: Job? = null
     private var scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private var activeHost: HostProfile? = null
@@ -61,68 +65,116 @@ class ViberWebSocketClient(
     private var lastReceivedSeq = 0L
 
     fun connect(host: HostProfile) {
+        val changed = activeHost?.id != host.id
         disconnect()
-        activeHost = host
-        shouldReconnect = true
-        _status.value = ConnectionStatus.CONNECTING
-
-        scope.launch {
-            attemptConnection(host)
+        synchronized(securityLock) {
+            activeHost = host
+            if (changed) { _activeSessionId.value = null; lastReceivedSeq = 0L }
+            shouldReconnect = true
+            _status.value = ConnectionStatus.CONNECTING
+            val generation = connectionGeneration
+            scope.launch { attemptConnection(host, generation) }
         }
     }
 
-    private fun attemptConnection(host: HostProfile) {
-        val targetIp = host.getPrimaryAddress()
-        val url = "ws://$targetIp:${host.port}/"
-        Log.i(TAG, "Connecting to $url with token ${host.token.take(4)}***")
-
-        // Guess mode from IP
-        _mode.value = when {
-            targetIp.startsWith("100.") -> ConnectionMode.TAILSCALE
-            targetIp == "127.0.0.1" || targetIp == "localhost" -> ConnectionMode.LOCALHOST
-            targetIp.startsWith("192.168.") || targetIp.startsWith("10.") || targetIp.startsWith("172.") -> ConnectionMode.LAN
-            else -> ConnectionMode.UNKNOWN
+    private fun attemptConnection(host: HostProfile, expectedGeneration: Long = connectionGeneration) {
+        synchronized(securityLock) {
+            if (!shouldReconnect || activeHost?.id != host.id || connectionGeneration != expectedGeneration) return
+            try {
+                val pin = com.remoteviber.client.data.HostManager.pinnedKey(host.id) ?: error("Re-pair required")
+                val crypto = ProtocolV2(pin, host.token)
+                secureSession = crypto
+                val generation = ++connectionGeneration
+                val address = host.getPrimaryAddress()
+                require(address.isNotBlank() && !address.contains(Regex("[\\s/?#@%]")))
+                val formatted = if (address.contains(':') && !address.startsWith('[')) "[$address]" else address
+                val url = com.remoteviber.client.data.HostManager.directUrl(host.id).orEmpty()
+                    .ifEmpty { "ws://$formatted:${host.port}/ws" }
+                _mode.value = when {
+                    address == "127.0.0.1" || address == "localhost" || address == "::1" -> ConnectionMode.LOCALHOST
+                    else -> ConnectionMode.UNKNOWN // Display only; never a trust decision.
+                }
+                val request = Request.Builder().url(url).build()
+                webSocket = okHttpClient.newWebSocket(request, createWebSocketListener(generation, crypto))
+            } catch (_: Exception) {
+                shouldReconnect = false
+                secureSession?.close(); secureSession = null
+                _status.value = ConnectionStatus.ERROR
+                Log.e(TAG, "Secure connection configuration is invalid; re-pair required")
+            }
         }
-
-        val request = Request.Builder().url(url).build()
-        webSocket = okHttpClient.newWebSocket(request, createWebSocketListener())
     }
 
-    private fun createWebSocketListener(): WebSocketListener {
+    private fun createWebSocketListener(generation: Long, crypto: ProtocolV2): WebSocketListener {
         return object : WebSocketListener() {
+            private fun current() = generation == connectionGeneration && secureSession === crypto
+            private fun reject(ws: WebSocket) {
+                if (!current()) return
+                shouldReconnect = false
+                _status.value = ConnectionStatus.ERROR
+                handshakeJob?.cancel(); stopHeartbeat()
+                crypto.close(); secureSession = null
+                ws.close(1008, "Authentication or protocol failure")
+                if (webSocket === ws) webSocket = null
+                Log.e(TAG, "Rejected unauthenticated, replayed or invalid protocol message")
+            }
             override fun onOpen(ws: WebSocket, response: Response) {
-                Log.i(TAG, "WebSocket opened, sending HELLO handshake")
-                _status.value = ConnectionStatus.HANDSHAKE
-                val hello = JSONObject().apply {
-                    put("type", "HELLO")
-                    put("client_id", "android-" + java.util.UUID.randomUUID().toString().take(6))
-                    put("token", activeHost?.token ?: "")
-                    put("e2ee", false) // Direct WireGuard/Tailscale encrypted transport
+                synchronized(securityLock) {
+                    if (!current()) { ws.close(1000, "Superseded"); return }
+                    try {
+                        _status.value = ConnectionStatus.HANDSHAKE
+                        check(ws.send(JSONObject(crypto.hello()).toString()))
+                        handshakeJob?.cancel()
+                        handshakeJob = scope.launch {
+                            delay(10000)
+                            synchronized(securityLock) { if (current() && crypto.phase != ProtocolV2.Phase.READY) reject(ws) }
+                        }
+                    } catch (_: Exception) { reject(ws) }
                 }
-                ws.send(hello.toString())
             }
-
             override fun onMessage(ws: WebSocket, text: String) {
-                try {
-                    val msg = JSONObject(text)
-                    handleMessage(msg)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error handling message", e)
+                synchronized(securityLock) {
+                    if (!current()) return
+                    try {
+                        require(text.length <= 1024 * 1024)
+                        val frame = JSONObject(text)
+                        if (crypto.phase == ProtocolV2.Phase.HELLO) {
+                            val challenge = frame.keys().asSequence().associateWith { frame.get(it) }
+                            check(ws.send(JSONObject(crypto.authenticate(challenge)).toString()))
+                            return
+                        }
+                        require(frame.keys().asSequence().toSet() == setOf("v", "seq", "data") && frame.opt("v") == 2)
+                        val seq = when (val value = frame.opt("seq")) {
+                            is Int -> value.toLong()
+                            is Long -> value
+                            else -> error("Invalid sequence")
+                        }
+                        val encrypted = frame.get("data") as? String ?: error("Invalid ciphertext")
+                        val message = JSONObject(String(crypto.decrypt(seq, encrypted), Charsets.UTF_8))
+                        if (crypto.phase == ProtocolV2.Phase.WELCOME) {
+                            require(message.optString("type") == "WELCOME" && message.opt("v") == 2 &&
+                                message.opt("e2ee") == true && message.optString("status") == "authenticated")
+                            crypto.acceptWelcome(); handshakeJob?.cancel()
+                        } else {
+                            require(message.optString("type") !in setOf("HELLO", "AUTH", "CHALLENGE", "WELCOME"))
+                        }
+                        handleMessage(message) // Only authenticated decrypted application data reaches the UI.
+                    } catch (_: Exception) { reject(ws) }
                 }
             }
-
-            override fun onClosing(ws: WebSocket, code: Int, reason: String) {
-                Log.w(TAG, "WebSocket closing: $code / $reason")
+            override fun onMessage(ws: WebSocket, bytes: okio.ByteString) {
+                synchronized(securityLock) { reject(ws) }
             }
-
+            override fun onClosing(ws: WebSocket, code: Int, reason: String) { ws.close(code, null) }
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                Log.w(TAG, "WebSocket closed: $code / $reason")
-                handleDisconnect()
+                synchronized(securityLock) {
+                    if (!current()) return
+                    if (code == 1008) { shouldReconnect = false; _status.value = ConnectionStatus.ERROR }
+                    handleDisconnect()
+                }
             }
-
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                Log.e(TAG, "WebSocket failure: ${t.message}")
-                handleDisconnect()
+                synchronized(securityLock) { if (current()) handleDisconnect() }
             }
         }
     }
@@ -243,22 +295,23 @@ class ViberWebSocketClient(
     }
 
     private fun handleDisconnect() {
-        stopHeartbeat()
-        if (!shouldReconnect || _status.value == ConnectionStatus.ERROR) {
-            _status.value = ConnectionStatus.DISCONNECTED
-            return
-        }
+        handshakeJob?.cancel(); stopHeartbeat()
+        secureSession?.close(); secureSession = null
+        webSocket = null
+        if (_status.value == ConnectionStatus.ERROR) return
+        if (!shouldReconnect) { _status.value = ConnectionStatus.DISCONNECTED; return }
         _status.value = ConnectionStatus.RECONNECTING
         scheduleReconnect()
     }
-
     private fun scheduleReconnect() {
         reconnectJob?.cancel()
+        val generation = connectionGeneration
         reconnectJob = scope.launch {
             delay(3000)
-            activeHost?.let {
-                if (_status.value != ConnectionStatus.CONNECTED) {
-                    attemptConnection(it)
+            synchronized(securityLock) {
+                val host = activeHost
+                if (host != null && shouldReconnect && connectionGeneration == generation && _status.value != ConnectionStatus.CONNECTED) {
+                    attemptConnection(host, generation)
                 }
             }
         }
@@ -284,17 +337,36 @@ class ViberWebSocketClient(
     }
 
     fun disconnect() {
-        shouldReconnect = false
-        stopHeartbeat()
-        reconnectJob?.cancel()
-        webSocket?.close(1000, "User disconnected")
-        webSocket = null
-        _status.value = ConnectionStatus.DISCONNECTED
+        synchronized(securityLock) {
+            shouldReconnect = false
+            ++connectionGeneration
+            handshakeJob?.cancel(); handshakeJob = null
+            stopHeartbeat(); reconnectJob?.cancel()
+            val previous = webSocket
+            webSocket = null
+            secureSession?.close(); secureSession = null
+            previous?.close(1000, "User disconnected")
+            _status.value = ConnectionStatus.DISCONNECTED
+        }
     }
 
     // High-Level Actions
-    fun send(json: JSONObject): Boolean {
-        return webSocket?.send(json.toString()) ?: false
+    fun send(json: JSONObject): Boolean = synchronized(securityLock) {
+        val crypto = secureSession ?: return@synchronized false
+        val ws = webSocket ?: return@synchronized false
+        if (_status.value != ConnectionStatus.CONNECTED || crypto.phase != ProtocolV2.Phase.READY) return@synchronized false
+        try {
+            require(ws.queueSize() <= 1024 * 1024)
+            // Allocate counter, encrypt and enqueue on the same lock.
+            val sent = ws.send(JSONObject(crypto.encrypt(json.toString().toByteArray(Charsets.UTF_8))).toString())
+            if (!sent) { ws.cancel(); handleDisconnect() }
+            sent
+        } catch (_: Exception) {
+            shouldReconnect = false; _status.value = ConnectionStatus.ERROR
+            crypto.close(); secureSession = null
+            ws.close(1008, "Secure send failed")
+            false
+        }
     }
 
     fun getStats() {
