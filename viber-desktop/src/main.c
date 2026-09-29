@@ -44,6 +44,7 @@ typedef struct {
 
     /* Native desktop action buttons in header */
     GtkWidget *btn_quick_term;
+    GtkWidget *btn_launch_agent;
     GtkWidget *btn_mosaic;
     GtkWidget *btn_single;
     GtkWidget *btn_dashboard;
@@ -58,6 +59,7 @@ typedef struct {
     char app_dir[1024];
     char local_pairing_code[2048];
     
+    double zoom_level;
     gboolean is_fullscreen;
     gboolean page_loaded;
     gboolean is_loading;
@@ -389,16 +391,29 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
     (void)web_view; (void)event;
     AppState *state = (AppState *)user_data;
 
-    /* Auto fallback from https to http or http to https if server uses the other protocol */
-    if (!state->explicit_url && !state->has_fallback_tried) {
+    /* 1. Ignore benign cancellation errors (e.g. subresource abort, reload, redirect) */
+    if (error) {
+        if (g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED) ||
+            g_error_matches(error, WEBKIT_POLICY_ERROR, WEBKIT_POLICY_ERROR_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE) ||
+            g_error_matches(error, WEBKIT_POLICY_ERROR, WEBKIT_POLICY_ERROR_CANNOT_SHOW_MIME_TYPE) ||
+            (error->message && (strstr(error->message, "cancelled") != NULL ||
+                                strstr(error->message, "canceled") != NULL))) {
+            return TRUE;
+        }
+    }
+
+    /* 2. If already loaded and port is open, ignore subresource failures */
+    if (state->page_loaded && is_port_open(state->host, state->port)) {
+        return TRUE;
+    }
+
+    /* 3. ONLY auto-fallback from http:// to https:// when plain http fails on a TLS server.
+          NEVER fallback from https:// to http:// because the host defaults to TLS! */
+    if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "http://")) {
         state->has_fallback_tried = TRUE;
         char fallback_url[512];
-        if (g_str_has_prefix(state->target_url, "https://")) {
-            snprintf(fallback_url, sizeof(fallback_url), "http://%s:%d/", state->host, state->port);
-        } else {
-            snprintf(fallback_url, sizeof(fallback_url), "https://%s:%d/", state->host, state->port);
-        }
-        g_print("[RemoteViber] 自动切换协议至 %s 重新尝试...\n", fallback_url);
+        snprintf(fallback_url, sizeof(fallback_url), "https://%s:%d/", state->host, state->port);
+        g_print("[RemoteViber] 检测到服务端启用了 TLS/HTTPS，自动切换至 %s 重新尝试...\n", fallback_url);
         fflush(stdout);
         snprintf(state->target_url, sizeof(state->target_url), "%s", fallback_url);
         state->is_loading = TRUE;
@@ -418,7 +433,7 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
     char err_msg[1024];
     snprintf(err_msg, sizeof(err_msg),
         "<span size='medium' weight='bold' foreground='#ef4444'>未能载入工作台页面 (%s)</span>\n\n"
-        "<span size='small' foreground='#94a3b8'>请确认服务端正在独立运行，或点击【一键启动本地服务端】：</span>\n"
+        "<span size='small' foreground='#94a3b8'>请确认服务端正在运行，或点击【一键启动本地服务端】：</span>\n"
         "<span font_family='monospace' size='small' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
         "<span size='small' foreground='#64748b'>正在自动检测重新连接...</span>",
         state->target_url, state->port);
@@ -439,7 +454,7 @@ static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *f
                                                gpointer user_data) {
     (void)errors;
     AppState *state = (AppState *)user_data;
-    g_print("[RemoteViber] 允许自签名 TLS 证书: %s\n", failing_uri ? failing_uri : "unknown");
+    g_print("[RemoteViber] 自动信任服务端自签名 TLS 证书 (%s)\n", failing_uri ? failing_uri : "unknown");
     fflush(stdout);
 
     char host[256] = {0};
@@ -459,7 +474,9 @@ static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *f
     if (context && certificate) {
         webkit_web_context_allow_tls_certificate_for_host(context, certificate, host);
     }
-    webkit_web_view_reload(web_view);
+    state->is_loading = TRUE;
+    state->load_failed = FALSE;
+    webkit_web_view_load_uri(web_view, state->target_url);
     return TRUE;
 }
 
@@ -635,12 +652,31 @@ static void on_quick_term_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
     const char *js =
-        "(function() {"
-        "  if (window.viber && window.viber.quickTerminal) { window.viber.quickTerminal(); return; }"
-        "  var btns = Array.from(document.querySelectorAll('button'));"
-        "  var target = btns.find(function(b) { return (b.innerText && b.innerText.indexOf('新建终端') !== -1) || (b.title && b.title.indexOf('开启纯交互终端') !== -1); });"
-        "  if (target) target.click();"
-        "})();";
+        "try {"
+        "  window.dispatchEvent(new CustomEvent('viber:quickTerminal'));"
+        "  if (window.viber && window.viber.quickTerminal) { window.viber.quickTerminal(); }"
+        "  else {"
+        "    var btns = Array.from(document.querySelectorAll('button'));"
+        "    var target = btns.find(function(b) { return (b.innerText && b.innerText.indexOf('新建终端') !== -1) || (b.title && b.title.indexOf('开启纯交互终端') !== -1); });"
+        "    if (target) target.click();"
+        "  }"
+        "} catch(e) { console.error('quickTerminal error:', e); }";
+    dispatch_web_js(WEBKIT_WEB_VIEW(state->web_view), js);
+}
+
+static void on_launch_agent_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    const char *js =
+        "try {"
+        "  window.dispatchEvent(new CustomEvent('viber:openLaunch'));"
+        "  if (window.viber && window.viber.openLaunch) { window.viber.openLaunch(); }"
+        "  else {"
+        "    var btns = Array.from(document.querySelectorAll('button'));"
+        "    var target = btns.find(function(b) { return (b.innerText && b.innerText.indexOf('启动 Agent') !== -1) || (b.title && b.title.indexOf('启动 Agent') !== -1); });"
+        "    if (target) target.click();"
+        "  }"
+        "} catch(e) { console.error('launchAgent error:', e); }";
     dispatch_web_js(WEBKIT_WEB_VIEW(state->web_view), js);
 }
 
@@ -727,6 +763,26 @@ static void on_quit_clicked(GtkButton *btn, gpointer user_data) {
     gtk_window_close(GTK_WINDOW(state->window));
 }
 
+/* Mouse wheel zoom handler (Ctrl+Scroll) */
+static gboolean on_scroll_event(GtkWidget *widget, GdkEventScroll *event, gpointer user_data) {
+    (void)widget;
+    AppState *state = (AppState *)user_data;
+    if (event->state & GDK_CONTROL_MASK) {
+        if (event->direction == GDK_SCROLL_UP || (event->direction == GDK_SCROLL_SMOOTH && event->delta_y < 0)) {
+            state->zoom_level += 0.05;
+            if (state->zoom_level > 3.0) state->zoom_level = 3.0;
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
+            return TRUE;
+        } else if (event->direction == GDK_SCROLL_DOWN || (event->direction == GDK_SCROLL_SMOOTH && event->delta_y > 0)) {
+            state->zoom_level -= 0.05;
+            if (state->zoom_level < 0.5) state->zoom_level = 0.5;
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 /* Keyboard shortcuts handler */
 static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data) {
     (void)widget;
@@ -748,6 +804,36 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer use
     if ((event->state & GDK_MOD1_MASK) && (event->keyval == GDK_KEY_n || event->keyval == GDK_KEY_N)) {
         on_quick_term_clicked(NULL, state);
         return TRUE;
+    }
+
+    /* Alt+A: Launch Agent */
+    if ((event->state & GDK_MOD1_MASK) && (event->keyval == GDK_KEY_a || event->keyval == GDK_KEY_A)) {
+        on_launch_agent_clicked(NULL, state);
+        return TRUE;
+    }
+
+    /* Zoom Controls: Ctrl+Plus, Ctrl+Minus, Ctrl+0 */
+    if (event->state & GDK_CONTROL_MASK) {
+        if (event->keyval == GDK_KEY_plus || event->keyval == GDK_KEY_equal || event->keyval == GDK_KEY_KP_Add) {
+            state->zoom_level += 0.1;
+            if (state->zoom_level > 3.0) state->zoom_level = 3.0;
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
+            g_print("[RemoteViber] 工作台缩放: %.0f%%\n", state->zoom_level * 100);
+            return TRUE;
+        }
+        if (event->keyval == GDK_KEY_minus || event->keyval == GDK_KEY_underscore || event->keyval == GDK_KEY_KP_Subtract) {
+            state->zoom_level -= 0.1;
+            if (state->zoom_level < 0.5) state->zoom_level = 0.5;
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
+            g_print("[RemoteViber] 工作台缩放: %.0f%%\n", state->zoom_level * 100);
+            return TRUE;
+        }
+        if (event->keyval == GDK_KEY_0 || event->keyval == GDK_KEY_KP_0) {
+            state->zoom_level = 1.0;
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
+            g_print("[RemoteViber] 工作台缩放已重置: 100%%\n");
+            return TRUE;
+        }
     }
 
     /* Alt+M: Mosaic Matrix View */
@@ -827,6 +913,11 @@ int main(int argc, char *argv[]) {
             app_state.explicit_url = TRUE;
         } else if (strcmp(argv[i], "--detach") == 0 || strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--bg") == 0) {
             detach_to_background = TRUE;
+        } else if (strcmp(argv[i], "--zoom") == 0 && i + 1 < argc) {
+            double z = atof(argv[++i]);
+            if (z >= 0.5 && z <= 3.0) {
+                app_state.zoom_level = z;
+            }
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             g_print("RemoteViber 原生桌面工作台 (Linux Native Desktop Client)\n"
                     "基于 GTK+ 3.0 & WebKit2GTK 4.1 原生打造 (支持纯客户端模式与一键服务端控制)\n\n"
@@ -835,13 +926,17 @@ int main(int argc, char *argv[]) {
                     "  --port <port>   指定服务端连接端口 (默认: 8765)\n"
                     "  --host <ip>     指定服务端连接IP (默认: 127.0.0.1)\n"
                     "  --url <url>     直接指定连接完整 URL (例如 https://192.168.1.100:8765/)\n"
+                    "  --zoom <factor> 工作台缩放比例 (默认: 1.0, 范围: 0.5 - 3.0)\n"
                     "  -d, --detach    转入后台独立运行，立即释放终端交互提示符\n"
                     "  --help, -h      显示帮助信息\n\n"
                     "快捷键:\n"
                     "  Alt+N           ➕ 快速创建并启动终端\n"
+                    "  Alt+A           🚀 启动 Agent 智能体\n"
                     "  Alt+M           🔲 切换至 4格拼图终端矩阵\n"
                     "  Alt+\\           🖥️ 切换至单屏聚焦终端\n"
                     "  Alt+D           📊 切换至 Agent 仪表盘\n"
+                    "  Ctrl++ / Ctrl+- 🔍 放大 / 缩小工作台 (支持 Ctrl+滚轮)\n"
+                    "  Ctrl+0          🔍 重置工作台缩放到 100%%\n"
                     "  F11             🖥️ 全屏模式切换\n"
                     "  Ctrl+R / F5     🔄 刷新工作台\n"
                     "  Ctrl+Q          ❌ 关闭桌面客户端 (不影响服务端后台运行)\n");
@@ -890,8 +985,10 @@ int main(int argc, char *argv[]) {
     /* Create top-level GtkWindow */
     app_state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(app_state.window), APP_TITLE);
-    gtk_window_set_default_size(GTK_WINDOW(app_state.window), 1360, 860);
+    gtk_window_set_default_size(GTK_WINDOW(app_state.window), 1600, 960);
     gtk_widget_set_size_request(app_state.window, 640, 480);
+    gtk_widget_add_events(app_state.window, GDK_SCROLL_MASK);
+    gtk_window_maximize(GTK_WINDOW(app_state.window));
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.window), "remote-viber-window");
 
     /* Try to set application icon */
@@ -932,6 +1029,11 @@ int main(int argc, char *argv[]) {
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_quick_term), "quick-term-btn");
     g_signal_connect(app_state.btn_quick_term, "clicked", G_CALLBACK(on_quick_term_clicked), &app_state);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_quick_term);
+
+    app_state.btn_launch_agent = gtk_button_new_with_label("🚀 启动 Agent (Alt+A)");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_launch_agent), "action-btn");
+    g_signal_connect(app_state.btn_launch_agent, "clicked", G_CALLBACK(on_launch_agent_clicked), &app_state);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_launch_agent);
 
     app_state.btn_mosaic = gtk_button_new_with_label("🔲 拼图网格 (Alt+M)");
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_mosaic), "action-btn");
@@ -1071,10 +1173,14 @@ int main(int argc, char *argv[]) {
     webkit_settings_set_enable_developer_extras(settings, TRUE);
     webkit_settings_set_enable_page_cache(settings, TRUE);
     webkit_settings_set_hardware_acceleration_policy(settings, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+    webkit_settings_set_zoom_text_only(settings, FALSE);
 
     app_state.web_view = webkit_web_view_new_with_context(ctx);
     webkit_web_view_set_settings(WEBKIT_WEB_VIEW(app_state.web_view), settings);
     g_object_unref(settings);
+
+    if (app_state.zoom_level < 0.5) app_state.zoom_level = 1.0;
+    webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(app_state.web_view), app_state.zoom_level);
 
     /* Set dark base background */
     GdkRGBA dark_bg = { 0.035, 0.05, 0.09, 1.0 }; /* #090d16 */
@@ -1101,33 +1207,35 @@ int main(int argc, char *argv[]) {
         char *js_init = g_strdup_printf(
             "(function() {"
             "  try {"
+            "    sessionStorage.setItem('viber_local_pairing_code', '%s');"
             "    var raw = sessionStorage.getItem('viber_host_config_v2');"
             "    if (!raw) {"
-            "      var b = '%s';"
-            "      if (b) {"
-            "        var bin = atob(b.replace(/-/g, '+').replace(/_/g, '/'));"
-            "        var d = JSON.parse(bin);"
-            "        if (d && d.v === 2 && d.pub && d.token) {"
-            "          sessionStorage.setItem('viber_host_config_v2', JSON.stringify({"
-            "            protocolVersion: 2,"
-            "            hostId: d.id,"
-            "            hostPub: d.pub,"
-            "            hostName: d.name || 'Local Host',"
-            "            directPort: d.port || %d,"
-            "            token: d.token,"
-            "            tailscaleIps: d.tailscale || [],"
-            "            lanIps: d.lan || ['127.0.0.1'],"
-            "            relayUrl: d.relay || '',"
-            "            directUrl: d.direct_url || '',"
-            "            ssl: Boolean(d.ssl),"
-            "            fingerprint: (d.id || '').replace(/^host-/, '')"
-            "          }));"
-            "        }"
+            "      var b = '%s'.trim().replace(/-/g, '+').replace(/_/g, '/');"
+            "      var padded = b + '='.repeat((4 - b.length %% 4) %% 4);"
+            "      var bin = atob(padded);"
+            "      var bytes = new Uint8Array(bin.length);"
+            "      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);"
+            "      var d = JSON.parse(new TextDecoder('utf-8').decode(bytes));"
+            "      if (d && d.v === 2 && d.pub && d.token) {"
+            "        sessionStorage.setItem('viber_host_config_v2', JSON.stringify({"
+            "          protocolVersion: 2,"
+            "          hostId: d.id,"
+            "          hostPub: d.pub,"
+            "          hostName: d.name || 'Local Host',"
+            "          directPort: d.port || %d,"
+            "          token: d.token,"
+            "          tailscaleIps: d.tailscale || [],"
+            "          lanIps: d.lan || ['127.0.0.1'],"
+            "          relayUrl: d.relay || '',"
+            "          directUrl: d.direct_url || '',"
+            "          ssl: Boolean(d.ssl),"
+            "          fingerprint: (d.id || '').replace(/^host-/, '')"
+            "        }));"
             "      }"
             "    }"
             "  } catch(e) {}"
             "})();",
-            app_state.local_pairing_code, app_state.port
+            app_state.local_pairing_code, app_state.local_pairing_code, app_state.port
         );
 
         WebKitUserScript *user_script = webkit_user_script_new(
@@ -1157,6 +1265,7 @@ int main(int argc, char *argv[]) {
 
     /* Connect window signals */
     g_signal_connect(app_state.window, "key-press-event", G_CALLBACK(on_key_press), &app_state);
+    g_signal_connect(app_state.window, "scroll-event", G_CALLBACK(on_scroll_event), &app_state);
     g_signal_connect(app_state.window, "destroy", G_CALLBACK(on_window_destroy), &app_state);
 
     gtk_widget_show_all(app_state.window);
