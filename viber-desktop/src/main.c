@@ -161,6 +161,12 @@ static void find_local_pairing_code(AppState *state) {
     char line[4096];
     while (fgets(line, sizeof(line), fp)) {
         char *trimmed = g_strstrip(line);
+        if (g_str_has_prefix(trimmed, "Local UI:")) {
+            char *url_part = g_strstrip(trimmed + 9);
+            if (!state->explicit_url && url_part[0] != '\0') {
+                strncpy(state->target_url, url_part, sizeof(state->target_url) - 1);
+            }
+        }
         if (g_str_has_prefix(trimmed, "eyJ2")) {
             strncpy(state->local_pairing_code, trimmed, sizeof(state->local_pairing_code) - 1);
             break;
@@ -321,12 +327,14 @@ static void on_open_browser_clicked(GtkButton *btn, gpointer user_data) {
 static void on_toggle_protocol_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
+    state->explicit_url = TRUE;
+    state->has_fallback_tried = TRUE;
     if (g_str_has_prefix(state->target_url, "https://")) {
         snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
     } else {
         snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
     }
-    g_print("[RemoteViber] 切换连接协议为: %s\n", state->target_url);
+    g_print("[RemoteViber] 手动切换连接协议为: %s\n", state->target_url);
     fflush(stdout);
     on_retry_clicked(NULL, state);
 }
@@ -402,24 +410,69 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
         }
     }
 
-    /* 2. If already loaded and port is open, ignore subresource failures */
-    if (state->page_loaded && is_port_open(state->host, state->port)) {
+    /* 2. If already loaded, ignore any subresource failures */
+    if (state->page_loaded) {
         return TRUE;
     }
 
-    /* 3. ONLY auto-fallback from http:// to https:// when plain http fails on a TLS server.
-          NEVER fallback from https:// to http:// because the host defaults to TLS! */
-    if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "http://")) {
-        state->has_fallback_tried = TRUE;
-        char fallback_url[512];
-        snprintf(fallback_url, sizeof(fallback_url), "https://%s:%d/", state->host, state->port);
-        g_print("[RemoteViber] 检测到服务端启用了 TLS/HTTPS，自动切换至 %s 重新尝试...\n", fallback_url);
-        fflush(stdout);
-        snprintf(state->target_url, sizeof(state->target_url), "%s", fallback_url);
-        state->is_loading = TRUE;
-        state->load_failed = FALSE;
-        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
-        return TRUE;
+    /* 3. If failing_uri is an external resource (e.g. Google Fonts, CDN), ignore and do not break the page */
+    if (failing_uri && state->target_url[0] != '\0') {
+        GUri *u_fail = g_uri_parse(failing_uri, G_URI_FLAGS_NONE, NULL);
+        GUri *u_target = g_uri_parse(state->target_url, G_URI_FLAGS_NONE, NULL);
+        if (u_fail && u_target) {
+            const char *h_fail = g_uri_get_host(u_fail);
+            const char *h_target = g_uri_get_host(u_target);
+            gboolean is_diff = (h_fail && h_target && g_ascii_strcasecmp(h_fail, h_target) != 0);
+            g_uri_unref(u_fail);
+            g_uri_unref(u_target);
+            if (is_diff) {
+                return TRUE;
+            }
+        } else {
+            if (u_fail) g_uri_unref(u_fail);
+            if (u_target) g_uri_unref(u_target);
+        }
+    }
+
+    /* 4. Intelligent protocol fallback (only once, and only when URL was not explicitly forced) */
+    if (!state->explicit_url && !state->has_fallback_tried) {
+        gboolean is_tls_handshake_err = FALSE;
+        if (error && error->message) {
+            if (strstr(error->message, "TLS handshake") != NULL ||
+                strstr(error->message, "handshake") != NULL ||
+                strstr(error->message, "non-properly terminated") != NULL ||
+                strstr(error->message, "not TLS") != NULL) {
+                is_tls_handshake_err = TRUE;
+            }
+        }
+
+        /* If https failed because server is plain HTTP (terminated TLS handshake) */
+        if (g_str_has_prefix(state->target_url, "https://") && is_tls_handshake_err) {
+            state->has_fallback_tried = TRUE;
+            char fallback_url[512];
+            snprintf(fallback_url, sizeof(fallback_url), "http://%s:%d/", state->host, state->port);
+            g_print("[RemoteViber] 服务端运行在纯 HTTP 模式，自动切换至 %s...\n", fallback_url);
+            fflush(stdout);
+            snprintf(state->target_url, sizeof(state->target_url), "%s", fallback_url);
+            state->is_loading = TRUE;
+            state->load_failed = FALSE;
+            webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
+            return TRUE;
+        }
+
+        /* If http failed and port is open, try https */
+        if (g_str_has_prefix(state->target_url, "http://")) {
+            state->has_fallback_tried = TRUE;
+            char fallback_url[512];
+            snprintf(fallback_url, sizeof(fallback_url), "https://%s:%d/", state->host, state->port);
+            g_print("[RemoteViber] 检测到服务端启用了 TLS/HTTPS，自动切换至 %s...\n", fallback_url);
+            fflush(stdout);
+            snprintf(state->target_url, sizeof(state->target_url), "%s", fallback_url);
+            state->is_loading = TRUE;
+            state->load_failed = FALSE;
+            webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
+            return TRUE;
+        }
     }
 
     g_printerr("[RemoteViber] 页面加载失败: %s (原因: %s)\n", failing_uri ? failing_uri : "", error ? error->message : "无法连接");

@@ -109,6 +109,9 @@ export class ViberConnection {
       const formatted = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
       if (useSsl) {
         add(`wss://${formatted}:${port}/ws`, mode);
+        if (!isHttps) {
+          add(`ws://${formatted}:${port}/ws`, mode);
+        }
       } else {
         add(`ws://${formatted}:${port}/ws`, mode);
         add(`wss://${formatted}:${port}/ws`, mode);
