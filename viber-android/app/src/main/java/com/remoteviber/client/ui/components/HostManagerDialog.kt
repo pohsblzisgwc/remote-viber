@@ -76,7 +76,7 @@ fun HostManagerDialog(
                 Spacer(modifier = Modifier.height(10.dp))
 
                 Text(
-                    text = "快速导入或粘贴配对链接:",
+                    text = "快速导入配对码或配对链接:",
                     color = TextSecondary,
                     fontSize = 11.sp
                 )
@@ -92,7 +92,7 @@ fun HostManagerDialog(
                             importInput = it
                             importError = false
                         },
-                        placeholder = { Text("viber://connect?data=... 或 http://100.x.x.x:8765/?token=...", fontSize = 10.sp, color = TextMuted) },
+                        placeholder = { Text("粘贴配对码 (eyJ...) 或配对链接 (viber://connect?data=...)", fontSize = 10.sp, color = TextMuted) },
                         singleLine = true,
                         isError = importError,
                         colors = OutlinedTextFieldDefaults.colors(
@@ -132,7 +132,7 @@ fun HostManagerDialog(
                 }
 
                 if (importError) {
-                    Text(text = "无法解析配对链接，请检查格式", color = ViberRose, fontSize = 10.sp, modifier = Modifier.padding(top = 2.dp))
+                    Text(text = "无法解析配对信息，请检查是否完整复制配对码或链接", color = ViberRose, fontSize = 10.sp, modifier = Modifier.padding(top = 2.dp))
                 }
 
                 Spacer(modifier = Modifier.height(12.dp))

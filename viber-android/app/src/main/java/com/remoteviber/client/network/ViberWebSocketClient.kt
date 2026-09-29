@@ -10,7 +10,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import okhttp3.*
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URI
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 import com.remoteviber.client.ui.components.XtermController
 
@@ -23,10 +29,23 @@ class ViberWebSocketClient(
         private const val TAG = "ViberWS"
     }
 
-    private val okHttpClient = OkHttpClient.Builder()
-        .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(0, TimeUnit.MILLISECONDS) // We handle custom PING frames
-        .build()
+    private val okHttpClient: OkHttpClient = run {
+        val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        })
+        val sslContext = SSLContext.getInstance("TLS").apply {
+            init(null, trustAllCerts, SecureRandom())
+        }
+        OkHttpClient.Builder()
+            .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
+            .hostnameVerifier { _, _ -> true }
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(0, TimeUnit.MILLISECONDS) // We handle custom PING frames
+            .build()
+    }
 
     private var webSocket: WebSocket? = null
     private val securityLock = Any()
@@ -94,45 +113,75 @@ class ViberWebSocketClient(
         val seen = mutableSetOf<String>()
 
         fun add(url: String, mode: ConnectionMode) {
-            if (url.isNotBlank() && seen.add(url)) {
-                list.add(CandidateEndpoint(url, mode))
+            val trimmed = url.trim()
+            if (trimmed.isNotBlank() && seen.add(trimmed)) {
+                list.add(CandidateEndpoint(trimmed, mode))
             }
         }
 
-        val direct = com.remoteviber.client.data.HostManager.directUrl(host.id).orEmpty()
-        if (direct.isNotBlank()) {
-            add(direct, ConnectionMode.UNKNOWN)
+        val direct = host.directUrl.ifBlank { com.remoteviber.client.data.HostManager.directUrl(host.id).orEmpty() }
+        if (direct.isNotBlank() && direct != "null") {
+            var directWs = direct
+            if (directWs.startsWith("https://")) {
+                directWs = "wss://" + directWs.removePrefix("https://")
+            } else if (directWs.startsWith("http://")) {
+                directWs = "ws://" + directWs.removePrefix("http://")
+            }
+            try {
+                val uri = URI(directWs)
+                if (uri.path.isNullOrEmpty() || uri.path == "/") {
+                    val portPart = if (uri.port > 0) ":${uri.port}" else ""
+                    val hostPart = if (uri.host.contains(':') && !uri.host.startsWith('[')) "[${uri.host}]" else uri.host
+                    directWs = "${uri.scheme}://$hostPart$portPart/ws"
+                }
+            } catch (_: Exception) {}
+            add(directWs, ConnectionMode.UNKNOWN)
+        }
+
+        val useSsl = host.ssl || direct.startsWith("wss://") || direct.startsWith("https://")
+
+        val addHost = { ip: String, mode: ConnectionMode ->
+            if (ip.isNotBlank() && !ip.contains(Regex("[\\s/?#@%]"))) {
+                val formatted = if (ip.contains(':') && !ip.startsWith('[')) "[$ip]" else ip
+                if (useSsl) {
+                    add("wss://$formatted:${host.port}/ws", mode)
+                    add("ws://$formatted:${host.port}/ws", mode)
+                } else {
+                    add("ws://$formatted:${host.port}/ws", mode)
+                    add("wss://$formatted:${host.port}/ws", mode)
+                }
+            }
         }
 
         for (ip in host.tailscaleIps) {
-            if (ip.isNotBlank() && !ip.contains(Regex("[\\s/?#@%]"))) {
-                val formatted = if (ip.contains(':') && !ip.startsWith('[')) "[$ip]" else ip
-                add("ws://$formatted:${host.port}/ws", ConnectionMode.TAILSCALE)
-            }
+            addHost(ip, ConnectionMode.TAILSCALE)
         }
 
         for (ip in host.lanIps) {
-            if (ip.isNotBlank() && ip != "127.0.0.1" && ip != "localhost" && ip != "::1" && !ip.contains(Regex("[\\s/?#@%]"))) {
-                val formatted = if (ip.contains(':') && !ip.startsWith('[')) "[$ip]" else ip
-                add("ws://$formatted:${host.port}/ws", ConnectionMode.LAN)
+            if (ip != "127.0.0.1" && ip != "localhost" && ip != "::1") {
+                addHost(ip, ConnectionMode.LAN)
             }
         }
 
-        if (host.relayUrl.isNotBlank()) {
-            val relayBase = host.relayUrl.trimEnd('/')
+        if (host.relayUrl.isNotBlank() && host.relayUrl != "null") {
+            val relayBase = host.relayUrl.trimEnd('/').let {
+                if (it.startsWith("https://")) "wss://" + it.removePrefix("https://")
+                else if (it.startsWith("http://")) "ws://" + it.removePrefix("http://")
+                else it
+            }
             add("$relayBase/connect/client?host_id=${host.id}", ConnectionMode.RELAY)
         }
 
         for (ip in host.lanIps) {
             if (ip == "127.0.0.1" || ip == "localhost" || ip == "::1") {
-                add("ws://$ip:${host.port}/ws", ConnectionMode.LOCALHOST)
+                addHost("10.0.2.2", ConnectionMode.LOCALHOST)
+                addHost(ip, ConnectionMode.LOCALHOST)
             }
         }
 
         if (list.isEmpty()) {
             val address = host.getPrimaryAddress()
-            val formatted = if (address.contains(':') && !address.startsWith('[')) "[$address]" else address
-            add("ws://$formatted:${host.port}/ws", ConnectionMode.UNKNOWN)
+            addHost(address, ConnectionMode.UNKNOWN)
         }
         return list
     }
@@ -233,8 +282,15 @@ class ViberWebSocketClient(
                         } else {
                             require(message.optString("type") !in setOf("HELLO", "AUTH", "CHALLENGE", "WELCOME"))
                         }
-                        handleMessage(message) // Only authenticated decrypted application data reaches the UI.
-                    } catch (_: Exception) { reject(ws) }
+                        try {
+                            handleMessage(message) // Only authenticated decrypted application data reaches the UI.
+                        } catch (appEx: Exception) {
+                            Log.e(TAG, "Error handling decrypted application message: ${message.optString("type")}", appEx)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Protocol or authentication failure: ${e.message}", e)
+                        reject(ws)
+                    }
                 }
             }
             override fun onMessage(ws: WebSocket, bytes: okio.ByteString) {
@@ -249,6 +305,7 @@ class ViberWebSocketClient(
                 }
             }
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                Log.w(TAG, "WebSocket connection failed: ${t.message} (response: $response)")
                 synchronized(securityLock) { if (current()) handleDisconnect() }
             }
         }
