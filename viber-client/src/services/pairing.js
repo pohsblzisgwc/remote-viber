@@ -10,7 +10,7 @@ export async function parsePairingBundle(input) {
     }
     encoded = url.searchParams.get('data');
   }
-  if (!/^[A-Za-z0-9_-]+={0,2}$/.test(encoded)) throw new Error('配对编码无效');
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(encoded)) throw new Error('配对编码无效');
   const normal = encoded.replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
   const padded = normal + '='.repeat((4 - normal.length % 4) % 4);
   const json = new TextDecoder('utf-8', { fatal: true }).decode(fromBase64(padded));

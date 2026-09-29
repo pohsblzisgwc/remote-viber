@@ -1,4 +1,4 @@
-import { loadSessionConfig } from './services/pairing.js';
+import { loadSessionConfig, parsePairingBundle } from './services/pairing.js';
 import React, { useState, useEffect, useRef } from 'react';
 import TopBar from './components/TopBar';
 import Dashboard from './components/Dashboard';
@@ -36,7 +36,34 @@ export default function App() {
     const url = new URL(window.location.href);
     for (const name of ['token', 'hostId', 'host_id']) url.searchParams.delete(name);
     if (url.href !== window.location.href) window.history.replaceState(null, '', url.href);
-    if (!hostConfig.hostPub || !hostConfig.token) setIsPairingModalOpen(true);
+
+    try {
+      const autoCode = sessionStorage.getItem('viber_local_pairing_code');
+      if (autoCode && (!hostConfig.hostPub || !hostConfig.token)) {
+        parsePairingBundle(autoCode).then((cfg) => {
+          handleSaveConfig(cfg);
+          setIsPairingModalOpen(false);
+        }).catch(() => {
+          setIsPairingModalOpen(true);
+        });
+      } else if (!hostConfig.hostPub || !hostConfig.token) {
+        setIsPairingModalOpen(true);
+      }
+    } catch (_) {
+      if (!hostConfig.hostPub || !hostConfig.token) setIsPairingModalOpen(true);
+    }
+
+    window.viber_import_pairing = (code) => {
+      if (!code) return;
+      parsePairingBundle(code).then((cfg) => {
+        handleSaveConfig(cfg);
+        setIsPairingModalOpen(false);
+      }).catch(console.error);
+    };
+
+    return () => {
+      delete window.viber_import_pairing;
+    };
   }, []);
 
   // Initialize or re-create connection when hostConfig changes
@@ -162,6 +189,36 @@ export default function App() {
       });
     }
   };
+
+  // Integration with native desktop client buttons and hotkeys
+  useEffect(() => {
+    const onQuickTerm = () => handleQuickTerminal();
+    const onSwitchView = (e) => {
+      if (e.detail) setActiveView(e.detail);
+    };
+    const onOpenPairing = () => setIsPairingModalOpen(true);
+    const onOpenLaunch = () => setIsLaunchModalOpen(true);
+
+    window.addEventListener('viber:quickTerminal', onQuickTerm);
+    window.addEventListener('viber:switchView', onSwitchView);
+    window.addEventListener('viber:openPairing', onOpenPairing);
+    window.addEventListener('viber:openLaunch', onOpenLaunch);
+
+    window.viber = {
+      quickTerminal: handleQuickTerminal,
+      switchView: (v) => setActiveView(v),
+      openPairing: () => setIsPairingModalOpen(true),
+      openLaunch: () => setIsLaunchModalOpen(true),
+    };
+
+    return () => {
+      window.removeEventListener('viber:quickTerminal', onQuickTerm);
+      window.removeEventListener('viber:switchView', onSwitchView);
+      window.removeEventListener('viber:openPairing', onOpenPairing);
+      window.removeEventListener('viber:openLaunch', onOpenLaunch);
+      delete window.viber;
+    };
+  }, [sessions, activeSessionId]);
 
   // Handle customized launch
   const handleConfigureLaunch = (config) => {
