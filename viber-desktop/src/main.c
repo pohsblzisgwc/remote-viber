@@ -47,6 +47,7 @@ typedef struct {
     
     gboolean is_fullscreen;
     gboolean page_loaded;
+    gboolean is_loading;
     guint poll_timer_id;
 } AppState;
 
@@ -101,9 +102,35 @@ static gboolean is_port_open(const char *host, int port) {
     return FALSE;
 }
 
+static gboolean check_host_ready_cb(gpointer user_data);
+
+/* Helper to stop polling timer safely */
+static void stop_poll_timer(AppState *state) {
+    if (state->poll_timer_id != 0) {
+        g_source_remove(state->poll_timer_id);
+        state->poll_timer_id = 0;
+    }
+}
+
+/* Helper to start polling timer safely without duplicates */
+static void start_poll_timer(AppState *state, guint interval_ms) {
+    stop_poll_timer(state);
+    state->poll_timer_id = g_timeout_add(interval_ms, check_host_ready_cb, state);
+}
+
 /* Polling callback: wait for host server to become available */
 static gboolean check_host_ready_cb(gpointer user_data) {
     AppState *state = (AppState *)user_data;
+
+    if (state->page_loaded) {
+        state->poll_timer_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    if (state->is_loading) {
+        /* Page load is already in progress; wait for load-changed or load-failed */
+        return G_SOURCE_CONTINUE;
+    }
 
     if (is_port_open(state->host, state->port)) {
         g_print("[RemoteViber] 服务端已连接 (%s)，正在加载工作台...\n", state->target_url);
@@ -116,9 +143,9 @@ static gboolean check_host_ready_cb(gpointer user_data) {
             "<span color='#10b981' font_weight='bold'>●</span> <span color='#38bdf8' font_size='small'>%d 准备中</span>", state->port);
         gtk_label_set_markup(GTK_LABEL(state->status_label), status_str);
 
-        /* Load URL; transition to webview once WEBKIT_LOAD_FINISHED fires */
-        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
+        state->is_loading = TRUE;
         state->poll_timer_id = 0;
+        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
         return G_SOURCE_REMOVE;
     }
 
@@ -145,10 +172,12 @@ static void on_retry_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
     gtk_spinner_start(GTK_SPINNER(state->spinner));
-    if (state->poll_timer_id == 0) {
-        state->poll_timer_id = g_timeout_add(1000, check_host_ready_cb, state);
+    state->page_loaded = FALSE;
+    state->is_loading = FALSE;
+    stop_poll_timer(state);
+    if (check_host_ready_cb(state) == G_SOURCE_CONTINUE) {
+        start_poll_timer(state, 1000);
     }
-    check_host_ready_cb(state);
 }
 
 /* Open in system browser button handler */
@@ -169,6 +198,8 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
             "<span size='small' foreground='#94a3b8'>正在解析渲染拼图工作台视图...</span>");
     } else if (event == WEBKIT_LOAD_FINISHED) {
         state->page_loaded = TRUE;
+        state->is_loading = FALSE;
+        stop_poll_timer(state);
         gtk_spinner_stop(GTK_SPINNER(state->spinner));
         gtk_stack_set_visible_child(GTK_STACK(state->stack), state->web_view);
         
@@ -183,9 +214,30 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
 static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, gchar *failing_uri, GError *error, gpointer user_data) {
     (void)web_view; (void)event;
     AppState *state = (AppState *)user_data;
-    g_printerr("[RemoteViber] 连接断开或页面加载失败: %s (原因: %s)\n", failing_uri, error ? error->message : "无法连接");
+
+    /* Ignore benign cancellation errors (e.g. rapid reload, user navigation abort, redirect) */
+    if (error) {
+        if (g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED) ||
+            g_error_matches(error, WEBKIT_POLICY_ERROR, WEBKIT_POLICY_ERROR_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE) ||
+            g_error_matches(error, WEBKIT_POLICY_ERROR, WEBKIT_POLICY_ERROR_CANNOT_SHOW_MIME_TYPE) ||
+            (error->message && (strstr(error->message, "cancelled") != NULL || strstr(error->message, "canceled") != NULL))) {
+            g_print("[RemoteViber] 加载请求已取消（无害并忽略）: %s\n", failing_uri ? failing_uri : "");
+            state->is_loading = FALSE;
+            return TRUE;
+        }
+    }
+
+    /* If the page is already loaded and host is still up, do not tear down the UI for subresource failures */
+    if (state->page_loaded && is_port_open(state->host, state->port)) {
+        g_printerr("[RemoteViber] 页面子资源加载告警: %s (原因: %s)\n", failing_uri ? failing_uri : "", error ? error->message : "未知");
+        state->is_loading = FALSE;
+        return TRUE;
+    }
+
+    g_printerr("[RemoteViber] 连接断开或页面加载失败: %s (原因: %s)\n", failing_uri ? failing_uri : "", error ? error->message : "无法连接");
 
     state->page_loaded = FALSE;
+    state->is_loading = FALSE;
     gtk_stack_set_visible_child(GTK_STACK(state->stack), state->loading_box);
     gtk_spinner_start(GTK_SPINNER(state->spinner));
 
@@ -204,9 +256,7 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
     gtk_label_set_markup(GTK_LABEL(state->status_label), badge_str);
 
     /* Resume polling to auto-reconnect when server is restarted */
-    if (state->poll_timer_id == 0) {
-        state->poll_timer_id = g_timeout_add(1000, check_host_ready_cb, state);
-    }
+    start_poll_timer(state, 1000);
 
     return TRUE; /* Handled */
 }
@@ -477,6 +527,7 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer use
     if ((event->keyval == GDK_KEY_F5) ||
         ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_r || event->keyval == GDK_KEY_R))) {
         if (is_port_open(state->host, state->port)) {
+            state->is_loading = TRUE;
             webkit_web_view_reload(WEBKIT_WEB_VIEW(state->web_view));
         } else {
             on_load_failed(WEBKIT_WEB_VIEW(state->web_view), WEBKIT_LOAD_FINISHED, state->target_url, NULL, state);
@@ -499,6 +550,7 @@ static void on_reload_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
     if (is_port_open(state->host, state->port)) {
+        state->is_loading = TRUE;
         webkit_web_view_reload(WEBKIT_WEB_VIEW(state->web_view));
     } else {
         on_load_failed(WEBKIT_WEB_VIEW(state->web_view), WEBKIT_LOAD_FINISHED, state->target_url, NULL, state);
@@ -547,7 +599,8 @@ static void on_quit_clicked(GtkButton *btn, gpointer user_data) {
 /* Clean exit handler: closes client only; server is independent */
 static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
     (void)widget;
-    (void)user_data;
+    AppState *state = (AppState *)user_data;
+    stop_poll_timer(state);
     gtk_main_quit();
 }
 
@@ -839,11 +892,10 @@ int main(int argc, char *argv[]) {
 
     gtk_widget_show_all(app_state.window);
 
-    /* Start non-blocking polling timer for host availability (polling every 1 second) */
-    app_state.poll_timer_id = g_timeout_add(1000, check_host_ready_cb, &app_state);
-
-    /* Trigger immediate initial check */
-    check_host_ready_cb(&app_state);
+    /* Initial check: if server is ready, connect immediately; otherwise poll every 1 second */
+    if (check_host_ready_cb(&app_state) == G_SOURCE_CONTINUE) {
+        start_poll_timer(&app_state, 1000);
+    }
 
     gtk_main();
 

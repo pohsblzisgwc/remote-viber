@@ -45,6 +45,8 @@ dist-bin/
 viber-host-linux
 viber-host-linux-x86_64
 viber-host-*
+viber-desktop-linux
+viber-desktop-*
 *.exe
 *.run
 *.bin
