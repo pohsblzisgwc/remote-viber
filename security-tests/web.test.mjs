@@ -89,3 +89,18 @@ test('stale socket events cannot clear a replacement connection', async () => {
     conn.disconnect(); await second;
   } finally { conn.disconnect(); globalThis.WebSocket = Original; }
 });
+test('HTTPS context uses wss for remote endpoints avoiding mixed content', () => {
+  globalThis.window = { location: new URL('https://app.example.com/') };
+  try {
+    const conn = new ViberConnection({ lanIps: ['192.168.1.50'], tailscaleIps: ['100.64.0.10'], directPort: 8765 });
+    const candidates = conn._buildCandidateUrls();
+    for (const c of candidates) {
+      assert.ok(c.url.startsWith('wss://'), `Expected wss:// in HTTPS page, got ${c.url}`);
+    }
+  } finally { delete globalThis.window; }
+});
+test('pairing bundle accepts https direct_url and normalizes to wss', async () => {
+  const parsed = await parsePairingBundle(link({ ...bundle, direct_url: 'https://viber.example.com/ws', ssl: true }));
+  assert.equal(parsed.directUrl, 'wss://viber.example.com/ws');
+  assert.equal(parsed.ssl, true);
+});

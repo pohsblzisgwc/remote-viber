@@ -5,10 +5,12 @@ import logging
 import os
 import signal
 import sys
+import socket
+from urllib.parse import urlsplit
 from core.config import HostConfig, HostLock, get_persistent_dir
 from core.agent_manager import AgentManager
 from core.monitor import SystemMonitor
-from network.direct_server import DirectServer
+from network.direct_server import DirectServer, get_or_create_tls_context
 from network.relay_client import RelayClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -16,10 +18,14 @@ logger = logging.getLogger("viber.main")
 
 
 def print_banner(config, monitor, show_pairing=False):
+    is_ssl = bool(getattr(config, "ssl_enabled", False) or getattr(config, "ssl_cert", None))
+    proto = "https" if is_ssl else "http"
     print("RemoteViber — protocol v2 (authenticated E2EE required)")
     print(f"Host ID: {config.host_id}")
     print(f"Identity SHA-256: {config.key_manager.get_fingerprint()}")
-    print(f"Local UI: http://127.0.0.1:{config.direct_port}/")
+    print(f"Local UI: {proto}://127.0.0.1:{config.direct_port}/")
+    if is_ssl:
+        print("[TLS/HTTPS] 原生安全传输模式已启用 (支持远程 WebCrypto 与 WSS 加密链路)")
     if config.migrated:
         print("Legacy identity/credentials rotated. All clients must be re-paired.")
     if show_pairing:
@@ -40,6 +46,12 @@ async def main_async():
     p.add_argument("--port", type=int)
     p.add_argument("--bind")
     p.add_argument("--allow-lan", action="store_true")
+    p.add_argument("--ssl", "--https", action="store_true", dest="ssl",
+                   help="Enable native HTTPS/WSS (auto-generates self-signed TLS cert if none provided)")
+    p.add_argument("--no-ssl", "--no-https", action="store_true", dest="no_ssl",
+                   help="Disable HTTPS/WSS and force plaintext HTTP/WS")
+    p.add_argument("--ssl-cert", help="Path to custom PEM SSL/TLS certificate file")
+    p.add_argument("--ssl-key", help="Path to custom PEM SSL/TLS private key file")
     p.add_argument("--relay", help="wss:// relay URL; ws:// permitted only on loopback")
     p.add_argument("--name")
     p.add_argument("--config-dir")
@@ -104,11 +116,39 @@ async def main_async():
         config.allowed_origins = args.origin
     if args.direct_url is not None:
         config.direct_url = args.direct_url
+    if args.ssl:
+        config.ssl_enabled = True
+    elif args.no_ssl:
+        config.ssl_enabled = False
+    if args.ssl_cert is not None:
+        config.ssl_cert = args.ssl_cert or None
+    if args.ssl_key is not None:
+        config.ssl_key = args.ssl_key or None
     config.save()
     monitor = SystemMonitor()
     print_banner(config, monitor, False)
     manager = AgentManager(config_path=os.path.join(config.config_dir, "viber_profiles.json"))
-    direct = DirectServer(config, manager, monitor)
+
+    ssl_context = None
+    if getattr(config, "ssl_enabled", False) or getattr(config, "ssl_cert", None):
+        san_hosts = ["localhost", "127.0.0.1", "::1"]
+        san_hosts.extend(monitor.discover_local_endpoints().get("tailscale", []))
+        if config.allow_lan:
+            san_hosts.extend(monitor.discover_local_endpoints().get("lan", []))
+        try:
+            san_hosts.append(socket.gethostname())
+        except Exception:
+            pass
+        if config.direct_url:
+            try:
+                u = urlsplit(config.direct_url)
+                if u.hostname:
+                    san_hosts.append(u.hostname)
+            except Exception:
+                pass
+        ssl_context = get_or_create_tls_context(config, san_hosts)
+
+    direct = DirectServer(config, manager, monitor, ssl_context=ssl_context)
     relay = RelayClient(config, manager, monitor)
     await direct.start()
     relay.start()

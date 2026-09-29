@@ -25,9 +25,10 @@ from core.crypto import (HostKeyManager, ServerHandshake, E2EESession, ProtocolE
                          MAX_CLIENT_FRAME_BYTES, MAX_RELAY_FRAME_BYTES)
 from core.config import HostConfig, read_private_json, write_private_json, is_safe_config_dir, HostLock
 from core.agent_manager import AgentManager
+import ssl
 from core.monitor import SystemMonitor
 from network.router import ClientConnectionState
-from network.direct_server import DirectServer, static_bytes, normalize_origin
+from network.direct_server import DirectServer, static_bytes, normalize_origin, get_or_create_tls_context
 from network.relay_client import RelayClient, validate_relay_url
 from secure_protocol import ProtocolError as RelayProtocolError
 from registry import HostRegistry
@@ -516,6 +517,37 @@ class DirectIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_forged_host_header_refused(self):
         text=await self.request('/api/pairing','attacker.tailscale.example'); self.assertIn('403',text.splitlines()[0])
         self.assertNotIn(self.config.pairing_secret,text)
+    async def test_direct_url_and_reverse_proxy_https_origin_accepted(self):
+        self.config.direct_url = 'https://viber.example.com'
+        self.server._refresh_origins()
+        reader, writer = await asyncio.open_connection('127.0.0.1', self.port)
+        req = (f'GET / HTTP/1.1\r\n'
+               f'Host: viber.example.com\r\n'
+               f'Origin: https://viber.example.com\r\n'
+               f'Connection: close\r\n\r\n').encode()
+        writer.write(req); await writer.drain()
+        raw = await reader.read()
+        writer.close(); await writer.wait_closed()
+        status = raw.decode().splitlines()[0]
+        self.assertNotIn('403', status)
+        self.assertIn('200', status)
+    async def test_tls_direct_server_roundtrip(self):
+        tls_ctx = get_or_create_tls_context(self.config, ['localhost', '127.0.0.1'])
+        tls_cfg = HostConfig(self.temp.name)
+        tls_cfg.direct_port = 0
+        tls_server = DirectServer(tls_cfg, Manager(), Monitor(), str(Path(self.temp.name) / 'missing'), ssl_context=tls_ctx)
+        await tls_server.start()
+        tls_port = tls_cfg.direct_port
+        client_ctx = ssl.create_default_context()
+        client_ctx.check_hostname = False
+        client_ctx.verify_mode = ssl.CERT_NONE
+        try:
+            async with connect(f'wss://127.0.0.1:{tls_port}/ws', ssl=client_ctx, origin=f'https://127.0.0.1:{tls_port}') as ws:
+                c = await self.pair(ws)
+                await ws.send(json.dumps(c.session.encrypt_json({'type': 'PING', 'ts': 99})))
+                self.assertEqual(c.session.decrypt_json(json.loads(await ws.recv())), {'type': 'PONG', 'ts': 99})
+        finally:
+            await tls_server.stop()
 
 class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

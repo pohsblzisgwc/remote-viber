@@ -73,13 +73,30 @@ export class ViberConnection {
   }
   _buildCandidateUrls() {
     const port = this.config.directPort || 8765;
+    const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
+    const useSsl = Boolean(this.config.ssl || this.config.useSsl || isHttps);
     const result = [], seen = new Set();
     const add = (value, mode) => {
       if (!value) return;
-      const u = new URL(value);
+      let normalized = value;
+      if (typeof normalized === 'string') {
+        if (normalized.startsWith('https://')) {
+          normalized = 'wss://' + normalized.slice(8);
+        } else if (normalized.startsWith('http://')) {
+          normalized = 'ws://' + normalized.slice(7);
+        }
+      }
+      const u = new URL(normalized);
       if (!['ws:', 'wss:'].includes(u.protocol) || u.username || u.password || u.hash) throw new Error('Invalid endpoint URL');
       if (mode === 'relay' && u.protocol !== 'wss:' && !['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname)) {
         throw new Error('Remote relay requires wss://');
+      }
+      // Under an HTTPS page, browser blocks unencrypted remote ws:// connections as Mixed Content.
+      if (isHttps && u.protocol === 'ws:' && !['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname)) {
+        const wssUrl = new URL(u.href);
+        wssUrl.protocol = 'wss:';
+        if (!seen.has(wssUrl.href)) { seen.add(wssUrl.href); result.push({ url: wssUrl.href, mode }); }
+        return;
       }
       if (!seen.has(u.href)) { seen.add(u.href); result.push({ url: u.href, mode }); }
     };
@@ -90,7 +107,12 @@ export class ViberConnection {
     const addHost = (host, mode) => {
       if (typeof host !== 'string' || !host || /[\s/?#@%]/.test(host)) throw new Error('Invalid host address');
       const formatted = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
-      add(`ws://${formatted}:${port}/ws`, mode);
+      if (useSsl) {
+        add(`wss://${formatted}:${port}/ws`, mode);
+      } else {
+        add(`ws://${formatted}:${port}/ws`, mode);
+        add(`wss://${formatted}:${port}/ws`, mode);
+      }
     };
     for (const ip of this.config.tailscaleIps || []) addHost(ip, 'tailscale');
     for (const ip of this.config.lanIps || []) addHost(ip, ['localhost', '127.0.0.1', '::1'].includes(ip) ? 'localhost' : 'lan');

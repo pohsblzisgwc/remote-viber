@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <netdb.h>
 
 #define DEFAULT_HOST "127.0.0.1"
 #define DEFAULT_PORT 8765
@@ -51,22 +52,33 @@ typedef struct {
 
 static AppState app_state;
 
-/* Check if TCP socket connects non-blockingly */
-static gboolean is_port_open(const char *ip, int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return FALSE;
+/* Check if TCP socket connects non-blockingly (supports IPv4, IPv6, hostnames) */
+static gboolean is_port_open(const char *host, int port) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) {
+        return FALSE;
+    }
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        return FALSE;
+    }
 
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &addr.sin_addr);
+    int r = connect(sock, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
 
-    int res = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-    if (res == 0) {
+    if (r == 0) {
         close(sock);
         return TRUE;
     }
@@ -94,7 +106,7 @@ static gboolean check_host_ready_cb(gpointer user_data) {
     AppState *state = (AppState *)user_data;
 
     if (is_port_open(state->host, state->port)) {
-        g_print("[RemoteViber] 服务端已连接 (http://%s:%d/)，正在加载工作台...\n", state->host, state->port);
+        g_print("[RemoteViber] 服务端已连接 (%s)，正在加载工作台...\n", state->target_url);
         gtk_label_set_markup(GTK_LABEL(state->spinner_label),
             "<span size='medium' weight='bold' foreground='#38bdf8'>已连接服务端！</span>\n\n"
             "<span size='small' foreground='#94a3b8'>正在载入终端拼图网格工作台...</span>");
@@ -113,11 +125,11 @@ static gboolean check_host_ready_cb(gpointer user_data) {
     /* Server not reachable yet: update waiting screen */
     char wait_msg[1024];
     snprintf(wait_msg, sizeof(wait_msg),
-        "<span size='medium' weight='bold' foreground='#38bdf8'>正在等待连接服务端 (http://%s:%d/)...</span>\n\n"
+        "<span size='medium' weight='bold' foreground='#38bdf8'>正在等待连接服务端 (%s)...</span>\n\n"
         "<span size='small' foreground='#94a3b8'>客户端与服务端已独立脱离，请在终端独立启动服务端：</span>\n\n"
         "<span font_family='monospace' size='medium' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
         "<span size='small' foreground='#64748b'>服务端启动后客户端将毫秒级自动感应并呈现拼图终端</span>",
-        state->host, state->port, state->port);
+        state->target_url, state->port);
     gtk_label_set_markup(GTK_LABEL(state->spinner_label), wait_msg);
 
     char badge_str[128];
@@ -197,6 +209,35 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
     }
 
     return TRUE; /* Handled */
+}
+
+/* WebKit load-failed-with-tls-errors handler: allow self-signed TLS certificates for LAN/remote viber host */
+static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *failing_uri,
+                                               GTlsCertificate *certificate, GTlsCertificateFlags errors,
+                                               gpointer user_data) {
+    (void)errors;
+    AppState *state = (AppState *)user_data;
+    g_print("[RemoteViber] 允许自签名或局域网 TLS 证书: %s\n", failing_uri ? failing_uri : "unknown");
+
+    char host[256] = {0};
+    if (failing_uri) {
+        GUri *parsed = g_uri_parse(failing_uri, G_URI_FLAGS_NONE, NULL);
+        if (parsed) {
+            const char *h = g_uri_get_host(parsed);
+            if (h) strncpy(host, h, sizeof(host) - 1);
+            g_uri_unref(parsed);
+        }
+    }
+    if (host[0] == '\0') {
+        strncpy(host, state->host, sizeof(host) - 1);
+    }
+
+    WebKitWebContext *context = webkit_web_view_get_context(web_view);
+    if (context && certificate) {
+        webkit_web_context_allow_tls_certificate_for_host(context, certificate, host);
+    }
+    webkit_web_view_reload(web_view);
+    return TRUE;
 }
 
 /* WebKit WebProcess crash handler */
@@ -569,7 +610,25 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (app_state.target_url[0] == '\0') {
+    if (app_state.target_url[0] != '\0') {
+        GUri *u = g_uri_parse(app_state.target_url, G_URI_FLAGS_NONE, NULL);
+        if (u) {
+            const char *h = g_uri_get_host(u);
+            int p = g_uri_get_port(u);
+            const char *scheme = g_uri_get_scheme(u);
+            if (h && h[0] != '\0') {
+                strncpy(app_state.host, h, sizeof(app_state.host) - 1);
+            }
+            if (p > 0) {
+                app_state.port = p;
+            } else if (scheme && strcmp(scheme, "https") == 0) {
+                app_state.port = 443;
+            } else if (scheme && strcmp(scheme, "http") == 0) {
+                app_state.port = 80;
+            }
+            g_uri_unref(u);
+        }
+    } else {
         snprintf(app_state.target_url, sizeof(app_state.target_url), "http://%s:%d/", app_state.host, app_state.port);
     }
 
@@ -756,9 +815,16 @@ int main(int argc, char *argv[]) {
 
     app_state.inspector = webkit_web_view_get_inspector(WEBKIT_WEB_VIEW(app_state.web_view));
 
+    /* Trust self-signed certificates for LAN/remote viber nodes seamlessly */
+    WebKitWebsiteDataManager *manager = webkit_web_view_get_website_data_manager(WEBKIT_WEB_VIEW(app_state.web_view));
+    if (manager) {
+        webkit_website_data_manager_set_tls_errors_policy(manager, WEBKIT_TLS_ERRORS_POLICY_IGNORE);
+    }
+
     /* Connect WebKit events to safely transition and recover from errors */
     g_signal_connect(app_state.web_view, "load-changed", G_CALLBACK(on_load_changed), &app_state);
     g_signal_connect(app_state.web_view, "load-failed", G_CALLBACK(on_load_failed), &app_state);
+    g_signal_connect(app_state.web_view, "load-failed-with-tls-errors", G_CALLBACK(on_load_failed_with_tls_errors), &app_state);
     g_signal_connect(app_state.web_view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), &app_state);
 
     gtk_stack_add_named(GTK_STACK(app_state.stack), app_state.web_view, "webview");
