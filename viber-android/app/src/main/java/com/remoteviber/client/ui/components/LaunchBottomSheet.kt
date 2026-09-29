@@ -170,37 +170,31 @@ fun LaunchBottomSheet(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                OutlinedTextField(
-                    value = nameInput,
-                    onValueChange = { nameInput = it },
-                    label = { Text("会话 / 预设名称", fontSize = 11.sp) },
-                    placeholder = { Text("例如: Docker Agent", fontSize = 11.sp, color = TextMuted) },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = ViberCyan,
-                        unfocusedBorderColor = ViberBorder,
-                        focusedLabelColor = ViberCyan,
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White
-                    ),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.weight(1f)
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = "会话 / 预设名称", color = TextSecondary, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    ViberTextField(
+                        value = nameInput,
+                        onValueChange = { nameInput = it },
+                        placeholder = "例如: Docker Agent",
+                        singleLine = true,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
 
-                OutlinedTextField(
-                    value = folderInput,
-                    onValueChange = { folderInput = it },
-                    label = { Text("所属项目", fontSize = 11.sp) },
-                    placeholder = { Text("例如: main-app", fontSize = 11.sp, color = TextMuted) },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = ViberCyan,
-                        unfocusedBorderColor = ViberBorder,
-                        focusedLabelColor = ViberCyan,
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White
-                    ),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.weight(1f)
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = "所属项目", color = TextSecondary, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    ViberTextField(
+                        value = folderInput,
+                        onValueChange = { folderInput = it },
+                        placeholder = "例如: main-app",
+                        singleLine = true,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -235,28 +229,19 @@ fun LaunchBottomSheet(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
-                OutlinedTextField(
+                ViberTextField(
                     value = commandInput,
                     onValueChange = { commandInput = it },
+                    singleLine = false,
                     minLines = 3,
                     maxLines = 6,
-                    placeholder = {
-                        Text(
-                            text = "# 支持多行与链式指令，例如:\ncd /workspace\ndocker run -it --rm -v $(pwd):/app ubuntu bash",
-                            fontSize = 11.sp,
-                            color = TextMuted,
-                            fontFamily = FontFamily.Monospace
-                        )
-                    },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedContainerColor = Color(0xFF070B14),
-                        unfocusedContainerColor = Color(0xFF070B14),
-                        focusedBorderColor = ViberCyan,
-                        unfocusedBorderColor = ViberBorder,
-                        focusedTextColor = ViberCyan,
-                        unfocusedTextColor = ViberCyan
+                    placeholder = "# 支持多行与链式指令，例如:\ncd /workspace\ndocker run -it --rm -v $(pwd):/app ubuntu bash",
+                    textStyle = androidx.compose.ui.text.TextStyle(
+                        color = ViberCyan,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace
                     ),
-                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                     modifier = Modifier.fillMaxWidth()
                 )
 
@@ -290,21 +275,18 @@ fun LaunchBottomSheet(
             Spacer(modifier = Modifier.height(10.dp))
 
             // CWD Input
-            OutlinedTextField(
-                value = cwdInput,
-                onValueChange = { cwdInput = it },
-                label = { Text("目标工作目录 (CWD)", fontSize = 11.sp) },
-                placeholder = { Text("/workspace", fontSize = 11.sp, color = TextMuted) },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = ViberCyan,
-                    unfocusedBorderColor = ViberBorder,
-                    focusedLabelColor = ViberCyan,
-                    focusedTextColor = Color.White,
-                    unfocusedTextColor = Color.White
-                ),
-                shape = RoundedCornerShape(8.dp),
-                modifier = Modifier.fillMaxWidth()
-            )
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(text = "目标工作目录 (CWD)", color = TextSecondary, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                Spacer(modifier = Modifier.height(4.dp))
+                ViberTextField(
+                    value = cwdInput,
+                    onValueChange = { cwdInput = it },
+                    placeholder = "/workspace",
+                    singleLine = true,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
 
             Spacer(modifier = Modifier.height(16.dp))
 

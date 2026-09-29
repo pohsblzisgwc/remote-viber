@@ -139,6 +139,51 @@ class AndroidConnectionTest {
         assertNotNull(hello["client_pub"])
         assertNotNull(hello["client_nonce"])
     }
+
+    @Test
+    fun testMobileSessionIdentificationAndProtection() {
+        val client = ViberWebSocketClient(TerminalBuffer(100))
+        val desktopSess = com.remoteviber.client.model.AgentSession(
+            sessionId = "pc-sess-1",
+            name = "开发终端",
+            profileId = null,
+            folder = "",
+            sessionType = "terminal",
+            command = "bash",
+            cwd = "/home/dev",
+            pid = 1234,
+            status = "running",
+            uptimeSeconds = 100L,
+            currentSeq = 50L
+        )
+        val mobileSess = com.remoteviber.client.model.AgentSession(
+            sessionId = "mob-sess-2",
+            name = "📱 手机终端",
+            profileId = null,
+            folder = "",
+            sessionType = "terminal",
+            command = "bash",
+            cwd = "/workspace",
+            pid = 5678,
+            status = "running",
+            uptimeSeconds = 20L,
+            currentSeq = 10L
+        )
+
+        // Inject sessions via reflection or STATS
+        val sessionsField = ViberWebSocketClient::class.java.getDeclaredField("_sessions")
+        sessionsField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val sessionsFlow = sessionsField.get(client) as kotlinx.coroutines.flow.MutableStateFlow<List<com.remoteviber.client.model.AgentSession>>
+        sessionsFlow.value = listOf(desktopSess, mobileSess)
+
+        assertFalse("Desktop terminal must NOT be flagged as mobile session", client.isMobileSession("pc-sess-1"))
+        assertTrue("Mobile terminal with phone icon must be flagged as mobile session", client.isMobileSession("mob-sess-2"))
+
+        // Registered in mobileSessionIds directly
+        client.mobileSessionIds.add("custom-mob-3")
+        assertTrue("Registered mobile ID must be flagged as mobile session", client.isMobileSession("custom-mob-3"))
+    }
 }
 
 class DummyContext : android.content.ContextWrapper(null) {

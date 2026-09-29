@@ -102,6 +102,14 @@ class ViberWebSocketClient(
             attachSession(sessId, 0L, true)
         }
     }
+    val mobileSessionIds: MutableSet<String> = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    fun isMobileSession(sessionId: String?): Boolean {
+        if (sessionId == null) return false
+        if (mobileSessionIds.contains(sessionId)) return true
+        val sess = _sessions.value.find { it.sessionId == sessionId }
+        return sess != null && (sess.name.contains("📱") || sess.name.contains("手机") || sess.name.contains("Mobile"))
+    }
 
     private var lastReceivedSeq = 0L
     private var candidateIndex = 0
@@ -351,10 +359,12 @@ class ViberWebSocketClient(
                     }
                     _sessions.value = list
                     if (_activeSessionId.value == null && list.isNotEmpty()) {
-                        attachSession(list.first().sessionId, 0L)
+                        val target = list.find { isMobileSession(it.sessionId) } ?: list.first()
+                        attachSession(target.sessionId, 0L)
                     } else if (_activeSessionId.value != null && list.none { it.sessionId == _activeSessionId.value }) {
                         if (list.isNotEmpty()) {
-                            attachSession(list.first().sessionId, 0L)
+                            val target = list.find { isMobileSession(it.sessionId) } ?: list.first()
+                            attachSession(target.sessionId, 0L)
                         } else {
                             _activeSessionId.value = null
                             terminalBuffer.clear()
@@ -419,6 +429,7 @@ class ViberWebSocketClient(
                     val newSess = AgentSession.fromJsonObject(sessJson)
                     val curr = _sessions.value.filter { it.sessionId != newSess.sessionId }
                     _sessions.value = curr + newSess
+                    mobileSessionIds.add(newSess.sessionId)
                     _activeSessionId.value = newSess.sessionId
                     attachSession(newSess.sessionId, 0L)
                 }
@@ -561,11 +572,14 @@ class ViberWebSocketClient(
         send(obj)
     }
 
-    fun launchTerminal(cwd: String = "/workspace", folder: String = "") {
+    fun launchTerminal(name: String = "📱 手机终端", cwd: String = "/workspace", folder: String = "") {
         val obj = JSONObject().apply {
             put("type", "LAUNCH_TERMINAL")
+            put("name", name)
             put("cwd", cwd)
             put("folder", folder)
+            put("rows", 24)
+            put("cols", 80)
         }
         send(obj)
     }
@@ -614,11 +628,23 @@ class ViberWebSocketClient(
 
     fun resizeTerminal(rows: Int, cols: Int) {
         val sessId = _activeSessionId.value ?: return
+        // CRITICAL PROTECTION: Shield desktop sessions from mobile PTY resize!
+        // A mobile portrait screen has few columns (~38-45).
+        // If mobile sends RESIZE_TERMINAL to a desktop session, Linux ioctl(TIOCSWINSZ)
+        // shrinks the desktop terminal down to phone width, breaking desktop layouts and CLI apps.
+        if (!isMobileSession(sessId)) {
+            Log.d(TAG, "Shielding desktop session $sessId from mobile pty resize (${rows}x${cols})")
+            return
+        }
+
+        // For mobile sessions, enforce standard minimum columns (at least 80)
+        val safeCols = maxOf(80, cols)
+        val safeRows = maxOf(24, rows)
         val obj = JSONObject().apply {
             put("type", "RESIZE_TERMINAL")
             put("session_id", sessId)
-            put("rows", rows)
-            put("cols", cols)
+            put("rows", safeRows)
+            put("cols", safeCols)
         }
         send(obj)
     }

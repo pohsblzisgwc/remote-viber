@@ -86,25 +86,24 @@ fun HostManagerDialog(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    OutlinedTextField(
+                    ViberTextField(
                         value = importInput,
                         onValueChange = {
                             importInput = it
                             importError = false
                         },
-                        placeholder = { Text("粘贴配对码 (eyJ...) 或配对链接 (viber://connect?data=...)", fontSize = 10.sp, color = TextMuted) },
+                        placeholder = "粘贴配对码 (eyJ...) 或配对链接...",
                         singleLine = true,
                         isError = importError,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = ViberCyan,
-                            unfocusedBorderColor = ViberBorder,
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                        textStyle = androidx.compose.ui.text.TextStyle(
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Default
                         ),
-                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                         modifier = Modifier
                             .weight(1f)
-                            .height(44.dp)
+                            .defaultMinSize(minHeight = 42.dp)
                     )
 
                     Spacer(modifier = Modifier.width(6.dp))
@@ -125,7 +124,7 @@ fun HostManagerDialog(
                         shape = RoundedCornerShape(8.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = ViberCyan),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                        modifier = Modifier.height(44.dp)
+                        modifier = Modifier.height(42.dp)
                     ) {
                         Text(text = "导入", color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     }
