@@ -34,6 +34,8 @@ fun ViberMainApp(
     val activeSessionId by wsClient.activeSessionId.collectAsState()
     val isHistoryTruncated by wsClient.isHistoryTruncated.collectAsState()
     val syncFullHistory by wsClient.syncFullHistory.collectAsState()
+    val lastError by wsClient.lastError.collectAsState()
+    val currentEndpoint by wsClient.currentEndpoint.collectAsState()
 
     var activeView by remember { mutableStateOf("dashboard") }
     var isLaunchSheetOpen by remember { mutableStateOf(false) }
@@ -56,6 +58,7 @@ fun ViberMainApp(
                 pingMs = pingMs,
                 activeView = activeView,
                 activeSessionsCount = sessions.count { it.status != "stopped" },
+                lastError = lastError,
                 onViewChange = { activeView = it },
                 onQuickTerminal = {
                     wsClient.launchTerminal()
@@ -164,6 +167,8 @@ fun ViberMainApp(
         HostManagerDialog(
             hosts = hosts,
             activeHost = activeHost,
+            currentEndpoint = currentEndpoint,
+            lastError = lastError,
             onSelectHost = { id -> hostManager.setActiveHost(id) },
             onSaveHost = { h -> hostManager.saveHost(h) },
             onDeleteHost = { id -> hostManager.deleteHost(id) },

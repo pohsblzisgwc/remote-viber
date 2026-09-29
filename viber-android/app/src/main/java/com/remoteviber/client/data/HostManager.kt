@@ -101,6 +101,30 @@ class HostManager(private val context: Context) {
     fun setActiveHost(id: String) {
         if (_hosts.value.any { it.id == id }) persist(_hosts.value, id)
     }
+    fun updateHost(
+        id: String,
+        name: String? = null,
+        directUrl: String? = null,
+        port: Int? = null,
+        ssl: Boolean? = null
+    ): HostProfile? {
+        val current = _hosts.value.find { it.id == id } ?: return null
+        val updated = current.copy(
+            name = (name ?: current.name).take(128),
+            directUrl = (directUrl ?: current.directUrl).trim(),
+            port = port ?: current.port,
+            ssl = ssl ?: current.ssl
+        )
+        saveHost(updated)
+        return updated
+    }
+    fun isDirectAddress(input: String): Boolean {
+        val trimmed = input.trim().trim('"', '\'')
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://") ||
+            trimmed.startsWith("ws://") || trimmed.startsWith("wss://")) return true
+        val hostRegex = Regex("""^([a-zA-Z0-9.-]+)(:\d{1,5})?$""")
+        return hostRegex.matches(trimmed) && !trimmed.contains("=") && trimmed.length < 256
+    }
     fun savePairing(candidate: PairingCandidate): HostProfile {
         val profile = candidate.profile
         require(profile.id == ProtocolV2.hostId(candidate.hostPub))

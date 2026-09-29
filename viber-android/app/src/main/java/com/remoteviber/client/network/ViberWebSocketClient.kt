@@ -41,7 +41,7 @@ class ViberWebSocketClient(
         OkHttpClient.Builder()
             .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
             .hostnameVerifier { _, _ -> true }
-            .connectTimeout(5, TimeUnit.SECONDS)
+            .connectTimeout(3, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .pingInterval(0, TimeUnit.MILLISECONDS) // We handle custom PING frames
             .build()
@@ -65,6 +65,14 @@ class ViberWebSocketClient(
 
     private val _mode = MutableStateFlow(ConnectionMode.UNKNOWN)
     val mode: StateFlow<ConnectionMode> = _mode.asStateFlow()
+
+    private val _lastError = MutableStateFlow<String?>(null)
+    val lastError: StateFlow<String?> = _lastError.asStateFlow()
+
+    private val _currentEndpoint = MutableStateFlow<String?>(null)
+    val currentEndpoint: StateFlow<String?> = _currentEndpoint.asStateFlow()
+
+    private var preferredEndpoint: String? = null
 
     private val _pingMs = MutableStateFlow(0L)
     val pingMs: StateFlow<Long> = _pingMs.asStateFlow()
@@ -127,26 +135,35 @@ class ViberWebSocketClient(
             }
         }
 
+        // 1. Previous successful endpoint gets top priority
+        preferredEndpoint?.let { pref ->
+            if (pref.isNotBlank()) add(pref, ConnectionMode.UNKNOWN)
+        }
+
+        // 2. Explicit direct URL
         val direct = host.directUrl.ifBlank { com.remoteviber.client.data.HostManager.directUrl(host.id).orEmpty() }
         if (direct.isNotBlank() && direct != "null") {
-            var directWs = direct
+            var directWs = direct.trim()
             if (directWs.startsWith("https://")) {
                 directWs = "wss://" + directWs.removePrefix("https://")
             } else if (directWs.startsWith("http://")) {
                 directWs = "ws://" + directWs.removePrefix("http://")
+            } else if (!directWs.startsWith("ws://") && !directWs.startsWith("wss://")) {
+                val proto = if (host.ssl) "wss://" else "ws://"
+                directWs = if (directWs.contains(':')) "$proto$directWs" else "$proto$directWs:${host.port}"
             }
             try {
                 val uri = URI(directWs)
                 if (uri.path.isNullOrEmpty() || uri.path == "/") {
                     val portPart = if (uri.port > 0) ":${uri.port}" else ""
-                    val hostPart = if (uri.host.contains(':') && !uri.host.startsWith('[')) "[${uri.host}]" else uri.host
+                    val hostPart = if (uri.host != null && uri.host.contains(':') && !uri.host.startsWith('[')) "[${uri.host}]" else (uri.host ?: "")
                     directWs = "${uri.scheme}://$hostPart$portPart/ws"
                 }
             } catch (_: Exception) {}
             add(directWs, ConnectionMode.UNKNOWN)
         }
 
-        val useSsl = host.ssl || direct.startsWith("wss://") || direct.startsWith("https://")
+        val useSsl = host.ssl
 
         val addHost = { ip: String, mode: ConnectionMode ->
             if (ip.isNotBlank() && !ip.contains(Regex("[\\s/?#@%]"))) {
@@ -198,6 +215,7 @@ class ViberWebSocketClient(
         val changed = activeHost?.id != host.id
         disconnect()
         synchronized(securityLock) {
+            if (changed) preferredEndpoint = null
             activeHost = host
             _activeSessionId.value = null
             lastReceivedSeq = 0L
@@ -218,16 +236,33 @@ class ViberWebSocketClient(
                 secureSession = crypto
                 val generation = ++connectionGeneration
                 val candidates = getCandidateEndpoints(host)
+                if (candidates.isEmpty()) {
+                    _status.value = ConnectionStatus.ERROR
+                    _lastError.value = "没有可用的连接端点，请在主机管理中配置"
+                    return
+                }
                 val target = candidates[candidateIndex % candidates.size]
+                _currentEndpoint.value = target.url
                 _mode.value = target.mode
                 Log.d(TAG, "Attempting connection to ${target.url} [${target.mode}] (candidate $candidateIndex/${candidates.size})")
-                val request = Request.Builder().url(target.url).build()
-                webSocket = okHttpClient.newWebSocket(request, createWebSocketListener(generation, crypto))
+                val requestBuilder = Request.Builder().url(target.url)
+                try {
+                    val uri = URI(target.url)
+                    if (uri.host == "10.0.2.2") {
+                        requestBuilder.header("Host", "127.0.0.1:${host.port}")
+                    } else if (!uri.host.isNullOrBlank()) {
+                        val portPart = if (uri.port > 0 && uri.port != 80 && uri.port != 443) ":${uri.port}" else ""
+                        requestBuilder.header("Host", "${uri.host}$portPart")
+                    }
+                } catch (_: Exception) {}
+                val request = requestBuilder.build()
+                webSocket = okHttpClient.newWebSocket(request, createWebSocketListener(generation, crypto, target))
             } catch (e: Exception) {
                 if (e.message == "Re-pair required") {
                     shouldReconnect = false
                     secureSession?.close(); secureSession = null
                     _status.value = ConnectionStatus.ERROR
+                    _lastError.value = "主机安全身份校验失效，需重新配对"
                     Log.e(TAG, "Secure connection configuration is invalid; re-pair required", e)
                 } else {
                     Log.w(TAG, "Connection initiation failed for current candidate, trying next", e)
@@ -237,13 +272,14 @@ class ViberWebSocketClient(
         }
     }
 
-    private fun createWebSocketListener(generation: Long, crypto: ProtocolV2): WebSocketListener {
+    private fun createWebSocketListener(generation: Long, crypto: ProtocolV2, target: CandidateEndpoint): WebSocketListener {
         return object : WebSocketListener() {
             private fun current() = generation == connectionGeneration && secureSession === crypto
             private fun reject(ws: WebSocket) {
                 if (!current()) return
                 shouldReconnect = false
                 _status.value = ConnectionStatus.ERROR
+                _lastError.value = "安全协议认证被拒绝 (身份公钥或配对口令不符)"
                 handshakeJob?.cancel(); stopHeartbeat()
                 crypto.close(); secureSession = null
                 ws.close(1008, "Authentication or protocol failure")
@@ -287,6 +323,8 @@ class ViberWebSocketClient(
                             require(message.optString("type") == "WELCOME" && message.opt("v") == 2 &&
                                 message.opt("e2ee") == true && message.optString("status") == "authenticated")
                             crypto.acceptWelcome(); handshakeJob?.cancel()
+                            preferredEndpoint = target.url
+                            _lastError.value = null
                         } else {
                             require(message.optString("type") !in setOf("HELLO", "AUTH", "CHALLENGE", "WELCOME"))
                         }
@@ -308,11 +346,25 @@ class ViberWebSocketClient(
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 synchronized(securityLock) {
                     if (!current()) return
-                    if (code == 1008) { shouldReconnect = false; _status.value = ConnectionStatus.ERROR }
+                    if (code == 1008) {
+                        shouldReconnect = false
+                        _status.value = ConnectionStatus.ERROR
+                        _lastError.value = "服务器主动关闭连接 (Code 1008 协议或认证错误)"
+                    }
                     handleDisconnect()
                 }
             }
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                val errMsg = when {
+                    response?.code == 403 -> "HTTP 403: 主机拒绝该来源或未开启 --allow-lan"
+                    response?.code == 404 -> "HTTP 404: 未找到 WebSocket 路径 (/ws)"
+                    response?.code == 503 -> "HTTP 503: 主机连接数已达上限"
+                    t is java.net.ConnectException -> "连接被拒绝 (端口未开放或 Host 未运行)"
+                    t is java.net.SocketTimeoutException -> "连接超时 (网络不可达)"
+                    t is javax.net.ssl.SSLException -> "TLS 握手失败 (请确认主机 SSL 配置)"
+                    else -> t.message ?: "连接失败"
+                }
+                _lastError.value = "[${target.url}] $errMsg"
                 Log.w(TAG, "WebSocket connection failed: ${t.message} (response: $response)")
                 synchronized(securityLock) { if (current()) handleDisconnect() }
             }
@@ -456,15 +508,33 @@ class ViberWebSocketClient(
         webSocket = null
         if (_status.value == ConnectionStatus.ERROR) return
         if (!shouldReconnect) { _status.value = ConnectionStatus.DISCONNECTED; return }
-        candidateIndex++
-        _status.value = ConnectionStatus.RECONNECTING
-        scheduleReconnect()
+
+        val host = activeHost ?: return
+        val candidates = getCandidateEndpoints(host)
+        val nextIndex = candidateIndex + 1
+        if (nextIndex < candidates.size) {
+            // Immediate fast failover to next candidate in the pool without delay
+            candidateIndex = nextIndex
+            val generation = connectionGeneration
+            scope.launch {
+                synchronized(securityLock) {
+                    if (shouldReconnect && activeHost?.id == host.id && connectionGeneration == generation && _status.value != ConnectionStatus.CONNECTED) {
+                        attemptConnection(host, generation)
+                    }
+                }
+            }
+        } else {
+            // Completed a full candidate sweep; pause briefly before next round
+            candidateIndex = 0
+            _status.value = ConnectionStatus.RECONNECTING
+            scheduleReconnect()
+        }
     }
     private fun scheduleReconnect() {
         reconnectJob?.cancel()
         val generation = connectionGeneration
         reconnectJob = scope.launch {
-            delay(1500)
+            delay(2000)
             synchronized(securityLock) {
                 val host = activeHost
                 if (host != null && shouldReconnect && connectionGeneration == generation && _status.value != ConnectionStatus.CONNECTED) {
@@ -504,6 +574,7 @@ class ViberWebSocketClient(
             secureSession?.close(); secureSession = null
             previous?.close(1000, "User disconnected")
             _status.value = ConnectionStatus.DISCONNECTED
+            _currentEndpoint.value = null
         }
     }
 

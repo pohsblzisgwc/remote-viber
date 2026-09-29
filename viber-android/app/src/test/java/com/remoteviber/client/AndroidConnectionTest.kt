@@ -184,6 +184,63 @@ class AndroidConnectionTest {
         client.mobileSessionIds.add("custom-mob-3")
         assertTrue("Registered mobile ID must be flagged as mobile session", client.isMobileSession("custom-mob-3"))
     }
+
+    @Test
+    fun testPreferredEndpointPrioritization() {
+        val profile = HostProfile(
+            id = "host-test",
+            name = "Dev Server",
+            port = 8765,
+            token = "T".repeat(32),
+            tailscaleIps = listOf("100.1.2.3"),
+            lanIps = listOf("192.168.1.50", "127.0.0.1"),
+            ssl = false,
+            directUrl = "https://viber.example.com"
+        )
+        val client = ViberWebSocketClient(TerminalBuffer(100))
+        val prefField = ViberWebSocketClient::class.java.getDeclaredField("preferredEndpoint")
+        prefField.isAccessible = true
+        prefField.set(client, "ws://192.168.1.50:8765/ws")
+
+        val method = ViberWebSocketClient::class.java.getDeclaredMethod("getCandidateEndpoints", HostProfile::class.java)
+        method.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val candidates = method.invoke(client, profile) as List<ViberWebSocketClient.CandidateEndpoint>
+
+        assertEquals("Preferred endpoint must be at index 0", "ws://192.168.1.50:8765/ws", candidates[0].url)
+    }
+
+    @Test
+    fun testRawIpAndHostDirectUrlNormalization() {
+        val profile = HostProfile(
+            id = "host-test",
+            name = "Dev Server",
+            port = 9000,
+            token = "T".repeat(32),
+            lanIps = listOf("127.0.0.1"),
+            ssl = false,
+            directUrl = "192.168.31.25"
+        )
+        val client = ViberWebSocketClient(TerminalBuffer(100))
+        val method = ViberWebSocketClient::class.java.getDeclaredMethod("getCandidateEndpoints", HostProfile::class.java)
+        method.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val candidates = method.invoke(client, profile) as List<ViberWebSocketClient.CandidateEndpoint>
+
+        assertTrue("Raw IP directUrl must be formatted as ws://192.168.31.25:9000/ws",
+            candidates.any { it.url == "ws://192.168.31.25:9000/ws" })
+    }
+
+    @Test
+    fun testIsDirectAddressRecognition() {
+        val hm = HostManager(DummyContext())
+        assertTrue(hm.isDirectAddress("192.168.1.100"))
+        assertTrue(hm.isDirectAddress("192.168.1.100:8765"))
+        assertTrue(hm.isDirectAddress("http://192.168.1.100:8765"))
+        assertTrue(hm.isDirectAddress("https://viber.example.com"))
+        assertTrue(hm.isDirectAddress("myhost.local:8765"))
+        assertFalse(hm.isDirectAddress("eyJ2IjoyLCJpZCI6Imhvc3QtMTIzIn0="))
+    }
 }
 
 class DummyContext : android.content.ContextWrapper(null) {
