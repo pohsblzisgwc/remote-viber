@@ -18,6 +18,7 @@ import {
   Sparkles,
   ArrowRightLeft,
 } from 'lucide-react';
+import SafePasteModal from './SafePasteModal';
 
 function stringToBase64(str) {
   const bytes = new TextEncoder().encode(str);
@@ -63,6 +64,21 @@ export default function MosaicTerminalTile({
   const [isInitialReady, setIsInitialReady] = useState(false);
   const [linesScrolledUp, setLinesScrolledUp] = useState(0);
   const [isHistoryTruncated, setIsHistoryTruncated] = useState(false);
+  const [pasteModal, setPasteModal] = useState(null);
+
+  const handleConfirmSafePaste = () => {
+    if (!pasteModal || !connection || !session) return;
+    const bracketed = `\x1b[200~${pasteModal.text}\x1b[201~`;
+    connection.sendInput(session.session_id, stringToBase64(bracketed));
+    setPasteModal(null);
+  };
+
+  const handleConfirmSingleLinePaste = () => {
+    if (!pasteModal || !connection || !session) return;
+    const singleLine = pasteModal.text.replace(/[\r\n]+/g, '; ');
+    connection.sendInput(session.session_id, stringToBase64(singleLine));
+    setPasteModal(null);
+  };
 
   const [preventAltScreen, setPreventAltScreen] = useState(() => {
     try {
@@ -249,6 +265,43 @@ export default function MosaicTerminalTile({
       }
     });
 
+    // Intercept DOM paste events to prevent newlines from auto-executing commands
+    const handlePaste = (e) => {
+      if (!connection || !session) return;
+      const clipboardText = e.clipboardData?.getData('text/plain') || '';
+      if (!clipboardText) return;
+
+      if (/[\r\n]/.test(clipboardText)) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        // 1. Strip trailing newlines (so a single line command never auto-executes)
+        const trimmed = clipboardText.replace(/[\r\n]+$/, '');
+
+        // If after stripping trailing newlines there are no remaining newlines:
+        if (!/[\r\n]/.test(trimmed)) {
+          connection.sendInput(session.session_id, stringToBase64(trimmed));
+          return;
+        }
+
+        // 2. Multi-line paste: if terminal has bracketed paste mode active, wrap and send safely
+        if (term.modes?.bracketedPasteMode) {
+          const bracketed = `\x1b[200~${trimmed}\x1b[201~`;
+          connection.sendInput(session.session_id, stringToBase64(bracketed));
+          return;
+        }
+
+        // 3. Otherwise show confirmation modal to prevent accidental execution
+        setPasteModal({
+          text: trimmed,
+          linesCount: trimmed.split(/\r?\n/).length,
+        });
+      }
+    };
+
+    const containerEl = containerRef.current;
+    containerEl?.addEventListener('paste', handlePaste, true);
+
     const handleFit = () => {
       try {
         fitAddon.fit();
@@ -335,6 +388,7 @@ export default function MosaicTerminalTile({
     connection.attachSession(session.session_id, 0, syncFullHistoryRef.current);
 
     return () => {
+      containerEl?.removeEventListener('paste', handlePaste, true);
       if (scrollRafId) cancelAnimationFrame(scrollRafId);
       scrollDisposable?.dispose?.();
       clearTimeout(replayTimer);
@@ -615,6 +669,14 @@ export default function MosaicTerminalTile({
           )}
         </div>
       )}
+
+      {/* Safe Paste Multi-line Confirmation Modal */}
+      <SafePasteModal
+        data={pasteModal}
+        onConfirmSafe={handleConfirmSafePaste}
+        onConfirmSingleLine={handleConfirmSingleLinePaste}
+        onCancel={() => setPasteModal(null)}
+      />
     </div>
   );
 }

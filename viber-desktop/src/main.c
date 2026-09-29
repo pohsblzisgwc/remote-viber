@@ -48,6 +48,8 @@ typedef struct {
     gboolean is_fullscreen;
     gboolean page_loaded;
     gboolean is_loading;
+    gboolean explicit_url;
+    gboolean has_fallback_tried;
     guint poll_timer_id;
 } AppState;
 
@@ -132,8 +134,12 @@ static gboolean check_host_ready_cb(gpointer user_data) {
         return G_SOURCE_CONTINUE;
     }
 
+    static gboolean s_notified_waiting = FALSE;
+
     if (is_port_open(state->host, state->port)) {
+        s_notified_waiting = FALSE;
         g_print("[RemoteViber] 服务端已连接 (%s)，正在加载工作台...\n", state->target_url);
+        fflush(stdout);
         gtk_label_set_markup(GTK_LABEL(state->spinner_label),
             "<span size='medium' weight='bold' foreground='#38bdf8'>已连接服务端！</span>\n\n"
             "<span size='small' foreground='#94a3b8'>正在载入终端拼图网格工作台...</span>");
@@ -149,7 +155,14 @@ static gboolean check_host_ready_cb(gpointer user_data) {
         return G_SOURCE_REMOVE;
     }
 
-    /* Server not reachable yet: update waiting screen */
+    /* Server not reachable yet: update waiting screen and notify in terminal */
+    if (!s_notified_waiting) {
+        s_notified_waiting = TRUE;
+        g_print("[RemoteViber] 正在等待服务端上线 (%s)...\n", state->target_url);
+        g_print("[RemoteViber] 提示: 客户端与服务端已独立脱离，请在另一终端窗口启动服务端：\n");
+        g_print("      ./dist-bin/viber-host-linux-x86_64 --port %d\n", state->port);
+        fflush(stdout);
+    }
     char wait_msg[1024];
     snprintf(wait_msg, sizeof(wait_msg),
         "<span size='medium' weight='bold' foreground='#38bdf8'>正在等待连接服务端 (%s)...</span>\n\n"
@@ -199,6 +212,7 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
     } else if (event == WEBKIT_LOAD_FINISHED) {
         state->page_loaded = TRUE;
         state->is_loading = FALSE;
+        state->has_fallback_tried = FALSE;
         stop_poll_timer(state);
         gtk_spinner_stop(GTK_SPINNER(state->spinner));
         gtk_stack_set_visible_child(GTK_STACK(state->stack), state->web_view);
@@ -231,6 +245,19 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
     if (state->page_loaded && is_port_open(state->host, state->port)) {
         g_printerr("[RemoteViber] 页面子资源加载告警: %s (原因: %s)\n", failing_uri ? failing_uri : "", error ? error->message : "未知");
         state->is_loading = FALSE;
+        return TRUE;
+    }
+
+    /* Auto fallback from http to https if server rejected plain http on a TLS port */
+    if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "http://")) {
+        state->has_fallback_tried = TRUE;
+        char https_url[512];
+        snprintf(https_url, sizeof(https_url), "https://%s:%d/", state->host, state->port);
+        g_print("[RemoteViber] 检测到服务端可能启用了 TLS/HTTPS，自动切换至 %s 尝试连接...\n", https_url);
+        fflush(stdout);
+        snprintf(state->target_url, sizeof(state->target_url), "%s", https_url);
+        state->is_loading = TRUE;
+        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
         return TRUE;
     }
 
@@ -618,6 +645,7 @@ int main(int argc, char *argv[]) {
     }
 
     gboolean force_software_rendering = FALSE;
+    gboolean detach_to_background = FALSE;
 
     /* Parse command line arguments */
     for (int i = 1; i < argc; i++) {
@@ -627,6 +655,9 @@ int main(int argc, char *argv[]) {
             strncpy(app_state.host, argv[++i], sizeof(app_state.host) - 1);
         } else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc) {
             strncpy(app_state.target_url, argv[++i], sizeof(app_state.target_url) - 1);
+            app_state.explicit_url = TRUE;
+        } else if (strcmp(argv[i], "--detach") == 0 || strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--bg") == 0) {
+            detach_to_background = TRUE;
         } else if (strcmp(argv[i], "--no-gpu") == 0 || strcmp(argv[i], "--software") == 0) {
             force_software_rendering = TRUE;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -637,6 +668,7 @@ int main(int argc, char *argv[]) {
                     "  --port <port>   指定服务端连接端口 (默认: 8765)\n"
                     "  --host <ip>     指定服务端连接IP (默认: 127.0.0.1)\n"
                     "  --url <url>     直接指定连接完整 URL (例如 http://192.168.1.100:8765/)\n"
+                    "  -d, --detach    转入后台独立运行，立即释放终端交互提示符\n"
                     "  --no-gpu        强制使用 CPU 纯软件渲染 (兼容老旧驱动/虚拟机)\n"
                     "  --help, -h      显示帮助信息\n\n"
                     "说明:\n"
@@ -892,9 +924,24 @@ int main(int argc, char *argv[]) {
 
     gtk_widget_show_all(app_state.window);
 
+    g_print("[RemoteViber] 原生桌面工作台已启动 (PID: %d)\n", getpid());
+    g_print("[RemoteViber] 目标连接地址: %s\n", app_state.target_url);
+    fflush(stdout);
+
     /* Initial check: if server is ready, connect immediately; otherwise poll every 1 second */
     if (check_host_ready_cb(&app_state) == G_SOURCE_CONTINUE) {
         start_poll_timer(&app_state, 1000);
+    }
+
+    if (detach_to_background) {
+        pid_t pid = fork();
+        if (pid > 0) {
+            g_print("[RemoteViber] 客户端已成功转入后台独立运行 (PID: %d)。当前终端已释放。\n", pid);
+            fflush(stdout);
+            return 0;
+        } else if (pid == 0) {
+            setsid();
+        }
     }
 
     gtk_main();

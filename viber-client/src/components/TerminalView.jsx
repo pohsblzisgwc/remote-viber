@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
@@ -14,6 +14,7 @@ import {
   History,
 } from 'lucide-react';
 import MobileToolbar from './MobileToolbar';
+import SafePasteModal from './SafePasteModal';
 
 function stringToBase64(str) {
   const bytes = new TextEncoder().encode(str);
@@ -73,6 +74,51 @@ export default function TerminalView({
   syncFullHistoryRef.current = syncFullHistory;
 
   const [isHistoryTruncated, setIsHistoryTruncated] = useState(false);
+  const [pasteModal, setPasteModal] = useState(null);
+
+  const handleConfirmSafePaste = () => {
+    if (!pasteModal || !connection || !activeSession) return;
+    const bracketed = `\x1b[200~${pasteModal.text}\x1b[201~`;
+    connection.sendInput(activeSession.session_id, stringToBase64(bracketed));
+    setPasteModal(null);
+  };
+
+  const handleConfirmSingleLinePaste = () => {
+    if (!pasteModal || !connection || !activeSession) return;
+    const singleLine = pasteModal.text.replace(/[\r\n]+/g, '; ');
+    connection.sendInput(activeSession.session_id, stringToBase64(singleLine));
+    setPasteModal(null);
+  };
+
+  const handlePasteText = useCallback((clipboardText) => {
+    if (!connection || !activeSession || !clipboardText) return;
+
+    if (/[\r\n]/.test(clipboardText)) {
+      // 1. Strip trailing newlines (so a single line command never auto-executes)
+      const trimmed = clipboardText.replace(/[\r\n]+$/, '');
+
+      // If after stripping trailing newlines there are no remaining newlines:
+      if (!/[\r\n]/.test(trimmed)) {
+        connection.sendInput(activeSession.session_id, stringToBase64(trimmed));
+        return;
+      }
+
+      // 2. Multi-line paste: if terminal has bracketed paste mode active, wrap and send safely
+      if (xtermRef.current?.modes?.bracketedPasteMode) {
+        const bracketed = `\x1b[200~${trimmed}\x1b[201~`;
+        connection.sendInput(activeSession.session_id, stringToBase64(bracketed));
+        return;
+      }
+
+      // 3. Otherwise show confirmation modal to prevent accidental execution
+      setPasteModal({
+        text: trimmed,
+        linesCount: trimmed.split(/\r?\n/).length,
+      });
+    } else {
+      connection.sendInput(activeSession.session_id, stringToBase64(clipboardText));
+    }
+  }, [connection, activeSession]);
 
   const handleToggleSyncFullHistory = () => {
     setSyncFullHistory((prev) => {
@@ -313,6 +359,21 @@ export default function TerminalView({
       }
     });
 
+    // Intercept DOM paste events to prevent newlines from auto-executing commands
+    const handlePaste = (e) => {
+      const clipboardText = e.clipboardData?.getData('text/plain') || '';
+      if (!clipboardText) return;
+
+      if (/[\r\n]/.test(clipboardText)) {
+        e.preventDefault();
+        e.stopPropagation();
+        handlePasteText(clipboardText);
+      }
+    };
+
+    const containerEl = containerRef.current;
+    containerEl?.addEventListener('paste', handlePaste, true);
+
     // Window & Mobile Virtual Viewport resize observer
     const handleFit = () => {
       try {
@@ -408,6 +469,7 @@ export default function TerminalView({
     connection.attachSession(activeSession.session_id, 0, syncFullHistoryRef.current);
 
     return () => {
+      containerEl?.removeEventListener('paste', handlePaste, true);
       if (scrollRafId) cancelAnimationFrame(scrollRafId);
       scrollDisposable?.dispose?.();
       clearTimeout(replayTimer);
@@ -617,9 +679,18 @@ export default function TerminalView({
       {/* Mobile Touch Toolbar & Quick Prompter */}
       <MobileToolbar 
         onSendKey={handleSendKey} 
+        onPaste={handlePasteText}
         onSendPrompt={handleSendPrompt}
         onZoomIn={handleZoomIn}
         onZoomOut={handleZoomOut}
+      />
+
+      {/* Safe Paste Multi-line Confirmation Modal */}
+      <SafePasteModal
+        data={pasteModal}
+        onConfirmSafe={handleConfirmSafePaste}
+        onConfirmSingleLine={handleConfirmSingleLinePaste}
+        onCancel={() => setPasteModal(null)}
       />
     </div>
   );
