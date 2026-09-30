@@ -29,7 +29,47 @@
 #define APP_TITLE "RemoteViber 终端拼图工作台"
 #define APP_ID "com.remoteviber.desktop"
 
-/* Unified timestamped diagnostic logger */
+static FILE *s_log_file = NULL;
+static char s_log_file_path[1024] = "/tmp/viber-desktop.log";
+
+static void init_log_file(const char *custom_path) {
+    if (s_log_file) {
+        fclose(s_log_file);
+        s_log_file = NULL;
+    }
+
+    if (custom_path && custom_path[0] != '\0') {
+        g_strlcpy(s_log_file_path, custom_path, sizeof(s_log_file_path));
+    } else {
+        const char *env_path = g_getenv("VIBER_LOG_FILE");
+        if (env_path && env_path[0] != '\0') {
+            g_strlcpy(s_log_file_path, env_path, sizeof(s_log_file_path));
+        } else {
+            g_strlcpy(s_log_file_path, "/tmp/viber-desktop.log", sizeof(s_log_file_path));
+        }
+    }
+
+    s_log_file = fopen(s_log_file_path, "a");
+    if (!s_log_file) {
+        snprintf(s_log_file_path, sizeof(s_log_file_path), "./viber-desktop.log");
+        s_log_file = fopen(s_log_file_path, "a");
+    }
+
+    if (s_log_file) {
+        time_t rawtime;
+        time(&rawtime);
+        struct tm timeinfo;
+        localtime_r(&rawtime, &timeinfo);
+        char time_str[64];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+        fprintf(s_log_file, "\n================================================================================\n");
+        fprintf(s_log_file, "  RemoteViber Desktop Diagnostic Log Session: %s (PID: %d)\n", time_str, getpid());
+        fprintf(s_log_file, "================================================================================\n");
+        fflush(s_log_file);
+    }
+}
+
+/* Unified timestamped diagnostic logger with dual stdout and file streaming */
 static void app_log(const char *tag, const char *fmt, ...) {
     time_t rawtime;
     struct tm timeinfo;
@@ -38,7 +78,7 @@ static void app_log(const char *tag, const char *fmt, ...) {
     char time_str[32];
     strftime(time_str, sizeof(time_str), "%H:%M:%S", &timeinfo);
 
-    char buffer[2048];
+    char buffer[4096];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buffer, sizeof(buffer), fmt, args);
@@ -46,6 +86,11 @@ static void app_log(const char *tag, const char *fmt, ...) {
 
     g_print("[%s][RemoteViber][%s] %s\n", time_str, tag, buffer);
     fflush(stdout);
+
+    if (s_log_file) {
+        fprintf(s_log_file, "[%s][%s] %s\n", time_str, tag, buffer);
+        fflush(s_log_file);
+    }
 }
 
 typedef struct {
@@ -94,6 +139,85 @@ typedef struct {
 } AppState;
 
 static AppState app_state;
+
+/* WebKit Resource & Network Diagnostic Callbacks */
+static void on_resource_failed(WebKitWebResource *resource, GError *error, gpointer user_data) {
+    (void)user_data;
+    const char *uri = webkit_web_resource_get_uri(resource);
+    app_log("RES-FAIL", "子资源加载失败: %s (domain=%s, code=%d, msg='%s')",
+            uri ? uri : "(null)",
+            error ? g_quark_to_string(error->domain) : "none",
+            error ? error->code : 0,
+            error ? error->message : "unknown");
+}
+
+static void on_resource_finished(WebKitWebResource *resource, gpointer user_data) {
+    (void)user_data;
+    const char *uri = webkit_web_resource_get_uri(resource);
+    WebKitURIResponse *resp = webkit_web_resource_get_response(resource);
+    guint status = resp ? webkit_uri_response_get_status_code(resp) : 0;
+    const char *mime = resp ? webkit_uri_response_get_mime_type(resp) : "unknown";
+    guint64 len = resp ? webkit_uri_response_get_content_length(resp) : 0;
+    app_log("RES-DONE", "子资源就绪: %s [HTTP %u, MIME: %s, %lu 字节]",
+            uri ? uri : "(null)", status, mime ? mime : "unknown", (unsigned long)len);
+}
+
+static void on_resource_load_started(WebKitWebView *web_view, WebKitWebResource *resource, WebKitURIRequest *request, gpointer user_data) {
+    (void)web_view; (void)user_data;
+    const char *uri = webkit_uri_request_get_uri(request);
+    app_log("RES-START", "请求子资源: %s", uri ? uri : "(null)");
+    g_signal_connect(resource, "failed", G_CALLBACK(on_resource_failed), NULL);
+    g_signal_connect(resource, "finished", G_CALLBACK(on_resource_finished), NULL);
+}
+
+/* Post-load DOM State Diagnostics */
+static void on_dom_state_cb(GObject *object, GAsyncResult *result, gpointer user_data) {
+    (void)user_data;
+    GError *error = NULL;
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    JSCValue *val = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
+    if (error) {
+        app_log("DOM-STATE", "获取 DOM 状态失败: %s", error->message);
+        g_error_free(error);
+    } else if (val) {
+        char *str = jsc_value_to_string(val);
+        app_log("DOM-STATE", "%s", str ? str : "(null)");
+        g_free(str);
+    }
+#else
+    (void)object; (void)result;
+#endif
+}
+
+static gboolean on_delayed_dom_check(gpointer user_data) {
+    AppState *state = (AppState *)user_data;
+    if (!state || !state->web_view) return G_SOURCE_REMOVE;
+    const char *diag_js =
+        "(function() {"
+        "  var root = document.getElementById('root');"
+        "  return JSON.stringify({"
+        "    href: window.location.href,"
+        "    title: document.title,"
+        "    readyState: document.readyState,"
+        "    contentType: document.contentType,"
+        "    bodyLen: document.body ? document.body.innerHTML.length : -1,"
+        "    bodyPreview: document.body ? document.body.innerHTML.slice(0, 200) : '',"
+        "    rootExists: !!root,"
+        "    rootChildren: root ? root.childElementCount : -1,"
+        "    rootText: root ? root.innerText.slice(0, 100) : '',"
+        "    isSecureContext: window.isSecureContext,"
+        "    hasSubtle: !!(window.crypto && window.crypto.subtle)"
+        "  });"
+        "})()";
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(state->web_view), diag_js, -1, NULL, NULL, NULL, on_dom_state_cb, NULL);
+#else
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    webkit_web_view_run_javascript(WEBKIT_WEB_VIEW(state->web_view), diag_js, NULL, NULL, NULL);
+    G_GNUC_END_IGNORE_DEPRECATIONS
+#endif
+    return G_SOURCE_REMOVE;
+}
 
 /* WebKit frontend console bridge callback */
 static void on_script_message(WebKitUserContentManager *manager, WebKitJavascriptResult *result, gpointer user_data) {
@@ -524,6 +648,7 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
 
     if (event == WEBKIT_LOAD_STARTED) {
         state->is_loading = TRUE;
+        state->load_failed = FALSE;
         app_log("LOAD", "事件 WEBKIT_LOAD_STARTED (URI: %s)", current_uri ? current_uri : state->target_url);
     } else if (event == WEBKIT_LOAD_REDIRECTED) {
         app_log("LOAD", "事件 WEBKIT_LOAD_REDIRECTED (新 URI: %s)", current_uri ? current_uri : "unknown");
@@ -581,6 +706,10 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
             dispatch_web_js(web_view, js);
             g_free(js);
         }
+
+        /* Trigger DOM verification checks after 500ms and 1500ms to log frontend render state */
+        g_timeout_add(500, on_delayed_dom_check, state);
+        g_timeout_add(1500, on_delayed_dom_check, state);
     }
 }
 
@@ -644,7 +773,7 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
             snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
             app_log("FALLBACK", "HTTPS 加载遇到 TLS 异常，自动降级至 HTTP 明文协议重试: %s", state->target_url);
             state->is_loading = TRUE;
-            state->load_failed = TRUE;
+            state->load_failed = FALSE;
             webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
             return TRUE;
         }
@@ -656,7 +785,7 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
         snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
         app_log("FALLBACK", "HTTP 连接失败，自动切换至 HTTPS 安全模式重新加载: %s", state->target_url);
         state->is_loading = TRUE;
-        state->load_failed = TRUE;
+        state->load_failed = FALSE;
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
         return TRUE;
     }
@@ -714,6 +843,7 @@ static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *f
         app_log("TLS", "正在为目标主机 '%s' 信任自签名证书...", host);
         webkit_web_context_allow_tls_certificate_for_host(context, certificate, host);
         app_log("TLS", "已成功将主机 '%s' 信任证书写入 WebKit 上下文，立即重试载入...", host);
+        state->load_failed = FALSE;
         webkit_web_view_load_uri(web_view, failing_uri ? failing_uri : state->target_url);
     }
     return TRUE;
@@ -722,7 +852,10 @@ static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *f
 /* WebKit WebProcess crash handler */
 static void on_web_process_terminated(WebKitWebView *web_view, WebKitWebProcessTerminationReason reason, gpointer user_data) {
     AppState *state = (AppState *)user_data;
-    app_log("PROCESS", "网页渲染进程退出 (代码: %d)，正在自动恢复重连...", reason);
+    const char *reason_desc = "未知原因";
+    if (reason == WEBKIT_WEB_PROCESS_CRASHED) reason_desc = "渲染进程异常崩溃 (CRASHED - 检查 GPU/Mesa/seccomp 驱动)";
+    else if (reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT) reason_desc = "内存消耗超限 (EXCEEDED_MEMORY_LIMIT)";
+    app_log("CRASH", "网页渲染进程异常退出! 原因: %s (代码: %d)，正在自动重连...", reason_desc, (int)reason);
 
     state->load_failed = TRUE;
     state->page_loaded = FALSE;
@@ -1161,6 +1294,7 @@ int main(int argc, char *argv[]) {
     gboolean detach_to_background = FALSE;
     gboolean force_software_rendering = FALSE;
     gboolean launch_browser_mode = FALSE;
+    char custom_log_path[1024] = {0};
 
     /* Parse command line arguments */
     for (int i = 1; i < argc; i++) {
@@ -1171,6 +1305,8 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc) {
             snprintf(app_state.target_url, sizeof(app_state.target_url), "%s", argv[++i]);
             app_state.explicit_url = TRUE;
+        } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
+            g_strlcpy(custom_log_path, argv[++i], sizeof(custom_log_path));
         } else if (strcmp(argv[i], "--detach") == 0 || strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--bg") == 0) {
             detach_to_background = TRUE;
         } else if (strcmp(argv[i], "--software") == 0 || strcmp(argv[i], "--software-rendering") == 0 || strcmp(argv[i], "--no-accel") == 0) {
@@ -1187,14 +1323,15 @@ int main(int argc, char *argv[]) {
                     "基于 GTK+ 3.0 & WebKit2GTK 4.1 原生打造 (支持纯客户端模式与一键服务端控制)\n\n"
                     "用法: viber-desktop-linux [选项]\n\n"
                     "选项:\n"
-                    "  --port <port>   指定服务端连接端口 (默认: 8765)\n"
-                    "  --host <ip>     指定服务端连接IP (默认: 127.0.0.1)\n"
-                    "  --url <url>     直接指定连接完整 URL (例如 https://192.168.1.100:8765/)\n"
-                    "  --zoom <factor> 工作台缩放比例 (默认: 1.0, 范围: 0.5 - 3.0)\n"
-                    "  --software      强制软件渲染兼容模式 (禁用 GPU 硬件加速)\n"
-                    "  --browser       在系统 Chrome/Chromium 独立应用窗口中启动工作台\n"
-                    "  -d, --detach    转入后台独立运行，立即释放终端交互提示符\n"
-                    "  --help, -h      显示帮助信息\n\n"
+                    "  --port <port>     指定服务端连接端口 (默认: 8765)\n"
+                    "  --host <ip>       指定服务端连接IP (默认: 127.0.0.1)\n"
+                    "  --url <url>       直接指定连接完整 URL (例如 https://192.168.1.100:8765/)\n"
+                    "  --log-file <path> 指定全量运行诊断日志输出文件 (默认: /tmp/viber-desktop.log)\n"
+                    "  --zoom <factor>   工作台缩放比例 (默认: 1.0, 范围: 0.5 - 3.0)\n"
+                    "  --software        强制软件渲染兼容模式 (禁用 GPU 硬件加速与合成管线)\n"
+                    "  --browser         在系统 Chrome/Chromium 独立应用窗口中启动工作台\n"
+                    "  -d, --detach      转入后台独立运行，立即释放终端交互提示符\n"
+                    "  --help, -h        显示帮助信息\n\n"
                     "快捷键:\n"
                     "  Alt+N           ➕ 快速创建并启动终端\n"
                     "  Alt+A           🚀 启动 Agent 智能体\n"
@@ -1209,6 +1346,9 @@ int main(int argc, char *argv[]) {
             return 0;
         }
     }
+
+    /* Initialize persistent diagnostic log file immediately */
+    init_log_file(custom_log_path);
 
     /* Enforce modern Linux compositor & driver compatibility */
     setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
@@ -1265,6 +1405,24 @@ int main(int argc, char *argv[]) {
                     app_state.port, app_state.port);
         return 1;
     }
+
+    app_log("SYSTEM", "================================================================================");
+    app_log("SYSTEM", "RemoteViber Linux Native Desktop Client v2.0 (Diagnostic Engine Active)");
+    app_log("SYSTEM", "全量运行诊断日志已同步写入: %s", s_log_file_path);
+    app_log("SYSTEM", "进程信息: PID=%d, PPID=%d, UID=%d, GID=%d", getpid(), getppid(), getuid(), getgid());
+    app_log("SYSTEM", "库版本: GTK+ %u.%u.%u | WebKitGTK %u.%u.%u",
+            gtk_get_major_version(), gtk_get_minor_version(), gtk_get_micro_version(),
+            webkit_get_major_version(), webkit_get_minor_version(), webkit_get_micro_version());
+    app_log("SYSTEM", "显示环境: DISPLAY='%s', WAYLAND_DISPLAY='%s', XDG_SESSION_TYPE='%s'",
+            g_getenv("DISPLAY") ? g_getenv("DISPLAY") : "(null)",
+            g_getenv("WAYLAND_DISPLAY") ? g_getenv("WAYLAND_DISPLAY") : "(null)",
+            g_getenv("XDG_SESSION_TYPE") ? g_getenv("XDG_SESSION_TYPE") : "(null)");
+    app_log("SYSTEM", "图形策略: force_software=%d, WEBKIT_DISABLE_COMPOSITING_MODE='%s', WEBKIT_DISABLE_DMABUF_RENDERER='%s', LIBGL_ALWAYS_SOFTWARE='%s'",
+            force_software_rendering,
+            g_getenv("WEBKIT_DISABLE_COMPOSITING_MODE") ? g_getenv("WEBKIT_DISABLE_COMPOSITING_MODE") : "(not set)",
+            g_getenv("WEBKIT_DISABLE_DMABUF_RENDERER") ? g_getenv("WEBKIT_DISABLE_DMABUF_RENDERER") : "(not set)",
+            g_getenv("LIBGL_ALWAYS_SOFTWARE") ? g_getenv("LIBGL_ALWAYS_SOFTWARE") : "(not set)");
+    app_log("SYSTEM", "================================================================================");
 
     find_local_pairing_code(&app_state);
 
@@ -1498,6 +1656,7 @@ int main(int argc, char *argv[]) {
     webkit_settings_set_hardware_acceleration_policy(settings,
         force_software_rendering ? WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER : WEBKIT_HARDWARE_ACCELERATION_POLICY_ON_DEMAND);
     webkit_settings_set_zoom_text_only(settings, FALSE);
+    webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
 
     app_state.web_view = webkit_web_view_new_with_context(ctx);
     webkit_web_view_set_settings(WEBKIT_WEB_VIEW(app_state.web_view), settings);
@@ -1614,6 +1773,12 @@ int main(int argc, char *argv[]) {
     g_signal_connect(app_state.web_view, "load-failed", G_CALLBACK(on_load_failed), &app_state);
     g_signal_connect(app_state.web_view, "load-failed-with-tls-errors", G_CALLBACK(on_load_failed_with_tls_errors), &app_state);
     g_signal_connect(app_state.web_view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), &app_state);
+    g_signal_connect(app_state.web_view, "resource-load-started", G_CALLBACK(on_resource_load_started), &app_state);
+
+    gtk_widget_set_hexpand(app_state.web_view, TRUE);
+    gtk_widget_set_vexpand(app_state.web_view, TRUE);
+    gtk_widget_set_hexpand(app_state.stack, TRUE);
+    gtk_widget_set_vexpand(app_state.stack, TRUE);
 
     gtk_stack_add_named(GTK_STACK(app_state.stack), app_state.web_view, "webview");
     gtk_container_add(GTK_CONTAINER(app_state.window), app_state.stack);
