@@ -15,12 +15,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.ArrowDownward
-import androidx.compose.material.icons.filled.Code
-import androidx.compose.material.icons.filled.DeleteSweep
-import androidx.compose.material.icons.filled.Forum
-import androidx.compose.material.icons.filled.Sync
-import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -39,6 +34,7 @@ import com.remoteviber.client.model.ConnectionStatus
 import com.remoteviber.client.model.TerminalBuffer
 import com.remoteviber.client.ui.components.AgentChatView
 import com.remoteviber.client.ui.components.SessionTabs
+import com.remoteviber.client.ui.components.ViberTextField
 import com.remoteviber.client.ui.components.VirtualKeyboardBar
 import com.remoteviber.client.ui.components.Xterm2DView
 import com.remoteviber.client.ui.components.XtermController
@@ -54,6 +50,10 @@ fun TerminalScreen(
     terminalBuffer: TerminalBuffer,
     chatProcessor: AgentChatStreamProcessor,
     xtermController: XtermController,
+    isHistoryTruncated: Boolean = false,
+    syncFullHistory: Boolean = false,
+    onToggleSyncFullHistory: () -> Unit = {},
+    onLoadFullHistory: () -> Unit = {},
     onSelectSession: (String) -> Unit,
     onCloseSession: (String) -> Unit,
     onNewTerminal: () -> Unit,
@@ -63,7 +63,7 @@ fun TerminalScreen(
     onSendInputBase64: (String) -> Unit,
     onResizeTerminal: (Int, Int) -> Unit
 ) {
-    // Mode switcher: "terminal" (Native Compose 终端 - 默认推荐，稳定高效) vs "xterm" (2D 虚拟终端) vs "chat" (Agent 对话卡片流)
+    val context = androidx.compose.ui.platform.LocalContext.current
     var displayMode by remember { mutableStateOf("terminal") }
     var fontSizeSp by remember { mutableStateOf(12) }
     var localCommandInput by remember { mutableStateOf("") }
@@ -277,6 +277,48 @@ fun TerminalScreen(
                     Spacer(modifier = Modifier.width(2.dp))
                     Text(text = "清屏", color = TextMuted, fontSize = 10.sp)
                 }
+
+                Spacer(modifier = Modifier.width(4.dp))
+
+                // Full history sync strategy toggle
+                TextButton(
+                    onClick = onToggleSyncFullHistory,
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                    modifier = Modifier.height(24.dp)
+                ) {
+                    Text(
+                        text = if (syncFullHistory) "📜 完整" else "📜 截断",
+                        color = if (syncFullHistory) ViberEmerald else TextMuted,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+
+        // Truncated History Notice & On-Demand Full Load Banner
+        if (isHistoryTruncated && !syncFullHistory) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF2E1B00))
+                    .border(width = 0.5.dp, color = Color(0xFFD97706))
+                    .padding(horizontal = 10.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "⚡ 历史已默认截断以加速秒开",
+                    color = Color(0xFFFFB74D),
+                    fontSize = 10.sp
+                )
+                TextButton(
+                    onClick = onLoadFullHistory,
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                    modifier = Modifier.height(22.dp)
+                ) {
+                    Text("📥 加载全部历史", color = Color(0xFFFFD54F), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                }
             }
         }
 
@@ -311,6 +353,46 @@ fun TerminalScreen(
                     fontSize = 9.sp,
                     fontFamily = FontFamily.Monospace
                 )
+            }
+        }
+
+        // Desktop Session Protection & Mobile Independence Banner
+        val currentSession = sessions.find { it.sessionId == activeSessionId }
+        val isMobileSession = currentSession != null && (currentSession.name.contains("📱") || currentSession.name.contains("手机") || currentSession.name.contains("Mobile"))
+        if (currentSession != null && !isMobileSession) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF07192A))
+                    .border(width = 0.5.dp, color = ViberCyan.copy(alpha = 0.35f))
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Icon(
+                        imageVector = Icons.Default.Security,
+                        contentDescription = "Shield",
+                        tint = ViberCyan,
+                        modifier = Modifier.size(12.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "💻 电脑会话保护中：已锁定宿主尺寸，手机操作不干扰电脑",
+                        color = Color(0xFF7DD3FC),
+                        fontSize = 10.sp,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(modifier = Modifier.width(4.dp))
+                TextButton(
+                    onClick = onNewTerminal,
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                    modifier = Modifier.height(20.dp)
+                ) {
+                    Text("+ 开启手机终端", color = ViberEmerald, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                }
             }
         }
 
@@ -532,6 +614,9 @@ fun TerminalScreen(
             ActionPill("↵ 回车", TextPrimary) {
                 onSendKey("\r")
             }
+            ActionPill("TAB 补全", ViberCyan) {
+                onSendKey("\t")
+            }
             ActionPill("^C 中断", ViberRose) {
                 chatProcessor.appendSystemNotice("[已发送 Ctrl+C 中断信号]", ViberRose)
                 terminalBuffer.appendSystemNotice("[已发送 Ctrl+C 中断信号]", ViberRose)
@@ -545,10 +630,30 @@ fun TerminalScreen(
                 terminalBuffer.appendLocalEcho("git status")
                 onSendPrompt("git status\n")
             }
+            ActionPill("git diff", TextSecondary) {
+                chatProcessor.appendUserPrompt("git diff")
+                terminalBuffer.appendLocalEcho("git diff")
+                onSendPrompt("git diff\n")
+            }
             ActionPill("docker ps", TextSecondary) {
                 chatProcessor.appendUserPrompt("docker ps")
                 terminalBuffer.appendLocalEcho("docker ps")
                 onSendPrompt("docker ps\n")
+            }
+            ActionPill("ls -la", TextSecondary) {
+                chatProcessor.appendUserPrompt("ls -la")
+                terminalBuffer.appendLocalEcho("ls -la")
+                onSendPrompt("ls -la\n")
+            }
+            ActionPill("cd ..", TextSecondary) {
+                chatProcessor.appendUserPrompt("cd ..")
+                terminalBuffer.appendLocalEcho("cd ..")
+                onSendPrompt("cd ..\n")
+            }
+            ActionPill("clear", TextMuted) {
+                chatProcessor.appendUserPrompt("clear")
+                terminalBuffer.appendLocalEcho("clear")
+                onSendPrompt("clear\n")
             }
         }
 
@@ -565,16 +670,10 @@ fun TerminalScreen(
                     .padding(horizontal = 8.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                OutlinedTextField(
+                ViberTextField(
                     value = localCommandInput,
                     onValueChange = { localCommandInput = it },
-                    placeholder = {
-                        Text(
-                            text = if (displayMode == "chat") "向 Agent 发送指令，回车发送..." else "本地编辑指令，回车发送...",
-                            fontSize = 11.sp,
-                            color = TextMuted
-                        )
-                    },
+                    placeholder = if (displayMode == "chat") "向 Agent 发送指令，回车发送..." else "输入指令，回车发送...",
                     singleLine = true,
                     textStyle = androidx.compose.ui.text.TextStyle(
                         fontSize = 12.sp,
@@ -583,21 +682,43 @@ fun TerminalScreen(
                     ),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                     keyboardActions = KeyboardActions(onSend = { submitCommand() }),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = ViberCyan,
-                        unfocusedBorderColor = ViberBorder,
-                        focusedContainerColor = Color(0xFF070B14),
-                        unfocusedContainerColor = Color(0xFF070B14)
-                    ),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 9.dp),
                     modifier = Modifier.weight(1f)
                 )
+
+                Spacer(modifier = Modifier.width(6.dp))
+
+                // 1-Tap Clipboard Paste Button for Mobile Convenience
+                IconButton(
+                    onClick = {
+                        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                        val clip = clipboard?.primaryClip
+                        if (clip != null && clip.itemCount > 0) {
+                            val text = clip.getItemAt(0).text?.toString() ?: ""
+                            if (text.isNotEmpty()) {
+                                localCommandInput += text
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .size(38.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(ViberCard)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ContentPaste,
+                        contentDescription = "Paste Clipboard",
+                        tint = ViberCyan,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
 
                 Spacer(modifier = Modifier.width(6.dp))
 
                 IconButton(
                     onClick = { submitCommand() },
                     modifier = Modifier
-                        .size(40.dp)
+                        .size(38.dp)
                         .clip(RoundedCornerShape(8.dp))
                         .background(if (localCommandInput.isNotBlank()) ViberCyan else ViberCard)
                 ) {
@@ -605,7 +726,7 @@ fun TerminalScreen(
                         imageVector = Icons.AutoMirrored.Filled.Send,
                         contentDescription = "Send Command",
                         tint = if (localCommandInput.isNotBlank()) Color.Black else TextMuted,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(17.dp)
                     )
                 }
             }

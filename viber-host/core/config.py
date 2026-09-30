@@ -141,6 +141,9 @@ class HostConfig:
         self.allowed_origins = data.get("allowed_origins", [])
         if not isinstance(self.allowed_origins, list) or not all(isinstance(x, str) for x in self.allowed_origins):
             raise ValueError("allowed_origins must be a list of exact origins")
+        self.ssl_enabled = bool(data.get("ssl_enabled", False))
+        self.ssl_cert = data.get("ssl_cert") or None
+        self.ssl_key = data.get("ssl_key") or None
         self.pairing_secret = data.get("pairing_secret", "")
         self.private_key_b64 = data.get("private_key_b64", "")
         # v1 credentials may already have been disclosed. Rotate both identity
@@ -169,6 +172,7 @@ class HostConfig:
                 "direct_port": self.direct_port, "direct_bind": self.direct_bind,
                 "allow_lan": self.allow_lan, "relay_url": self.relay_url,
                 "direct_url": self.direct_url, "allowed_origins": self.allowed_origins,
+                "ssl_enabled": self.ssl_enabled, "ssl_cert": self.ssl_cert, "ssl_key": self.ssl_key,
                 "pairing_secret": self.pairing_secret, "private_key_b64": self.private_key_b64}
         write_private_json(Path(self.config_file), data)
 
@@ -177,6 +181,7 @@ class HostConfig:
         return {"v": 2, "id": self.host_id, "name": self.host_name, "port": self.direct_port,
                 "pub": self.key_manager.public_key_b64, "token": self.pairing_secret,
                 "relay": self.relay_url or "", "direct_url": self.direct_url,
+                "ssl": bool(getattr(self, "ssl_enabled", False) or getattr(self, "ssl_cert", None)),
                 "tailscale": endpoints.get("tailscale", []),
                 "lan": endpoints.get("lan", []) if self.allow_lan else ["127.0.0.1"]}
 

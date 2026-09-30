@@ -1,13 +1,20 @@
 """Direct endpoint: explicit Origins, no auto-pairing, bounded authenticated streams."""
 import asyncio
+import datetime
 import ipaddress
 import logging
 import mimetypes
 import os
 from pathlib import Path
+import ssl
 import stat
 import sys
 from urllib.parse import unquote, urlsplit
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Response
@@ -16,6 +23,93 @@ from core.crypto import ProtocolError, MAX_FRAME_BYTES, HANDSHAKE_TIMEOUT
 from network.router import ClientConnectionState
 
 logger = logging.getLogger("viber.direct")
+
+
+def get_or_create_tls_context(config, san_hosts=None):
+    """Retrieve custom SSL/TLS context or auto-generate a private self-signed certificate."""
+    cert_file = getattr(config, "ssl_cert", None)
+    key_file = getattr(config, "ssl_key", None)
+
+    if cert_file and key_file:
+        cert_p = Path(cert_file)
+        key_p = Path(key_file)
+        if not cert_p.is_file():
+            raise FileNotFoundError(f"SSL certificate file not found: {cert_file}")
+        if not key_p.is_file():
+            raise FileNotFoundError(f"SSL key file not found: {key_file}")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=str(cert_p), keyfile=str(key_p))
+        return ctx
+
+    config_dir = Path(getattr(config, "config_dir", "."))
+    auto_cert = config_dir / "viber_cert.pem"
+    auto_key = config_dir / "viber_key.pem"
+
+    if auto_cert.is_file() and auto_key.is_file():
+        try:
+            cert_bytes = auto_cert.read_bytes()
+            existing_cert = x509.load_pem_x509_certificate(cert_bytes)
+            bc = existing_cert.extensions.get_extension_for_oid(x509.ExtensionOID.BASIC_CONSTRAINTS).value
+            if not bc.ca:
+                raise ValueError("Self-signed root certificate must have ca=True for strict TLS stacks")
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=str(auto_cert), keyfile=str(auto_key))
+            return ctx
+        except Exception:
+            pass  # regenerate if invalid or ca=False
+
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "RemoteViber Host"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "RemoteViber"),
+    ])
+
+    san_list = []
+    seen = set()
+    hosts_to_add = san_hosts or ["localhost", "127.0.0.1", "::1"]
+    for h in hosts_to_add:
+        if not h or h in seen:
+            continue
+        clean = h.strip("[]")
+        seen.add(clean)
+        try:
+            ip = ipaddress.ip_address(clean)
+            san_list.append(x509.IPAddress(ip))
+        except ValueError:
+            if not any(c in clean for c in "/:?#@*"):
+                san_list.append(x509.DNSName(clean))
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(private_key, hashes.SHA256())
+    )
+
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    for p, b in [(auto_cert, cert_pem), (auto_key, key_pem)]:
+        tmp = p.with_suffix(".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(fd, "wb") as f:
+            f.write(b)
+        tmp.replace(p)
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=str(auto_cert), keyfile=str(auto_key))
+    return ctx
 
 
 def normalize_origin(value):
@@ -81,8 +175,9 @@ def static_bytes(root: Path, relative: str):
 
 
 class DirectServer:
-    def __init__(self, config, agent_manager, monitor, client_dist_dir=None):
+    def __init__(self, config, agent_manager, monitor, client_dist_dir=None, ssl_context=None):
         self.config, self.agent_manager, self.monitor = config, agent_manager, monitor
+        self.ssl_context = ssl_context
         if client_dist_dir:
             self.client_dist_dir = str(client_dist_dir)
         elif hasattr(sys, "_MEIPASS"):
@@ -113,14 +208,35 @@ class DirectServer:
                 continue
             host = f"[{name}]" if ":" in name and not name.startswith("[") else name
             origins.add(normalize_origin(f"http://{host}:{port}"))
+            origins.add(normalize_origin(f"https://{host}:{port}"))
+
+        direct_url = getattr(self.config, "direct_url", None)
+        if direct_url:
+            raw = direct_url
+            if raw.startswith("wss://"):
+                raw = "https://" + raw[6:]
+            elif raw.startswith("ws://"):
+                raw = "http://" + raw[5:]
+            try:
+                u = urlsplit(raw)
+                if u.hostname:
+                    port_str = f":{u.port}" if u.port and u.port not in (80, 443) else ""
+                    h_fmt = f"[{u.hostname}]" if ":" in u.hostname and not u.hostname.startswith("[") else u.hostname
+                    origins.add(normalize_origin(f"https://{h_fmt}{port_str}"))
+                    origins.add(normalize_origin(f"http://{h_fmt}{port_str}"))
+            except Exception:
+                pass
+
         origins.update(normalize_origin(x) for x in getattr(self.config, "allowed_origins", []))
         self.allowed_origins[:] = [None] + sorted(origins)
         self.allowed_hosts = {urlsplit(x).netloc for x in origins}
-        # Explicit default ports are legal Host forms as well.
+        # Explicit default ports and bare hostnames are legal Host forms as well.
         for x in origins:
             u = urlsplit(x)
             if u.port is None:
                 self.allowed_hosts.add(u.netloc + (":443" if u.scheme == "https" else ":80"))
+            elif (u.scheme == "https" and u.port == 443) or (u.scheme == "http" and u.port == 80):
+                self.allowed_hosts.add(u.hostname)
 
     async def start(self):
         bind = self.config.direct_bind
@@ -133,13 +249,15 @@ class DirectServer:
         else:
             hosts = ["127.0.0.1"] + self.monitor.discover_local_endpoints().get("tailscale", [])
         self.server = await serve(self._handle_ws_connection, hosts, self.config.direct_port,
+                                  ssl=self.ssl_context,
                                   process_request=self._handle_http_request, origins=self.allowed_origins,
                                   open_timeout=10, close_timeout=3, ping_interval=20, ping_timeout=20,
                                   max_size=MAX_FRAME_BYTES, max_queue=16, compression=None)
         if self.config.direct_port == 0:
             self.config.direct_port = self.server.sockets[0].getsockname()[1]
             self._refresh_origins()
-        logger.info("Direct endpoint started; all connections require protocol-v2 authentication")
+        mode_str = "TLS/WSS" if self.ssl_context else "HTTP/WS"
+        logger.info("Direct endpoint started (%s); all connections require protocol-v2 authentication", mode_str)
 
     def _is_trusted_network(self, connection, request=None):
         return False  # There is no network-based authorization exception.
@@ -159,7 +277,11 @@ class DirectServer:
         try:
             hosts = request.headers.get_all("Host")
             origins = request.headers.get_all("Origin")
-            if len(hosts) != 1 or hosts[0].lower() not in self.allowed_hosts:
+            fwd_hosts = request.headers.get_all("X-Forwarded-Host")
+            candidate_hosts = [h.lower() for h in hosts]
+            if fwd_hosts:
+                candidate_hosts.extend(h.lower() for h in fwd_hosts)
+            if len(hosts) != 1 or not any(h in self.allowed_hosts for h in candidate_hosts):
                 return self._response(403, "Unrecognized Host")
             if len(origins) > 1 or (origins and origins[0] not in self.allowed_origins):
                 return self._response(403, "Origin not permitted")

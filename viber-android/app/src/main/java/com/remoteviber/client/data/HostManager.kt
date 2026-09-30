@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
+import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 
@@ -45,12 +46,17 @@ class HostManager(private val context: Context) {
             val list = mutableListOf<HostProfile>()
             for (i in 0 until arr.length()) {
                 val entry = arr.getJSONObject(i)
-                val profile = HostProfile.fromJsonObject(entry.getJSONObject("profile"))
+                var profile = HostProfile.fromJsonObject(entry.getJSONObject("profile"))
                 val pub = entry.getString("pub")
                 require(profile.id == ProtocolV2.hostId(pub))
                 require(profile.token.length in 32..256)
-                list.add(profile); loadedPins[profile.id] = pub
-                loadedUrls[profile.id] = entry.optString("direct_url", "")
+                val directUrl = entry.optString("direct_url", "").takeIf { it != "null" } ?: profile.directUrl
+                if (profile.directUrl.isBlank() && directUrl.isNotBlank()) {
+                    profile = profile.copy(directUrl = directUrl)
+                }
+                list.add(profile)
+                loadedPins[profile.id] = pub
+                loadedUrls[profile.id] = directUrl
             }
             pins.putAll(loadedPins); directUrls.putAll(loadedUrls)
             _hosts.value = list
@@ -69,8 +75,9 @@ class HostManager(private val context: Context) {
         list.forEach { profile ->
             val pub = newPins[profile.id] ?: error("Missing trusted public key")
             require(ProtocolV2.hostId(pub) == profile.id)
+            val dUrl = (newUrls[profile.id] ?: profile.directUrl).takeIf { it != "null" } ?: ""
             arr.put(JSONObject().put("profile", profile.toJsonObject()).put("pub", pub)
-                .put("direct_url", newUrls[profile.id] ?: ""))
+                .put("direct_url", dUrl))
         }
         storage.write(JSONObject().put("hosts", arr).put("active", activeId ?: "").toString())
         val retainedPins = list.associate { it.id to (newPins[it.id] ?: error("Missing key")) }
@@ -94,25 +101,61 @@ class HostManager(private val context: Context) {
     fun setActiveHost(id: String) {
         if (_hosts.value.any { it.id == id }) persist(_hosts.value, id)
     }
+    fun updateHost(
+        id: String,
+        name: String? = null,
+        directUrl: String? = null,
+        port: Int? = null,
+        ssl: Boolean? = null
+    ): HostProfile? {
+        val current = _hosts.value.find { it.id == id } ?: return null
+        val updated = current.copy(
+            name = (name ?: current.name).take(128),
+            directUrl = (directUrl ?: current.directUrl).trim(),
+            port = port ?: current.port,
+            ssl = ssl ?: current.ssl
+        )
+        saveHost(updated)
+        return updated
+    }
+    fun isDirectAddress(input: String): Boolean {
+        val trimmed = input.trim().trim('"', '\'')
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://") ||
+            trimmed.startsWith("ws://") || trimmed.startsWith("wss://")) return true
+        val hostRegex = Regex("""^([a-zA-Z0-9.-]+)(:\d{1,5})?$""")
+        return hostRegex.matches(trimmed) && !trimmed.contains("=") && trimmed.length < 256
+    }
     fun savePairing(candidate: PairingCandidate): HostProfile {
         val profile = candidate.profile
         require(profile.id == ProtocolV2.hostId(candidate.hostPub))
         val previous = pins[profile.id]
         require(previous == null || previous == candidate.hostPub) { "Existing host identity changed" }
-        persist(_hosts.value.filter { it.id != profile.id } + profile, profile.id,
+        val updatedProfile = if (profile.directUrl.isBlank() && candidate.directUrl.isNotBlank()) {
+            profile.copy(directUrl = candidate.directUrl)
+        } else {
+            profile
+        }
+        persist(_hosts.value.filter { it.id != profile.id } + updatedProfile, profile.id,
             pins.toMap() + (profile.id to candidate.hostPub), directUrls.toMap() + (profile.id to candidate.directUrl))
-        return profile
+        return updatedProfile
     }
     /** Pure preview parser. No storage, selected-host change or network access. */
     fun parsePairingUrl(url: String): PairingCandidate? = try {
-        require(url.length <= 16384)
-        val uri = URI(url.trim())
-        require(uri.scheme == "viber" && uri.host == "connect" && uri.path.isNullOrEmpty() && uri.fragment == null)
-        val parts = uri.rawQuery?.split('&') ?: error("Missing pairing data")
-        require(parts.size == 1 && parts[0].startsWith("data="))
-        val encoded = parts[0].substringAfter('=')
+        val trimmed = url.trim().trim('"', '\'')
+        require(trimmed.length in 10..16384)
+        val encoded = if (trimmed.startsWith("viber://")) {
+            val uri = URI(trimmed)
+            require(uri.scheme == "viber" && uri.host == "connect" && uri.path.isNullOrEmpty() && uri.fragment == null)
+            val parts = uri.rawQuery?.split('&') ?: error("Missing pairing data")
+            require(parts.size == 1 && parts[0].startsWith("data="))
+            parts[0].substringAfter('=')
+        } else {
+            trimmed
+        }
         require(encoded.matches(Regex("[A-Za-z0-9_-]+={0,2}")))
-        val json = JSONObject(String(Base64.getUrlDecoder().decode(encoded), Charsets.UTF_8))
+        val normalized = encoded.replace('-', '+').replace('_', '/')
+        val padded = normalized + "=".repeat((4 - normalized.length % 4) % 4)
+        val json = JSONObject(String(Base64.getDecoder().decode(padded), StandardCharsets.UTF_8))
         require(json.optInt("v") == 2)
         val pub = json.getString("pub")
         val id = json.getString("id")
@@ -120,6 +163,7 @@ class HostManager(private val context: Context) {
         val token = json.getString("token")
         require(token.length in 32..256 && token.all { it.code in 33..126 })
         val port = json.getInt("port"); require(port in 1..65535)
+
         fun addresses(key: String): List<String> {
             val arr = json.optJSONArray(key) ?: JSONArray()
             require(arr.length() <= 16)
@@ -127,17 +171,41 @@ class HostManager(private val context: Context) {
                 arr.getString(i).also { require(it.isNotEmpty() && it.length <= 253 && !it.contains(Regex("[\\s/?#@%]"))) }
             }
         }
-        fun endpoint(value: String, relay: Boolean): String {
-            if (value.isEmpty()) return ""
-            val parsed = URI(value)
+
+        fun endpoint(value: String?, relay: Boolean): String {
+            if (value.isNullOrBlank() || value == "null") return ""
+            var norm = value.trim()
+            if (norm.startsWith("https://")) {
+                norm = "wss://" + norm.removePrefix("https://")
+            } else if (norm.startsWith("http://")) {
+                norm = "ws://" + norm.removePrefix("http://")
+            }
+            val parsed = URI(norm)
             require(parsed.scheme in listOf("ws", "wss") && parsed.host != null && parsed.userInfo == null && parsed.query == null && parsed.fragment == null)
-            if (relay && parsed.scheme == "ws") require(parsed.host in listOf("localhost", "127.0.0.1", "[::1]", "::1"))
-            return value.trimEnd('/')
+            if (relay && parsed.scheme == "ws") {
+                require(parsed.host in listOf("localhost", "127.0.0.1", "[::1]", "::1"))
+            }
+            return norm.trimEnd('/')
         }
-        val profile = HostProfile(id = id, name = json.optString("name", "远程主机").take(128),
-            port = port, token = token, tailscaleIps = addresses("tailscale"), lanIps = addresses("lan"),
-            relayUrl = endpoint(json.optString("relay", ""), true))
-        PairingCandidate(profile, pub, endpoint(json.optString("direct_url", ""), false))
+
+        val directRaw = if (json.isNull("direct_url")) "" else json.optString("direct_url", "")
+        val directUrl = endpoint(directRaw, false)
+        val relayRaw = if (json.isNull("relay")) "" else json.optString("relay", "")
+        val relayUrl = endpoint(relayRaw, true)
+        val ssl = json.optBoolean("ssl", false) || directUrl.startsWith("wss://")
+
+        val profile = HostProfile(
+            id = id,
+            name = json.optString("name", "远程主机").take(128),
+            port = port,
+            token = token,
+            tailscaleIps = addresses("tailscale"),
+            lanIps = addresses("lan"),
+            relayUrl = relayUrl,
+            ssl = ssl,
+            directUrl = directUrl
+        )
+        PairingCandidate(profile, pub, directUrl)
     } catch (_: Exception) { null }
 
     /** Retained for the existing in-app Import button (an explicit user action). */

@@ -25,9 +25,10 @@ from core.crypto import (HostKeyManager, ServerHandshake, E2EESession, ProtocolE
                          MAX_CLIENT_FRAME_BYTES, MAX_RELAY_FRAME_BYTES)
 from core.config import HostConfig, read_private_json, write_private_json, is_safe_config_dir, HostLock
 from core.agent_manager import AgentManager
+import ssl
 from core.monitor import SystemMonitor
 from network.router import ClientConnectionState
-from network.direct_server import DirectServer, static_bytes, normalize_origin
+from network.direct_server import DirectServer, static_bytes, normalize_origin, get_or_create_tls_context
 from network.relay_client import RelayClient, validate_relay_url
 from secure_protocol import ProtocolError as RelayProtocolError
 from registry import HostRegistry
@@ -431,6 +432,47 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         messages=[client.session.decrypt_json(frame) for frame in self.raw[start:]]
         self.assertEqual([m['seq'] for m in messages if m['type']=='TERMINAL_OUTPUT'],[1,2])
 
+    async def test_attach_session_default_truncation(self):
+        client = await self.authenticate()
+        state = self.state
+        from core.session import TerminalRingBuffer
+        class RealBufferSession:
+            def __init__(self):
+                self.buffer = TerminalRingBuffer(max_bytes=1024*1024)
+                self.callback = None
+            def subscribe(self, callback): self.callback = callback
+            def unsubscribe(self, callback): self.callback = None
+            def to_dict(self): return {'session_id':'s_trunc'}
+        session = RealBufferSession()
+        # Add 20 chunks of 10 KB each (total ~200 KiB > default truncated limit of 64 KiB)
+        for i in range(20):
+            session.buffer.append(f"chunk_{i:02d}_".encode() * 1000)
+        self.manager.get_session = lambda sid: session if sid == 's_trunc' else None
+
+        # 1. Default attach (full_history=False)
+        start = len(self.raw)
+        await state.handle_raw_message(json.dumps(client.session.encrypt_json({'type': 'ATTACH_SESSION', 'session_id': 's_trunc', 'last_seq': 0})))
+        await asyncio.sleep(0.01)
+        messages = [client.session.decrypt_json(frame) for frame in self.raw[start:]]
+        attached = next(m for m in messages if m['type'] == 'SESSION_ATTACHED')
+        self.assertTrue(attached.get('is_truncated'))
+        self.assertFalse(attached.get('full_history'))
+        replayed_chunks = [m for m in messages if m['type'] == 'TERMINAL_OUTPUT']
+        self.assertLess(len(replayed_chunks), 20)
+        self.assertGreater(len(replayed_chunks), 0)
+
+        # 2. Explicit full_history=True attach
+        start = len(self.raw)
+        await state.handle_raw_message(json.dumps(client.session.encrypt_json({'type': 'ATTACH_SESSION', 'session_id': 's_trunc', 'last_seq': 0, 'full_history': True})))
+        await asyncio.sleep(0.01)
+        messages = [client.session.decrypt_json(frame) for frame in self.raw[start:]]
+        attached_full = next(m for m in messages if m['type'] == 'SESSION_ATTACHED')
+        self.assertFalse(attached_full.get('is_truncated'))
+        self.assertTrue(attached_full.get('full_history'))
+        replayed_chunks_full = [m for m in messages if m['type'] == 'TERMINAL_OUTPUT']
+        self.assertEqual(len(replayed_chunks_full), 20)
+
+
 class DirectIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp=tempfile.TemporaryDirectory(); self.config=HostConfig(self.temp.name); self.config.direct_port=0
@@ -475,6 +517,37 @@ class DirectIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_forged_host_header_refused(self):
         text=await self.request('/api/pairing','attacker.tailscale.example'); self.assertIn('403',text.splitlines()[0])
         self.assertNotIn(self.config.pairing_secret,text)
+    async def test_direct_url_and_reverse_proxy_https_origin_accepted(self):
+        self.config.direct_url = 'https://viber.example.com'
+        self.server._refresh_origins()
+        reader, writer = await asyncio.open_connection('127.0.0.1', self.port)
+        req = (f'GET / HTTP/1.1\r\n'
+               f'Host: viber.example.com\r\n'
+               f'Origin: https://viber.example.com\r\n'
+               f'Connection: close\r\n\r\n').encode()
+        writer.write(req); await writer.drain()
+        raw = await reader.read()
+        writer.close(); await writer.wait_closed()
+        status = raw.decode().splitlines()[0]
+        self.assertNotIn('403', status)
+        self.assertIn('200', status)
+    async def test_tls_direct_server_roundtrip(self):
+        tls_ctx = get_or_create_tls_context(self.config, ['localhost', '127.0.0.1'])
+        tls_cfg = HostConfig(self.temp.name)
+        tls_cfg.direct_port = 0
+        tls_server = DirectServer(tls_cfg, Manager(), Monitor(), str(Path(self.temp.name) / 'missing'), ssl_context=tls_ctx)
+        await tls_server.start()
+        tls_port = tls_cfg.direct_port
+        client_ctx = ssl.create_default_context()
+        client_ctx.check_hostname = False
+        client_ctx.verify_mode = ssl.CERT_NONE
+        try:
+            async with connect(f'wss://127.0.0.1:{tls_port}/ws', ssl=client_ctx, origin=f'https://127.0.0.1:{tls_port}') as ws:
+                c = await self.pair(ws)
+                await ws.send(json.dumps(c.session.encrypt_json({'type': 'PING', 'ts': 99})))
+                self.assertEqual(c.session.decrypt_json(json.loads(await ws.recv())), {'type': 'PONG', 'ts': 99})
+        finally:
+            await tls_server.stop()
 
 class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

@@ -32,6 +32,7 @@ fun TopBar(
     pingMs: Long,
     activeView: String, // "dashboard" | "terminal"
     activeSessionsCount: Int,
+    lastError: String? = null,
     onViewChange: (String) -> Unit,
     onQuickTerminal: () -> Unit,
     onOpenLaunch: () -> Unit,
@@ -136,7 +137,7 @@ fun TopBar(
                         ConnectionStatus.CONNECTING -> "连接中..." to ViberAmber
                         ConnectionStatus.HANDSHAKE -> "握手中..." to ViberAmber
                         ConnectionStatus.RECONNECTING -> "正在重连..." to ViberAmber
-                        ConnectionStatus.ERROR -> "口令错误" to ViberRose
+                        ConnectionStatus.ERROR -> (lastError?.substringAfterLast("] ")?.take(8) ?: "连接错误") to ViberRose
                         else -> "未连接" to TextMuted
                     }
 
@@ -145,6 +146,7 @@ fun TopBar(
                             .clip(RoundedCornerShape(12.dp))
                             .background(modeColor.copy(alpha = 0.12f))
                             .border(0.8.dp, modeColor.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                            .clickable { onOpenHostManager() }
                             .padding(horizontal = 8.dp, vertical = 3.dp)
                     ) {
                         Text(

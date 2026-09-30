@@ -87,6 +87,7 @@ fun SessionTabs(
             ) {
                 sessions.forEach { session ->
                     val isActive = session.sessionId == activeSessionId
+                    val isMobile = session.name.contains("📱") || session.name.contains("手机") || session.name.contains("Mobile")
                     val isStopped = session.status == "stopped"
                     val isWaiting = session.status == "waiting_input"
                     val statusDotColor = when {
@@ -116,13 +117,22 @@ fun SessionTabs(
                             )
                             Spacer(modifier = Modifier.width(4.dp))
                             Text(
-                                text = session.name,
+                                text = if (isMobile) "📱 " + session.name.replace("📱", "").trim() else "💻 " + session.name,
                                 color = if (isActive) ViberCyan else TextSecondary,
                                 fontSize = 11.sp,
                                 fontFamily = FontFamily.Monospace,
                                 fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
                                 maxLines = 1
                             )
+                            if (isActive && !isMobile) {
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text(
+                                    text = "[保护]",
+                                    color = ViberEmerald,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                             Spacer(modifier = Modifier.width(4.dp))
                             Icon(
                                 imageVector = Icons.Default.Close,
@@ -138,17 +148,30 @@ fun SessionTabs(
                     Spacer(modifier = Modifier.width(4.dp))
                 }
 
-                // Add Terminal Button
-                IconButton(
-                    onClick = onNewTerminal,
-                    modifier = Modifier.size(24.dp)
+                // Add Dedicated Mobile Terminal Button
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(ViberCyan.copy(alpha = 0.12f))
+                        .border(0.6.dp, ViberCyan.copy(alpha = 0.35f), RoundedCornerShape(6.dp))
+                        .clickable { onNewTerminal() }
+                        .padding(horizontal = 6.dp, vertical = 4.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Add,
-                        contentDescription = "New Terminal",
-                        tint = TextSecondary,
-                        modifier = Modifier.size(16.dp)
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "New Terminal",
+                            tint = ViberCyan,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Spacer(modifier = Modifier.width(2.dp))
+                        Text(
+                            text = "手机终端",
+                            color = ViberCyan,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
                 }
             }
         }

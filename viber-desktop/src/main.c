@@ -1,0 +1,1970 @@
+/*
+ * RemoteViber Native Linux Desktop Client
+ * Powered by GTK+ 3.0 & WebKit2GTK 4.1
+ * Completely decoupled from the server; client and server run independently.
+ * Ultra-low resource usage, smooth animations, asynchronous & non-blocking.
+ */
+
+#define _GNU_SOURCE
+#include <gtk/gtk.h>
+#include <webkit2/webkit2.h>
+#include <jsc/jsc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <signal.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <netdb.h>
+
+#define DEFAULT_HOST "127.0.0.1"
+#define DEFAULT_PORT 8765
+#define APP_TITLE "RemoteViber 终端拼图工作台"
+#define APP_ID "com.remoteviber.desktop"
+
+static FILE *s_log_file = NULL;
+static char s_log_file_path[1024] = "/tmp/viber-desktop.log";
+
+static void init_log_file(const char *custom_path) {
+    if (s_log_file) {
+        fclose(s_log_file);
+        s_log_file = NULL;
+    }
+
+    if (custom_path && custom_path[0] != '\0') {
+        g_strlcpy(s_log_file_path, custom_path, sizeof(s_log_file_path));
+    } else {
+        const char *env_path = g_getenv("VIBER_LOG_FILE");
+        if (env_path && env_path[0] != '\0') {
+            g_strlcpy(s_log_file_path, env_path, sizeof(s_log_file_path));
+        } else {
+            g_strlcpy(s_log_file_path, "/tmp/viber-desktop.log", sizeof(s_log_file_path));
+        }
+    }
+
+    s_log_file = fopen(s_log_file_path, "a");
+    if (!s_log_file) {
+        snprintf(s_log_file_path, sizeof(s_log_file_path), "./viber-desktop.log");
+        s_log_file = fopen(s_log_file_path, "a");
+    }
+
+    if (s_log_file) {
+        time_t rawtime;
+        time(&rawtime);
+        struct tm timeinfo;
+        localtime_r(&rawtime, &timeinfo);
+        char time_str[64];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+        fprintf(s_log_file, "\n================================================================================\n");
+        fprintf(s_log_file, "  RemoteViber Desktop Diagnostic Log Session: %s (PID: %d)\n", time_str, getpid());
+        fprintf(s_log_file, "================================================================================\n");
+        fflush(s_log_file);
+    }
+}
+
+/* Unified timestamped diagnostic logger with dual stdout and file streaming */
+static void app_log(const char *tag, const char *fmt, ...) {
+    time_t rawtime;
+    struct tm timeinfo;
+    time(&rawtime);
+    localtime_r(&rawtime, &timeinfo);
+    char time_str[32];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", &timeinfo);
+
+    char buffer[4096];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+
+    g_print("[%s][RemoteViber][%s] %s\n", time_str, tag, buffer);
+    fflush(stdout);
+
+    if (s_log_file) {
+        fprintf(s_log_file, "[%s][%s] %s\n", time_str, tag, buffer);
+        fflush(s_log_file);
+    }
+}
+
+typedef struct {
+    GtkWidget *window;
+    GtkWidget *header_bar;
+    GtkWidget *status_badge;
+    GtkWidget *status_label;
+    GtkWidget *stack;
+    GtkWidget *loading_box;
+    GtkWidget *spinner;
+    GtkWidget *spinner_title;
+    GtkWidget *spinner_label;
+    GtkWidget *start_host_btn;
+    GtkWidget *retry_btn;
+    GtkWidget *open_browser_btn;
+    GtkWidget *web_view;
+    WebKitWebInspector *inspector;
+
+    /* Native desktop action buttons in header */
+    GtkWidget *btn_quick_term;
+    GtkWidget *btn_launch_agent;
+    GtkWidget *btn_mosaic;
+    GtkWidget *btn_single;
+    GtkWidget *btn_dashboard;
+    GtkWidget *btn_pairing;
+    GtkWidget *btn_reload;
+    GtkWidget *btn_fullscreen;
+    GtkWidget *btn_quit;
+    
+    char host[128];
+    int port;
+    char target_url[512];
+    char app_dir[1024];
+    char local_pairing_code[2048];
+    
+    double zoom_level;
+    gboolean is_fullscreen;
+    gboolean page_loaded;
+    gboolean is_loading;
+    gboolean load_failed;
+    gboolean explicit_url;
+    gboolean has_detected_url;
+    gboolean has_fallback_tried;
+    guint poll_timer_id;
+    pid_t spawned_host_pid;
+    guint last_http_status;
+    char last_http_error[256];
+} AppState;
+
+static AppState app_state;
+static void start_poll_timer(AppState *state, guint interval_ms);
+static void stop_poll_timer(AppState *state);
+
+/* WebKit Resource & Network Diagnostic Callbacks */
+static void on_resource_failed(WebKitWebResource *resource, GError *error, gpointer user_data) {
+    (void)user_data;
+    const char *uri = webkit_web_resource_get_uri(resource);
+    app_log("RES-FAIL", "子资源加载失败: %s (domain=%s, code=%d, msg='%s')",
+            uri ? uri : "(null)",
+            error ? g_quark_to_string(error->domain) : "none",
+            error ? error->code : 0,
+            error ? error->message : "unknown");
+}
+
+static void on_resource_finished(WebKitWebResource *resource, gpointer user_data) {
+    AppState *state = (AppState *)user_data;
+    const char *uri = webkit_web_resource_get_uri(resource);
+    WebKitURIResponse *resp = webkit_web_resource_get_response(resource);
+    guint status = resp ? webkit_uri_response_get_status_code(resp) : 0;
+    const char *mime = resp ? webkit_uri_response_get_mime_type(resp) : "unknown";
+    guint64 len = resp ? webkit_uri_response_get_content_length(resp) : 0;
+    app_log("RES-DONE", "子资源就绪: %s [HTTP %u, MIME: %s, %lu 字节]",
+            uri ? uri : "(null)", status, mime ? mime : "unknown", (unsigned long)len);
+
+    if (state && uri && state->target_url[0] != '\0') {
+        char norm_target[512] = {0};
+        char norm_uri[512] = {0};
+        g_strlcpy(norm_target, state->target_url, sizeof(norm_target));
+        g_strlcpy(norm_uri, uri, sizeof(norm_uri));
+        size_t lt = strlen(norm_target);
+        if (lt > 0 && norm_target[lt - 1] == '/') norm_target[lt - 1] = '\0';
+        size_t lu = strlen(norm_uri);
+        if (lu > 0 && norm_uri[lu - 1] == '/') norm_uri[lu - 1] = '\0';
+
+        if (strcmp(norm_target, norm_uri) == 0) {
+            state->last_http_status = status;
+            if (status >= 400) {
+                state->load_failed = TRUE;
+                const char *desc = "未知错误";
+                if (status == 502) desc = "Bad Gateway (网关错误/后端未运行或代理断开)";
+                else if (status == 503) desc = "Service Unavailable (服务暂不可用)";
+                else if (status == 504) desc = "Gateway Timeout (网关超时)";
+                else if (status == 500) desc = "Internal Server Error (服务端内部错误)";
+                else if (status == 403) desc = "Forbidden (访问被拒绝/Host头未放行)";
+                else if (status == 404) desc = "Not Found (页面未找到)";
+                snprintf(state->last_http_error, sizeof(state->last_http_error), "HTTP %u %s", status, desc);
+                app_log("ERROR", "工作台主页面响应 HTTP 异常: %s", state->last_http_error);
+            }
+        }
+    }
+}
+
+static void on_resource_load_started(WebKitWebView *web_view, WebKitWebResource *resource, WebKitURIRequest *request, gpointer user_data) {
+    (void)web_view;
+    AppState *state = (AppState *)user_data;
+    const char *uri = webkit_uri_request_get_uri(request);
+    app_log("RES-START", "请求子资源: %s", uri ? uri : "(null)");
+    g_signal_connect(resource, "failed", G_CALLBACK(on_resource_failed), state);
+    g_signal_connect(resource, "finished", G_CALLBACK(on_resource_finished), state);
+}
+
+/* Post-load DOM State Diagnostics */
+static void on_dom_state_cb(GObject *object, GAsyncResult *result, gpointer user_data) {
+    AppState *state = (AppState *)user_data;
+    GError *error = NULL;
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    JSCValue *val = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
+    if (error) {
+        app_log("DOM-STATE", "获取 DOM 状态失败: %s", error->message);
+        g_error_free(error);
+    } else if (val) {
+        char *str = jsc_value_to_string(val);
+        app_log("DOM-STATE", "%s", str ? str : "(null)");
+        if (str && state) {
+            /* If #root doesn't exist and body length is 0, the page is completely blank / error */
+            if (strstr(str, "\"rootExists\":false") != NULL && strstr(str, "\"bodyLen\":0") != NULL) {
+                app_log("DOM-WARN", "DOM 检查发现页面无内容 (#root 不存在且 bodyLen=0)，页面未成功载入，回退至状态提示");
+                if (state->page_loaded) {
+                    state->page_loaded = FALSE;
+                    state->load_failed = TRUE;
+                    gtk_stack_set_visible_child(GTK_STACK(state->stack), state->loading_box);
+                    gtk_spinner_start(GTK_SPINNER(state->spinner));
+                    char err_card[1024];
+                    snprintf(err_card, sizeof(err_card),
+                        "<span size='medium' weight='bold' foreground='#ef4444'>工作台页面未正确呈现</span>\n\n"
+                        "<span foreground='#94a3b8'>页面内容为空或被服务网关拦截 (HTTP %u)。\n"
+                        "请确认服务端正在正常运行。</span>",
+                        state->last_http_status ? state->last_http_status : 502);
+                    gtk_label_set_markup(GTK_LABEL(state->spinner_label), err_card);
+                    start_poll_timer(state, 1500);
+                }
+            }
+        }
+        g_free(str);
+    }
+#else
+    (void)object; (void)result; (void)state;
+#endif
+}
+
+static gboolean on_delayed_dom_check(gpointer user_data) {
+    AppState *state = (AppState *)user_data;
+    if (!state || !state->web_view) return G_SOURCE_REMOVE;
+    const char *diag_js =
+        "(function() {"
+        "  var root = document.getElementById('root');"
+        "  return JSON.stringify({"
+        "    href: window.location.href,"
+        "    title: document.title,"
+        "    readyState: document.readyState,"
+        "    contentType: document.contentType,"
+        "    bodyLen: document.body ? document.body.innerHTML.length : -1,"
+        "    bodyPreview: document.body ? document.body.innerHTML.slice(0, 200) : '',"
+        "    rootExists: !!root,"
+        "    rootChildren: root ? root.childElementCount : -1,"
+        "    rootText: root ? root.innerText.slice(0, 100) : '',"
+        "    isSecureContext: window.isSecureContext,"
+        "    hasSubtle: !!(window.crypto && window.crypto.subtle)"
+        "  });"
+        "})()";
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(state->web_view), diag_js, -1, NULL, NULL, NULL, on_dom_state_cb, state);
+#else
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    webkit_web_view_run_javascript(WEBKIT_WEB_VIEW(state->web_view), diag_js, NULL, NULL, NULL);
+    G_GNUC_END_IGNORE_DEPRECATIONS
+#endif
+    return G_SOURCE_REMOVE;
+}
+
+/* WebKit frontend console bridge callback */
+static void on_script_message(WebKitUserContentManager *manager, WebKitJavascriptResult *result, gpointer user_data) {
+    (void)manager; (void)user_data;
+    JSCValue *val = webkit_javascript_result_get_js_value(result);
+    if (val && jsc_value_is_string(val)) {
+        char *str = jsc_value_to_string(val);
+        app_log("WEB-JS", "%s", str);
+        g_free(str);
+    }
+}
+
+/* Check if TCP socket connects non-blockingly (supports IPv4, IPv6, hostnames) */
+static gboolean is_port_open(const char *host, int port) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) {
+        return FALSE;
+    }
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        return FALSE;
+    }
+
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    int r = connect(sock, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+
+    if (r == 0) {
+        close(sock);
+        return TRUE;
+    }
+
+    if (errno == EINPROGRESS) {
+        fd_set set;
+        FD_ZERO(&set);
+        FD_SET(sock, &set);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 }; /* 250ms */
+        if (select(sock + 1, NULL, &set, NULL, &tv) > 0) {
+            int so_error = 0;
+            socklen_t len = sizeof(so_error);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
+            close(sock);
+            return (so_error == 0);
+        }
+    }
+
+    close(sock);
+    return FALSE;
+}
+
+/* Probe whether the target port is serving plain HTTP or HTTPS */
+static gboolean probe_is_plain_http(const char *host, int port) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) {
+        app_log("PROBE", "getaddrinfo 解析 %s:%d 失败", host, port);
+        return FALSE;
+    }
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        app_log("PROBE", "创建探测套接字失败: %s", strerror(errno));
+        freeaddrinfo(res);
+        return FALSE;
+    }
+
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 }; /* 1000ms timeout */
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+        app_log("PROBE", "连接 %s:%d 探测失败: %s", host, port, strerror(errno));
+        freeaddrinfo(res);
+        close(sock);
+        return FALSE;
+    }
+    freeaddrinfo(res);
+
+    char probe_req[256];
+    snprintf(probe_req, sizeof(probe_req), "GET / HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n", host, port);
+    app_log("PROBE", "发送 HTTP/1.1 协议探测包 -> %s:%d (Host: %s:%d)", host, port, host, port);
+    send(sock, probe_req, strlen(probe_req), 0);
+
+    char buf[64] = {0};
+    ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
+    int saved_errno = errno;
+    close(sock);
+
+    if (n > 0) {
+        buf[n] = '\0';
+        char clean_preview[32] = {0};
+        for (int i = 0; i < n && i < 28; i++) {
+            clean_preview[i] = (buf[i] >= 32 && buf[i] < 127) ? buf[i] : '.';
+        }
+        app_log("PROBE", "收到响应数据 (%zd 字节): '%s'", n, clean_preview);
+        if (strncmp(buf, "HTTP/", 5) == 0) {
+            int code = (n >= 12) ? atoi(buf + 9) : 0;
+            if (code == 502) {
+                app_log("PROBE", "服务端返回 HTTP 502 Bad Gateway (网关错误/后端未运行或代理断开)");
+            } else if (code >= 400) {
+                app_log("PROBE", "服务端返回 HTTP 异常状态码: %d", code);
+            } else {
+                app_log("PROBE", "检测到 HTTP 响应状态行 (HTTP %d) -> 确认服务端运行在 HTTP 明文协议", code);
+            }
+            return TRUE;
+        } else {
+            app_log("PROBE", "响应未包含 HTTP 状态行 -> 确认服务端运行在 HTTPS/TLS 模式");
+            return FALSE;
+        }
+    } else if (n == 0) {
+        app_log("PROBE", "服务端主动断开连接 (0 字节) -> 确认服务端运行在 HTTPS/TLS (非明文 HTTP)");
+        return FALSE;
+    } else {
+        app_log("PROBE", "接收超时或错误 (errno: %s) -> 预设为 HTTPS/TLS", strerror(saved_errno));
+        return FALSE;
+    }
+}
+
+/* Dispatch JavaScript into WebKit view */
+static void dispatch_web_js(WebKitWebView *web_view, const char *js) {
+    if (!web_view || !js) return;
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    webkit_web_view_evaluate_javascript(web_view, js, -1, NULL, NULL, NULL, NULL, NULL);
+#else
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    webkit_web_view_run_javascript(web_view, js, NULL, NULL, NULL);
+    G_GNUC_END_IGNORE_DEPRECATIONS
+#endif
+}
+
+/* Search potential configuration directories for one matching state->port */
+static char *find_matching_config_dir(int port) {
+    GPtrArray *dirs = g_ptr_array_new_with_free_func(g_free);
+    
+    /* 1. Environment override */
+    const char *env_dir = g_getenv("VIBER_CONFIG_DIR");
+    if (env_dir && *env_dir) {
+        g_ptr_array_add(dirs, g_strdup(env_dir));
+    }
+
+    /* 2. User home directory */
+    const char *home = g_get_home_dir();
+    if (home && *home) {
+        g_ptr_array_add(dirs, g_build_filename(home, ".viber", NULL));
+    }
+
+    // 3. Scan user home directories under /home for multi-user/root support
+    GDir *home_root = g_dir_open("/home", 0, NULL);
+    if (home_root) {
+        const char *user_name;
+        while ((user_name = g_dir_read_name(home_root)) != NULL) {
+            char *user_viber = g_build_filename("/home", user_name, ".viber", NULL);
+            g_ptr_array_add(dirs, user_viber);
+        }
+        g_dir_close(home_root);
+    }
+
+    /* 4. Common and local fallbacks */
+    g_ptr_array_add(dirs, g_strdup("./dist-bin"));
+    g_ptr_array_add(dirs, g_strdup("."));
+
+    char *matched_dir = NULL;
+    for (guint i = 0; i < dirs->len; i++) {
+        const char *d = (const char *)g_ptr_array_index(dirs, i);
+        char *cfg_file = g_build_filename(d, "viber_config.json", NULL);
+        char *contents = NULL;
+        if (g_file_get_contents(cfg_file, &contents, NULL, NULL)) {
+            char port_needle[64];
+            snprintf(port_needle, sizeof(port_needle), "\"direct_port\": %d", port);
+            if (strstr(contents, port_needle) != NULL) {
+                matched_dir = g_strdup(d);
+                g_free(contents);
+                g_free(cfg_file);
+                break;
+            }
+            g_free(contents);
+        }
+        g_free(cfg_file);
+    }
+
+    g_ptr_array_unref(dirs);
+    return matched_dir;
+}
+
+/* Read local host pairing code if available */
+static void find_local_pairing_code(AppState *state) {
+    if (state->local_pairing_code[0] != '\0') return;
+    if (strcmp(state->host, "127.0.0.1") != 0 && strcmp(state->host, "localhost") != 0) return;
+
+    char *exe = g_strdup_printf("%s/viber-host-linux-x86_64", state->app_dir);
+    if (access(exe, X_OK) != 0) {
+        g_free(exe);
+        exe = g_strdup_printf("%s/../dist-bin/viber-host-linux-x86_64", state->app_dir);
+    }
+    if (access(exe, X_OK) != 0) {
+        g_free(exe);
+        exe = g_strdup("./dist-bin/viber-host-linux-x86_64");
+    }
+    if (access(exe, X_OK) != 0) {
+        g_free(exe);
+        app_log("AUTH", "未找到本地服务端可执行文件，跳过自动配对");
+        return;
+    }
+
+    char *matched_cfg_dir = find_matching_config_dir(state->port);
+    char *cmd = NULL;
+    if (matched_cfg_dir) {
+        app_log("AUTH", "已匹配到端口 %d 对应的本地配置目录: %s", state->port, matched_cfg_dir);
+        cmd = g_strdup_printf("'%s' --config-dir '%s' --pair-info 2>/dev/null", exe, matched_cfg_dir);
+        g_free(matched_cfg_dir);
+    } else {
+        cmd = g_strdup_printf("'%s' --pair-info 2>/dev/null", exe);
+    }
+    g_free(exe);
+    app_log("AUTH", "正在探测本地配对信息: %s", cmd);
+    FILE *fp = popen(cmd, "r");
+    g_free(cmd);
+    if (!fp) {
+        app_log("AUTH", "执行 --pair-info 失败: %s", strerror(errno));
+        return;
+    }
+
+    char line[4096];
+    while (fgets(line, sizeof(line), fp)) {
+        char *trimmed = g_strstrip(line);
+        if (g_str_has_prefix(trimmed, "Local UI:")) {
+            char *url_part = g_strstrip(trimmed + 9);
+            if (!state->explicit_url && url_part[0] != '\0') {
+                GUri *u = g_uri_parse(url_part, G_URI_FLAGS_NONE, NULL);
+                if (u) {
+                    int p = g_uri_get_port(u);
+                    if (p <= 0 || p == state->port) {
+                        strncpy(state->target_url, url_part, sizeof(state->target_url) - 1);
+                        state->has_detected_url = TRUE;
+                        app_log("AUTH", "从 --pair-info 识别到默认工作台地址: %s", state->target_url);
+                    }
+                    g_uri_unref(u);
+                }
+            }
+        }
+        if (g_str_has_prefix(trimmed, "eyJ2")) {
+            strncpy(state->local_pairing_code, trimmed, sizeof(state->local_pairing_code) - 1);
+            break;
+        }
+    }
+    pclose(fp);
+    if (state->local_pairing_code[0] != '\0') {
+        app_log("AUTH", "成功获取本机配对凭据 (长度: %zu 字节)，将自动注入本地工作台安全认证", strlen(state->local_pairing_code));
+    }
+}
+
+static gboolean check_host_ready_cb(gpointer user_data);
+
+/* Helper to stop polling timer safely */
+static void stop_poll_timer(AppState *state) {
+    if (state->poll_timer_id != 0) {
+        g_source_remove(state->poll_timer_id);
+        state->poll_timer_id = 0;
+    }
+}
+
+/* Helper to start polling timer safely without duplicates */
+static void start_poll_timer(AppState *state, guint interval_ms) {
+    stop_poll_timer(state);
+    state->poll_timer_id = g_timeout_add(interval_ms, check_host_ready_cb, state);
+}
+
+/* Polling callback: wait for host server to become available */
+static gboolean check_host_ready_cb(gpointer user_data) {
+    AppState *state = (AppState *)user_data;
+
+    if (state->page_loaded) {
+        state->poll_timer_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    if (state->is_loading) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    static gboolean s_notified_waiting = FALSE;
+
+    if (is_port_open(state->host, state->port)) {
+        s_notified_waiting = FALSE;
+        app_log("SOCKET", "服务端端口已就绪 (%s:%d)", state->host, state->port);
+
+        find_local_pairing_code(state);
+
+        if (!state->explicit_url && !state->has_fallback_tried && state->target_url[0] == '\0') {
+            if (probe_is_plain_http(state->host, state->port)) {
+                snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
+            } else {
+                snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
+            }
+        }
+
+        app_log("CONNECT", "服务端已连接 (%s)，正在载入工作台...", state->target_url);
+
+        gtk_label_set_markup(GTK_LABEL(state->spinner_label),
+            "<span size='medium' weight='bold' foreground='#38bdf8'>已连接服务端！</span>\n\n"
+            "<span size='small' foreground='#94a3b8'>正在解析并呈现终端拼图网格工作台...</span>");
+        
+        char status_str[128];
+        snprintf(status_str, sizeof(status_str),
+            "<span color='#10b981' font_weight='bold'>●</span> <span color='#38bdf8' font_size='small'>%d 准备中</span>", state->port);
+        gtk_label_set_markup(GTK_LABEL(state->status_label), status_str);
+
+        state->is_loading = TRUE;
+        state->load_failed = FALSE;
+        state->poll_timer_id = 0;
+        app_log("LOAD", "开始通过 WebKit 加载 URI: %s", state->target_url);
+        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
+        return G_SOURCE_REMOVE;
+    }
+
+    /* Server not reachable yet: update waiting screen and notify in terminal */
+    if (!s_notified_waiting) {
+        s_notified_waiting = TRUE;
+        app_log("POLL", "正在等待服务端上线 (%s:%d)...", state->host, state->port);
+        g_print("[RemoteViber] 提示: 可点击 GUI 界面【一键启动本地服务端】，或在另一终端窗口启动：\n");
+        g_print("      ./dist-bin/viber-host-linux-x86_64 --port %d\n", state->port);
+        fflush(stdout);
+    }
+
+    char wait_msg[1024];
+    snprintf(wait_msg, sizeof(wait_msg),
+        "<span size='medium' weight='bold' foreground='#38bdf8'>正在等待连接服务端 (%s)...</span>\n\n"
+        "<span size='small' foreground='#94a3b8'>服务端尚未启动。点击下方绿色按钮可直接在 GUI 启动：</span>\n\n"
+        "<span font_family='monospace' size='medium' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
+        "<span size='small' foreground='#64748b'>服务端启动后客户端将毫秒级自动感应并呈现拼图终端</span>",
+        state->target_url, state->port);
+    gtk_label_set_markup(GTK_LABEL(state->spinner_label), wait_msg);
+
+    char badge_str[128];
+    snprintf(badge_str, sizeof(badge_str),
+        "<span color='#f59e0b' font_weight='bold'>○</span> <span color='#94a3b8' font_size='small'>等待服务 (%d)</span>", state->port);
+    gtk_label_set_markup(GTK_LABEL(state->status_label), badge_str);
+
+    return G_SOURCE_CONTINUE;
+}
+
+/* Retry / Reconnect button handler */
+static void on_retry_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    app_log("POLL", "用户触发手动重试连接 (host: %s, port: %d)", state->host, state->port);
+    gtk_spinner_start(GTK_SPINNER(state->spinner));
+    state->page_loaded = FALSE;
+    state->is_loading = FALSE;
+    state->load_failed = FALSE;
+    state->has_fallback_tried = FALSE;
+    stop_poll_timer(state);
+    if (check_host_ready_cb(state) == G_SOURCE_CONTINUE) {
+        start_poll_timer(state, 1000);
+    }
+}
+
+/* Launch local host server directly from GUI */
+static void on_start_host_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    if (is_port_open(state->host, state->port) && state->page_loaded && state->last_http_status == 200) {
+        app_log("HOST", "服务端已在正常运行中 (端口: %d)", state->port);
+        gtk_label_set_markup(GTK_LABEL(state->spinner_label),
+            "<span size='medium' weight='bold' foreground='#38bdf8'>服务端已在运行！</span>\n\n"
+            "<span size='small' foreground='#94a3b8'>正在载入工作台...</span>");
+        on_retry_clicked(NULL, state);
+        return;
+    }
+
+    app_log("HOST", "正在通过 GUI 一键拉起本地服务端 (端口 %d)...", state->port);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%d", state->port);
+        char *exe = g_strdup_printf("%s/viber-host-linux-x86_64", state->app_dir);
+        if (access(exe, X_OK) != 0) {
+            g_free(exe);
+            exe = g_strdup_printf("%s/../dist-bin/viber-host-linux-x86_64", state->app_dir);
+        }
+        if (access(exe, X_OK) != 0) {
+            g_free(exe);
+            exe = g_strdup("./dist-bin/viber-host-linux-x86_64");
+        }
+        if (access(exe, X_OK) != 0) {
+            g_free(exe);
+            exe = g_strdup("./viber-host-linux-x86_64");
+        }
+        execl(exe, "viber-host-linux-x86_64", "--port", port_str, NULL);
+        g_free(exe);
+        _exit(127);
+    } else if (pid > 0) {
+        state->spawned_host_pid = pid;
+        app_log("HOST", "本地服务端进程已拉起 (PID: %d)，等待端口就绪...", pid);
+        gtk_label_set_markup(GTK_LABEL(state->spinner_label),
+            "<span size='medium' weight='bold' foreground='#34d399'>本地服务端进程已拉起！</span>\n\n"
+            "<span size='small' foreground='#94a3b8'>正在等待端口就绪并自动载入工作台...</span>");
+        start_poll_timer(state, 500);
+    }
+}
+
+/* Open in system browser button handler */
+static void on_open_browser_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    gtk_show_uri_on_window(GTK_WINDOW(state->window), state->target_url, GDK_CURRENT_TIME, NULL);
+}
+
+/* Protocol toggle button handler (HTTP <-> HTTPS) */
+static void on_toggle_protocol_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    state->explicit_url = TRUE;
+    state->has_fallback_tried = TRUE;
+    if (g_str_has_prefix(state->target_url, "https://")) {
+        snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
+    } else {
+        snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
+    }
+    app_log("MANUAL", "用户手动切换连接协议为: %s", state->target_url);
+    on_retry_clicked(NULL, state);
+}
+
+/* WebKit load-changed handler */
+static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpointer user_data) {
+    AppState *state = (AppState *)user_data;
+    const char *current_uri = webkit_web_view_get_uri(web_view);
+
+    if (event == WEBKIT_LOAD_STARTED) {
+        state->is_loading = TRUE;
+        state->load_failed = FALSE;
+        state->last_http_status = 0;
+        state->last_http_error[0] = '\0';
+        app_log("LOAD", "事件 WEBKIT_LOAD_STARTED (URI: %s)", current_uri ? current_uri : state->target_url);
+    } else if (event == WEBKIT_LOAD_REDIRECTED) {
+        app_log("LOAD", "事件 WEBKIT_LOAD_REDIRECTED (新 URI: %s)", current_uri ? current_uri : "unknown");
+    } else if (event == WEBKIT_LOAD_COMMITTED) {
+        state->load_failed = FALSE;
+        app_log("LOAD", "事件 WEBKIT_LOAD_COMMITTED (URI: %s)", current_uri ? current_uri : state->target_url);
+        gtk_label_set_markup(GTK_LABEL(state->spinner_label),
+            "<span size='medium' weight='bold' foreground='#38bdf8'>已建立通信连接</span>\n\n"
+            "<span size='small' foreground='#94a3b8'>正在解析渲染拼图工作台视图...</span>");
+        
+        /* Auto-inject local pairing code if available */
+        if (state->local_pairing_code[0] != '\0') {
+            app_log("AUTH", "COMMITTED 阶段注入本机配对凭据至 sessionStorage");
+            char *js = g_strdup_printf(
+                "try {"
+                "  sessionStorage.setItem('viber_local_pairing_code', '%s');"
+                "  if (window.viber_import_pairing) { window.viber_import_pairing('%s'); }"
+                "} catch(e) {}",
+                state->local_pairing_code, state->local_pairing_code);
+            dispatch_web_js(web_view, js);
+            g_free(js);
+        }
+    } else if (event == WEBKIT_LOAD_FINISHED) {
+        state->is_loading = FALSE;
+
+        /* Extract main resource status code directly from WebKitWebView if available */
+        WebKitWebResource *main_res = webkit_web_view_get_main_resource(web_view);
+        if (main_res) {
+            WebKitURIResponse *resp = webkit_web_resource_get_response(main_res);
+            if (resp) {
+                guint code = webkit_uri_response_get_status_code(resp);
+                if (code > 0) state->last_http_status = code;
+            }
+        }
+
+        app_log("LOAD", "事件 WEBKIT_LOAD_FINISHED (URI: %s, load_failed=%d, http_status=%u)",
+                current_uri ? current_uri : state->target_url, state->load_failed, state->last_http_status);
+        if (state->load_failed || state->last_http_status >= 400) {
+            /* Aborted or failed load; keep loading view visible, do not show blank screen! */
+            app_log("LOAD", "加载失败或服务端返回 HTTP 异常状态码 (%u)，保持并显示错误引导界面", state->last_http_status);
+            state->page_loaded = FALSE;
+            gtk_stack_set_visible_child(GTK_STACK(state->stack), state->loading_box);
+            gtk_spinner_start(GTK_SPINNER(state->spinner));
+
+            char err_card[2048];
+            if (state->last_http_status == 502) {
+                snprintf(err_card, sizeof(err_card),
+                    "<span size='large' weight='bold' foreground='#ef4444'>未能载入工作台 (HTTP 502 Bad Gateway)</span>\n\n"
+                    "<span foreground='#f87171'>服务端或网关响应异常：端口 %d 返回了 502 Bad Gateway。</span>\n\n"
+                    "<span foreground='#94a3b8'>可能原因：</span>\n"
+                    "<span foreground='#cbd5e1'>  1. 端口 %d 被反向代理或 Docker 容器占用，但后端未运行\n"
+                    "  2. Viber Host 服务端进程未启动或已意外退出</span>\n\n"
+                    "<span foreground='#94a3b8'>解决方法：</span>\n"
+                    "<span foreground='#34d399'>  • 点击下方绿色【⚡ 一键启动本地服务端】按钮启动主机服务\n</span>"
+                    "<span foreground='#38bdf8'>  • 或在终端窗口启动: ./viber-host-linux-x86_64 --port %d\n</span>"
+                    "<span foreground='#f59e0b'>  • 检查端口占用情况: lsof -i :%d 或 netstat -tlpn | grep %d</span>",
+                    state->port, state->port, state->port, state->port, state->port);
+            } else if (state->last_http_status >= 400) {
+                snprintf(err_card, sizeof(err_card),
+                    "<span size='large' weight='bold' foreground='#ef4444'>未能载入工作台 (%s)</span>\n\n"
+                    "<span foreground='#f87171'>服务端响应了 HTTP 异常状态码：%s</span>\n\n"
+                    "<span foreground='#94a3b8'>请确认服务端正在正常运行：</span>\n"
+                    "<span font_family='monospace' foreground='#34d399'>  ./viber-host-linux-x86_64 --port %d</span>",
+                    state->last_http_error, state->last_http_error, state->port);
+            } else {
+                snprintf(err_card, sizeof(err_card),
+                    "<span size='medium' weight='bold' foreground='#ef4444'>未能载入工作台页面 (%s)</span>\n\n"
+                    "<span size='small' foreground='#94a3b8'>请确认服务端正在运行，或点击【一键启动本地服务端】：</span>\n"
+                    "<span font_family='monospace' size='small' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
+                    "<span size='small' foreground='#64748b'>正在自动检测重新连接...</span>",
+                    state->target_url, state->port);
+            }
+            gtk_label_set_markup(GTK_LABEL(state->spinner_label), err_card);
+
+            char badge_str[128];
+            snprintf(badge_str, sizeof(badge_str),
+                "<span color='#ef4444' font_weight='bold'>✕</span> <span color='#94a3b8' font_size='small'>异常 (%d)</span>", state->port);
+            gtk_label_set_markup(GTK_LABEL(state->status_label), badge_str);
+
+            start_poll_timer(state, 1500);
+            return;
+        }
+
+        state->page_loaded = TRUE;
+        state->has_fallback_tried = FALSE;
+        stop_poll_timer(state);
+        gtk_spinner_stop(GTK_SPINNER(state->spinner));
+        gtk_stack_set_visible_child(GTK_STACK(state->stack), state->web_view);
+        gtk_widget_queue_draw(state->web_view);
+        gtk_widget_queue_draw(state->window);
+        
+        char status_str[128];
+        snprintf(status_str, sizeof(status_str),
+            "<span color='#10b981' font_weight='bold'>●</span> <span color='#38bdf8' font_size='small'>%d 在线</span>", state->port);
+        gtk_label_set_markup(GTK_LABEL(state->status_label), status_str);
+        app_log("SUCCESS", "工作台已成功呈现！(端口: %d 在线)", state->port);
+
+        if (state->local_pairing_code[0] != '\0') {
+            app_log("AUTH", "FINISHED 阶段确保配对凭据导入工作台");
+            char *js = g_strdup_printf(
+                "try {"
+                "  sessionStorage.setItem('viber_local_pairing_code', '%s');"
+                "  if (window.viber_import_pairing) { window.viber_import_pairing('%s'); }"
+                "} catch(e) {}",
+                state->local_pairing_code, state->local_pairing_code);
+            dispatch_web_js(web_view, js);
+            g_free(js);
+        }
+
+        /* Trigger DOM verification checks after 500ms and 1500ms to log frontend render state */
+        g_timeout_add(500, on_delayed_dom_check, state);
+        g_timeout_add(1500, on_delayed_dom_check, state);
+    }
+}
+
+/* WebKit load-failed handler */
+static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, gchar *failing_uri, GError *error, gpointer user_data) {
+    (void)web_view; (void)event;
+    AppState *state = (AppState *)user_data;
+
+    const char *err_dom = error ? g_quark_to_string(error->domain) : "none";
+    int err_code = error ? error->code : 0;
+    const char *err_msg = error && error->message ? error->message : "未知错误";
+
+    app_log("ERROR", "WebKit 加载失败通知: failing_uri='%s', domain='%s', code=%d, msg='%s'",
+            failing_uri ? failing_uri : "(null)", err_dom, err_code, err_msg);
+
+    /* 1. Ignore benign cancellation errors (e.g. subresource abort, reload, redirect) */
+    if (error) {
+        if (g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED) ||
+            g_error_matches(error, WEBKIT_POLICY_ERROR, WEBKIT_POLICY_ERROR_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE) ||
+            g_error_matches(error, WEBKIT_POLICY_ERROR, WEBKIT_POLICY_ERROR_CANNOT_SHOW_MIME_TYPE) ||
+            (error->message && (strstr(error->message, "cancelled") != NULL ||
+                                strstr(error->message, "canceled") != NULL))) {
+            app_log("LOAD", "忽略良性取消/重定向错误: %s", err_msg);
+            return TRUE;
+        }
+    }
+
+    /* 2. Subresource check: if failing_uri is not the main page URL, completely ignore it */
+    if (failing_uri && state->target_url[0] != '\0') {
+        char norm_target[512] = {0};
+        char norm_failing[512] = {0};
+        g_strlcpy(norm_target, state->target_url, sizeof(norm_target));
+        g_strlcpy(norm_failing, failing_uri, sizeof(norm_failing));
+        size_t lt = strlen(norm_target);
+        if (lt > 0 && norm_target[lt - 1] == '/') norm_target[lt - 1] = '\0';
+        size_t lf = strlen(norm_failing);
+        if (lf > 0 && norm_failing[lf - 1] == '/') norm_failing[lf - 1] = '\0';
+
+        if (strcmp(norm_target, norm_failing) != 0) {
+            app_log("LOAD", "忽略非主页面子资源加载失败: %s", failing_uri);
+            return TRUE;
+        }
+    }
+
+    /* 3. If already loaded, ignore any subresource failures */
+    if (state->page_loaded) {
+        app_log("LOAD", "主页面已正常加载运行，忽略后发网络失败");
+        return TRUE;
+    }
+
+    /* 4. If HTTPS failed due to TLS handshake / certificate / protocol error, fallback directly to HTTP */
+    if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "https://")) {
+        if (error && (error->domain == g_tls_error_quark() ||
+                      (error->message && (strstr(error->message, "non-properly terminated") != NULL ||
+                                          strstr(error->message, "unexpected TLS packet") != NULL ||
+                                          strstr(error->message, "wrong version number") != NULL ||
+                                          strstr(error->message, "handshake") != NULL ||
+                                          strstr(error->message, "TLS") != NULL ||
+                                          strstr(error->message, "SSL") != NULL)))) {
+            state->has_fallback_tried = TRUE;
+            snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
+            app_log("FALLBACK", "HTTPS 加载遇到 TLS 异常，自动降级至 HTTP 明文协议重试: %s", state->target_url);
+            state->is_loading = TRUE;
+            state->load_failed = FALSE;
+            webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
+            return TRUE;
+        }
+    }
+
+    /* 5. If HTTP failed, fallback to HTTPS */
+    if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "http://")) {
+        state->has_fallback_tried = TRUE;
+        snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
+        app_log("FALLBACK", "HTTP 连接失败，自动切换至 HTTPS 安全模式重新加载: %s", state->target_url);
+        state->is_loading = TRUE;
+        state->load_failed = FALSE;
+        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
+        return TRUE;
+    }
+
+    app_log("ERROR", "工作台页面加载失败: %s (原因: %s)", failing_uri ? failing_uri : "", err_msg);
+
+    state->load_failed = TRUE;
+    state->page_loaded = FALSE;
+    state->is_loading = FALSE;
+    gtk_stack_set_visible_child(GTK_STACK(state->stack), state->loading_box);
+    gtk_spinner_start(GTK_SPINNER(state->spinner));
+
+    char err_msg_ui[1024];
+    snprintf(err_msg_ui, sizeof(err_msg_ui),
+        "<span size='medium' weight='bold' foreground='#ef4444'>未能载入工作台页面 (%s)</span>\n\n"
+        "<span size='small' foreground='#94a3b8'>请确认服务端正在运行，或点击【一键启动本地服务端】：</span>\n"
+        "<span font_family='monospace' size='small' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
+        "<span size='small' foreground='#64748b'>正在自动检测重新连接...</span>",
+        state->target_url, state->port);
+    gtk_label_set_markup(GTK_LABEL(state->spinner_label), err_msg_ui);
+
+    char badge_str[128];
+    snprintf(badge_str, sizeof(badge_str),
+        "<span color='#ef4444' font_weight='bold'>✕</span> <span color='#94a3b8' font_size='small'>已断开 (%d)</span>", state->port);
+    gtk_label_set_markup(GTK_LABEL(state->status_label), badge_str);
+
+    start_poll_timer(state, 1000);
+    return TRUE;
+}
+
+/* WebKit load-failed-with-tls-errors handler: allow self-signed TLS certificates for LAN/remote viber host */
+static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *failing_uri,
+                                               GTlsCertificate *certificate, GTlsCertificateFlags errors,
+                                               gpointer user_data) {
+    (void)errors;
+    AppState *state = (AppState *)user_data;
+    app_log("TLS", "检测到自签名/自定义 TLS 证书 (failing_uri: '%s', flags: 0x%x)", failing_uri ? failing_uri : "(null)", (guint)errors);
+    fflush(stdout);
+
+    char host[256] = {0};
+    if (failing_uri) {
+        GUri *parsed = g_uri_parse(failing_uri, G_URI_FLAGS_NONE, NULL);
+        if (parsed) {
+            const char *h = g_uri_get_host(parsed);
+            if (h) strncpy(host, h, sizeof(host) - 1);
+            g_uri_unref(parsed);
+        }
+    }
+    if (host[0] == '\0') {
+        strncpy(host, state->host, sizeof(host) - 1);
+    }
+
+    WebKitWebContext *context = webkit_web_view_get_context(web_view);
+    if (context && certificate) {
+        app_log("TLS", "正在为目标主机 '%s' 信任自签名证书...", host);
+        webkit_web_context_allow_tls_certificate_for_host(context, certificate, host);
+        app_log("TLS", "已成功将主机 '%s' 信任证书写入 WebKit 上下文，立即重试载入...", host);
+        state->load_failed = FALSE;
+        webkit_web_view_load_uri(web_view, failing_uri ? failing_uri : state->target_url);
+    }
+    return TRUE;
+}
+
+/* WebKit WebProcess crash handler */
+static void on_web_process_terminated(WebKitWebView *web_view, WebKitWebProcessTerminationReason reason, gpointer user_data) {
+    AppState *state = (AppState *)user_data;
+    const char *reason_desc = "未知原因";
+    if (reason == WEBKIT_WEB_PROCESS_CRASHED) reason_desc = "渲染进程异常崩溃 (CRASHED - 检查 GPU/Mesa/seccomp 驱动)";
+    else if (reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT) reason_desc = "内存消耗超限 (EXCEEDED_MEMORY_LIMIT)";
+    app_log("CRASH", "网页渲染进程异常退出! 原因: %s (代码: %d)，正在自动重连...", reason_desc, (int)reason);
+
+    state->load_failed = TRUE;
+    state->page_loaded = FALSE;
+    state->is_loading = FALSE;
+    gtk_stack_set_visible_child(GTK_STACK(state->stack), state->loading_box);
+    gtk_label_set_markup(GTK_LABEL(state->spinner_label),
+        "<span size='small' foreground='#f59e0b'>网页渲染进程正在自动恢复，请稍候...</span>");
+    gtk_spinner_start(GTK_SPINNER(state->spinner));
+
+    webkit_web_view_reload(web_view);
+}
+
+/* Apply GTK custom styles */
+static void apply_dark_theme(void) {
+    GtkSettings *gtk_settings = gtk_settings_get_default();
+    if (gtk_settings) {
+        g_object_set(gtk_settings,
+            "gtk-xft-antialias", 1,
+            "gtk-xft-hinting", 1,
+            "gtk-xft-hintstyle", "hintslight",
+            "gtk-xft-rgba", "rgb",
+            NULL);
+    }
+
+    GtkCssProvider *provider = gtk_css_provider_new();
+    const char *css =
+        "window, .remote-viber-window {"
+        "  background-color: #060911;"
+        "  color: #f8fafc;"
+        "  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Noto Sans\", Ubuntu, Cantarell, sans-serif;"
+        "}"
+        "headerbar, .remote-viber-header {"
+        "  background-color: #0b0f19;"
+        "  background-image: linear-gradient(to bottom, #0d1424, #080c16);"
+        "  border-bottom: 1px solid rgba(56, 189, 248, 0.25);"
+        "  padding: 4px 8px;"
+        "  min-height: 44px;"
+        "  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);"
+        "}"
+        "headerbar .title, .titlebar .title {"
+        "  color: #f8fafc;"
+        "  font-weight: 700;"
+        "  font-size: 13px;"
+        "  letter-spacing: 0.5px;"
+        "}"
+        "headerbar .subtitle, .titlebar .subtitle {"
+        "  color: #94a3b8;"
+        "  font-size: 11px;"
+        "}"
+        ".status-pill {"
+        "  background-color: rgba(15, 23, 42, 0.85);"
+        "  border: 1px solid rgba(56, 189, 248, 0.25);"
+        "  border-radius: 9999px;"
+        "  padding: 2px 10px;"
+        "}"
+        "headerbar button, .titlebar button, button.action-btn {"
+        "  background-color: rgba(30, 41, 59, 0.75);"
+        "  background-image: none;"
+        "  border: 1px solid rgba(56, 189, 248, 0.3);"
+        "  color: #e2e8f0;"
+        "  border-radius: 8px;"
+        "  padding: 4px 12px;"
+        "  font-size: 12px;"
+        "  font-weight: 600;"
+        "  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Noto Sans\", Ubuntu, Cantarell, sans-serif;"
+        "  box-shadow: none;"
+        "  text-shadow: none;"
+        "  transition: all 150ms ease-in-out;"
+        "}"
+        "headerbar button:hover, .titlebar button:hover, button.action-btn:hover {"
+        "  background-color: rgba(56, 189, 248, 0.18);"
+        "  border-color: rgba(56, 189, 248, 0.6);"
+        "  color: #38bdf8;"
+        "  box-shadow: 0 0 12px rgba(56, 189, 248, 0.25);"
+        "}"
+        "headerbar button:active, .titlebar button:active, button.action-btn:active {"
+        "  background-color: rgba(56, 189, 248, 0.35);"
+        "  border-color: #38bdf8;"
+        "  color: #ffffff;"
+        "}"
+        "button.action-btn.quick-term-btn {"
+        "  background-color: #0284c7;"
+        "  background-image: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);"
+        "  border-color: rgba(56, 189, 248, 0.6);"
+        "  color: #ffffff;"
+        "  font-weight: 600;"
+        "  box-shadow: 0 2px 8px rgba(2, 132, 199, 0.35);"
+        "}"
+        "button.action-btn.quick-term-btn:hover {"
+        "  background-color: #0ea5e9;"
+        "  border-color: #38bdf8;"
+        "  box-shadow: 0 0 16px rgba(56, 189, 248, 0.5);"
+        "}"
+        "headerbar button.quit-btn:hover, button.action-btn.quit-btn:hover {"
+        "  background-color: rgba(239, 68, 68, 0.2);"
+        "  border-color: rgba(239, 68, 68, 0.5);"
+        "  color: #ef4444;"
+        "  box-shadow: 0 0 12px rgba(239, 68, 68, 0.3);"
+        "}"
+        ".glass-card {"
+        "  background-color: rgba(13, 20, 36, 0.92);"
+        "  background-image: linear-gradient(135deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%);"
+        "  border: 1px solid rgba(56, 189, 248, 0.3);"
+        "  border-radius: 20px;"
+        "  padding: 36px 48px;"
+        "  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.7), 0 0 40px rgba(56, 189, 248, 0.1);"
+        "  min-width: 540px;"
+        "}"
+        ".tag-badge {"
+        "  background-color: rgba(56, 189, 248, 0.12);"
+        "  border: 1px solid rgba(56, 189, 248, 0.3);"
+        "  border-radius: 9999px;"
+        "  padding: 3px 14px;"
+        "}"
+        ".start-host-btn {"
+        "  background-color: #059669;"
+        "  background-image: linear-gradient(135deg, #10b981 0%, #059669 100%);"
+        "  border: 1px solid rgba(52, 211, 153, 0.45);"
+        "  border-radius: 10px;"
+        "  color: #ffffff;"
+        "  font-weight: 700;"
+        "  font-size: 13px;"
+        "  padding: 9px 22px;"
+        "  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.35);"
+        "  transition: all 180ms ease-in-out;"
+        "}"
+        ".start-host-btn:hover {"
+        "  background-color: #10b981;"
+        "  background-image: linear-gradient(135deg, #34d399 0%, #10b981 100%);"
+        "  box-shadow: 0 6px 20px rgba(52, 211, 153, 0.55);"
+        "}"
+        ".retry-btn {"
+        "  background-color: #0284c7;"
+        "  background-image: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);"
+        "  border: 1px solid rgba(56, 189, 248, 0.4);"
+        "  border-radius: 10px;"
+        "  color: #ffffff;"
+        "  font-weight: 600;"
+        "  font-size: 13px;"
+        "  padding: 9px 20px;"
+        "  box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);"
+        "  transition: all 180ms ease-in-out;"
+        "}"
+        ".retry-btn:hover {"
+        "  background-color: #0ea5e9;"
+        "  background-image: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);"
+        "  box-shadow: 0 6px 20px rgba(14, 165, 233, 0.5);"
+        "}"
+        ".secondary-btn {"
+        "  background-color: rgba(30, 41, 59, 0.7);"
+        "  background-image: none;"
+        "  border: 1px solid rgba(255, 255, 255, 0.15);"
+        "  border-radius: 10px;"
+        "  color: #cbd5e1;"
+        "  font-weight: 500;"
+        "  font-size: 13px;"
+        "  padding: 9px 18px;"
+        "  transition: all 180ms ease-in-out;"
+        "}"
+        ".secondary-btn:hover {"
+        "  background-color: rgba(51, 65, 85, 0.9);"
+        "  color: #38bdf8;"
+        "  border-color: rgba(56, 189, 248, 0.35);"
+        "  box-shadow: 0 0 12px rgba(56, 189, 248, 0.2);"
+        "}";
+
+    gtk_css_provider_load_from_data(provider, css, -1, NULL);
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(),
+        GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_USER
+    );
+    g_object_unref(provider);
+}
+
+/* Native HeaderBar Actions */
+static void on_quick_term_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    if (!state->page_loaded) {
+        if (!state->is_loading) {
+            app_log("ACTION", "工作台尚未呈现，点击启动终端触发重新连接探测...");
+            check_host_ready_cb(state);
+        }
+        return;
+    }
+    const char *js =
+        "try {"
+        "  window.dispatchEvent(new CustomEvent('viber:quickTerminal'));"
+        "  if (window.viber && window.viber.quickTerminal) { window.viber.quickTerminal(); }"
+        "  else {"
+        "    var btns = Array.from(document.querySelectorAll('button'));"
+        "    var target = btns.find(function(b) { return (b.innerText && b.innerText.indexOf('新建终端') !== -1) || (b.title && b.title.indexOf('开启纯交互终端') !== -1); });"
+        "    if (target) target.click();"
+        "  }"
+        "} catch(e) { console.error('quickTerminal error:', e); }";
+    dispatch_web_js(WEBKIT_WEB_VIEW(state->web_view), js);
+}
+
+static void on_launch_agent_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    const char *js =
+        "try {"
+        "  window.dispatchEvent(new CustomEvent('viber:openLaunch'));"
+        "  if (window.viber && window.viber.openLaunch) { window.viber.openLaunch(); }"
+        "  else {"
+        "    var btns = Array.from(document.querySelectorAll('button'));"
+        "    var target = btns.find(function(b) { return (b.innerText && b.innerText.indexOf('启动 Agent') !== -1) || (b.title && b.title.indexOf('启动 Agent') !== -1); });"
+        "    if (target) target.click();"
+        "  }"
+        "} catch(e) { console.error('launchAgent error:', e); }";
+    dispatch_web_js(WEBKIT_WEB_VIEW(state->web_view), js);
+}
+
+static void on_mosaic_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    const char *js =
+        "window.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', altKey: true, bubbles: true }));"
+        "(function() {"
+        "  if (window.viber && window.viber.switchView) { window.viber.switchView('mosaic'); return; }"
+        "  var btns = Array.from(document.querySelectorAll('button'));"
+        "  var target = btns.find(function(b) { return b.innerText && b.innerText.indexOf('平铺视图') !== -1; });"
+        "  if (target) target.click();"
+        "})();";
+    dispatch_web_js(WEBKIT_WEB_VIEW(state->web_view), js);
+}
+
+static void on_single_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    const char *js =
+        "(function() {"
+        "  if (window.viber && window.viber.switchView) { window.viber.switchView('terminal'); return; }"
+        "  var btns = Array.from(document.querySelectorAll('button'));"
+        "  var target = btns.find(function(b) { return (b.innerText && b.innerText.indexOf('终端工作台') !== -1) || (b.innerText && b.innerText.indexOf('终端') !== -1); });"
+        "  if (target) target.click();"
+        "})();";
+    dispatch_web_js(WEBKIT_WEB_VIEW(state->web_view), js);
+}
+
+static void on_dashboard_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    const char *js =
+        "(function() {"
+        "  if (window.viber && window.viber.switchView) { window.viber.switchView('dashboard'); return; }"
+        "  var btns = Array.from(document.querySelectorAll('button'));"
+        "  var target = btns.find(function(b) { return (b.innerText && b.innerText.indexOf('控制面板') !== -1) || (b.innerText && b.innerText.indexOf('看板') !== -1); });"
+        "  if (target) target.click();"
+        "})();";
+    dispatch_web_js(WEBKIT_WEB_VIEW(state->web_view), js);
+}
+
+static void on_pairing_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    const char *js =
+        "(function() {"
+        "  if (window.viber && window.viber.openPairing) { window.viber.openPairing(); return; }"
+        "  var btns = Array.from(document.querySelectorAll('button'));"
+        "  var target = btns.find(function(b) { return b.title && b.title.indexOf('网络配对') !== -1; });"
+        "  if (target) target.click();"
+        "})();";
+    dispatch_web_js(WEBKIT_WEB_VIEW(state->web_view), js);
+}
+
+static void on_reload_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    if (is_port_open(state->host, state->port)) {
+        state->is_loading = TRUE;
+        state->load_failed = FALSE;
+        webkit_web_view_reload(WEBKIT_WEB_VIEW(state->web_view));
+    } else {
+        on_load_failed(WEBKIT_WEB_VIEW(state->web_view), WEBKIT_LOAD_FINISHED, state->target_url, NULL, state);
+    }
+}
+
+static void on_fullscreen_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    if (state->is_fullscreen) {
+        gtk_window_unfullscreen(GTK_WINDOW(state->window));
+        state->is_fullscreen = FALSE;
+    } else {
+        gtk_window_fullscreen(GTK_WINDOW(state->window));
+        state->is_fullscreen = TRUE;
+    }
+}
+
+static void on_quit_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppState *state = (AppState *)user_data;
+    gtk_window_close(GTK_WINDOW(state->window));
+}
+
+/* Mouse wheel zoom handler (Ctrl+Scroll) */
+static gboolean on_scroll_event(GtkWidget *widget, GdkEventScroll *event, gpointer user_data) {
+    (void)widget;
+    AppState *state = (AppState *)user_data;
+    if (event->state & GDK_CONTROL_MASK) {
+        if (event->direction == GDK_SCROLL_UP || (event->direction == GDK_SCROLL_SMOOTH && event->delta_y < 0)) {
+            state->zoom_level += 0.05;
+            if (state->zoom_level > 3.0) state->zoom_level = 3.0;
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
+            return TRUE;
+        } else if (event->direction == GDK_SCROLL_DOWN || (event->direction == GDK_SCROLL_SMOOTH && event->delta_y > 0)) {
+            state->zoom_level -= 0.05;
+            if (state->zoom_level < 0.5) state->zoom_level = 0.5;
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* Keyboard shortcuts handler */
+static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data) {
+    (void)widget;
+    AppState *state = (AppState *)user_data;
+
+    /* Ctrl+Q: Close client window */
+    if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_q || event->keyval == GDK_KEY_Q)) {
+        gtk_window_close(GTK_WINDOW(state->window));
+        return TRUE;
+    }
+
+    /* F11: Fullscreen toggle */
+    if (event->keyval == GDK_KEY_F11) {
+        on_fullscreen_clicked(NULL, state);
+        return TRUE;
+    }
+
+    /* Alt+N: New Terminal */
+    if ((event->state & GDK_MOD1_MASK) && (event->keyval == GDK_KEY_n || event->keyval == GDK_KEY_N)) {
+        on_quick_term_clicked(NULL, state);
+        return TRUE;
+    }
+
+    /* Alt+A: Launch Agent */
+    if ((event->state & GDK_MOD1_MASK) && (event->keyval == GDK_KEY_a || event->keyval == GDK_KEY_A)) {
+        on_launch_agent_clicked(NULL, state);
+        return TRUE;
+    }
+
+    /* Zoom Controls: Ctrl+Plus, Ctrl+Minus, Ctrl+0 */
+    if (event->state & GDK_CONTROL_MASK) {
+        if (event->keyval == GDK_KEY_plus || event->keyval == GDK_KEY_equal || event->keyval == GDK_KEY_KP_Add) {
+            state->zoom_level += 0.1;
+            if (state->zoom_level > 3.0) state->zoom_level = 3.0;
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
+            app_log("ZOOM", "工作台缩放: %.0f%%", state->zoom_level * 100);
+            return TRUE;
+        }
+        if (event->keyval == GDK_KEY_minus || event->keyval == GDK_KEY_underscore || event->keyval == GDK_KEY_KP_Subtract) {
+            state->zoom_level -= 0.1;
+            if (state->zoom_level < 0.5) state->zoom_level = 0.5;
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
+            app_log("ZOOM", "工作台缩放: %.0f%%", state->zoom_level * 100);
+            return TRUE;
+        }
+        if (event->keyval == GDK_KEY_0 || event->keyval == GDK_KEY_KP_0) {
+            state->zoom_level = 1.0;
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
+            app_log("ZOOM", "工作台缩放已重置: 100%%");
+            return TRUE;
+        }
+    }
+
+    /* Alt+M: Mosaic Matrix View */
+    if ((event->state & GDK_MOD1_MASK) && (event->keyval == GDK_KEY_m || event->keyval == GDK_KEY_M)) {
+        on_mosaic_clicked(NULL, state);
+        return TRUE;
+    }
+
+    /* Alt+\: Single Terminal View */
+    if ((event->state & GDK_MOD1_MASK) && event->keyval == GDK_KEY_backslash) {
+        on_single_clicked(NULL, state);
+        return TRUE;
+    }
+
+    /* Alt+D: Dashboard View */
+    if ((event->state & GDK_MOD1_MASK) && (event->keyval == GDK_KEY_d || event->keyval == GDK_KEY_D)) {
+        on_dashboard_clicked(NULL, state);
+        return TRUE;
+    }
+
+    /* F12 or Ctrl+Shift+I: Web Inspector */
+    if (event->keyval == GDK_KEY_F12 || 
+        ((event->state & GDK_CONTROL_MASK) && (event->state & GDK_SHIFT_MASK) && (event->keyval == GDK_KEY_I || event->keyval == GDK_KEY_i))) {
+        if (state->inspector) {
+            webkit_web_inspector_show(state->inspector);
+            return TRUE;
+        }
+    }
+
+    /* Ctrl+R or F5: Reload */
+    if ((event->keyval == GDK_KEY_F5) ||
+        ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_r || event->keyval == GDK_KEY_R))) {
+        on_reload_clicked(NULL, state);
+        return TRUE;
+    }
+
+    /* 'r' or 'R' when waiting: retry */
+    if (!state->page_loaded && (event->keyval == GDK_KEY_r || event->keyval == GDK_KEY_R)) {
+        on_retry_clicked(NULL, state);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+/* Clean exit handler */
+static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
+    (void)widget;
+    AppState *state = (AppState *)user_data;
+    stop_poll_timer(state);
+    gtk_main_quit();
+}
+
+int main(int argc, char *argv[]) {
+    memset(&app_state, 0, sizeof(app_state));
+    strncpy(app_state.host, DEFAULT_HOST, sizeof(app_state.host) - 1);
+    app_state.port = DEFAULT_PORT;
+
+    /* Get directory of executable */
+    char exe_path[1024];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len != -1) {
+        exe_path[len] = '\0';
+        strncpy(app_state.app_dir, dirname(exe_path), sizeof(app_state.app_dir) - 1);
+    }
+
+    gboolean detach_to_background = FALSE;
+    gboolean force_software_rendering = FALSE;
+    gboolean launch_browser_mode = FALSE;
+    gboolean force_ssl = FALSE;
+    gboolean force_no_ssl = FALSE;
+    char custom_log_path[1024] = {0};
+
+    /* Parse command line arguments */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            app_state.port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+            strncpy(app_state.host, argv[++i], sizeof(app_state.host) - 1);
+        } else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc) {
+            snprintf(app_state.target_url, sizeof(app_state.target_url), "%s", argv[++i]);
+            app_state.explicit_url = TRUE;
+        } else if (strcmp(argv[i], "--ssl") == 0 || strcmp(argv[i], "--tls") == 0 || strcmp(argv[i], "--https") == 0) {
+            force_ssl = TRUE;
+        } else if (strcmp(argv[i], "--no-ssl") == 0 || strcmp(argv[i], "--http") == 0) {
+            force_no_ssl = TRUE;
+        } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
+            g_strlcpy(custom_log_path, argv[++i], sizeof(custom_log_path));
+        } else if (strcmp(argv[i], "--detach") == 0 || strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--bg") == 0) {
+            detach_to_background = TRUE;
+        } else if (strcmp(argv[i], "--software") == 0 || strcmp(argv[i], "--software-rendering") == 0 || strcmp(argv[i], "--no-accel") == 0) {
+            force_software_rendering = TRUE;
+        } else if (strcmp(argv[i], "--browser") == 0 || strcmp(argv[i], "--chrome") == 0 || strcmp(argv[i], "--app") == 0) {
+            launch_browser_mode = TRUE;
+        } else if (strcmp(argv[i], "--zoom") == 0 && i + 1 < argc) {
+            double z = atof(argv[++i]);
+            if (z >= 0.5 && z <= 3.0) {
+                app_state.zoom_level = z;
+            }
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            g_print("RemoteViber 原生桌面工作台 (Linux Native Desktop Client)\n"
+                    "基于 GTK+ 3.0 & WebKit2GTK 4.1 原生打造 (支持纯客户端模式与一键服务端控制)\n\n"
+                    "用法: viber-desktop-linux [选项]\n\n"
+                    "选项:\n"
+                    "  --port <port>     指定服务端连接端口 (默认: 8765)\n"
+                    "  --host <ip>       指定服务端连接IP (默认: 127.0.0.1)\n"
+                    "  --ssl, --https    强制使用 HTTPS 安全协议连接\n"
+                    "  --no-ssl, --http  强制使用明文 HTTP 协议连接\n"
+                    "  --url <url>       直接指定连接完整 URL (例如 https://192.168.1.100:8765/)\n"
+                    "  --log-file <path> 指定全量运行诊断日志输出文件 (默认: /tmp/viber-desktop.log)\n"
+                    "  --zoom <factor>   工作台缩放比例 (默认: 1.0, 范围: 0.5 - 3.0)\n"
+                    "  --software        强制软件渲染兼容模式 (禁用 GPU 硬件加速与合成管线)\n"
+                    "  --browser         在系统 Chrome/Chromium 独立应用窗口中启动工作台\n"
+                    "  -d, --detach      转入后台独立运行，立即释放终端交互提示符\n"
+                    "  --help, -h        显示帮助信息\n\n"
+                    "快捷键:\n"
+                    "  Alt+N           ➕ 快速创建并启动终端\n"
+                    "  Alt+A           🚀 启动 Agent 智能体\n"
+                    "  Alt+M           🔲 切换至 4格拼图终端矩阵\n"
+                    "  Alt+\\           🖥️ 切换至单屏聚焦终端\n"
+                    "  Alt+D           📊 切换至 Agent 仪表盘\n"
+                    "  Ctrl++ / Ctrl+- 🔍 放大 / 缩小工作台 (支持 Ctrl+滚轮)\n"
+                    "  Ctrl+0          🔍 重置工作台缩放到 100%%\n"
+                    "  F11             🖥️ 全屏模式切换\n"
+                    "  Ctrl+R / F5     🔄 刷新工作台\n"
+                    "  Ctrl+Q          ❌ 关闭桌面客户端 (不影响服务端后台运行)\n");
+            return 0;
+        }
+    }
+
+    if (force_ssl) {
+        snprintf(app_state.target_url, sizeof(app_state.target_url), "https://%s:%d/", app_state.host, app_state.port);
+        app_state.explicit_url = TRUE;
+    } else if (force_no_ssl) {
+        snprintf(app_state.target_url, sizeof(app_state.target_url), "http://%s:%d/", app_state.host, app_state.port);
+        app_state.explicit_url = TRUE;
+    }
+
+    /* Initialize persistent diagnostic log file immediately */
+    init_log_file(custom_log_path);
+
+    /* Completely bypass any system/environment HTTP/SOCKS proxies for local communication */
+    unsetenv("http_proxy");
+    unsetenv("https_proxy");
+    unsetenv("all_proxy");
+    unsetenv("HTTP_PROXY");
+    unsetenv("HTTPS_PROXY");
+    unsetenv("ALL_PROXY");
+    setenv("no_proxy", "*", 1);
+    setenv("NO_PROXY", "*", 1);
+
+    /* Enforce modern Linux compositor & driver compatibility */
+    setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
+    /* WEBKIT_DISABLE_DMABUF_RENDERER=1 fixes black screen on modern WebKitGTK 2.40-2.52 with Wayland / NVIDIA / Mesa */
+    setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", 1);
+    if (force_software_rendering) {
+        setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", 1);
+    }
+
+    /* Check if browser mode requested */
+    if (launch_browser_mode) {
+        const char *browsers[] = {
+            "google-chrome-stable",
+            "google-chrome",
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "microsoft-edge-stable",
+            NULL
+        };
+        char app_url[512];
+        if (app_state.target_url[0] != '\0') {
+            snprintf(app_url, sizeof(app_url), "%s", app_state.target_url);
+        } else {
+            snprintf(app_url, sizeof(app_url), "http://%s:%d/", app_state.host, app_state.port);
+        }
+        for (int b = 0; browsers[b]; b++) {
+            char *bpath = g_find_program_in_path(browsers[b]);
+            if (bpath) {
+                g_print("[RemoteViber] 使用系统浏览器独立应用窗口启动: %s\n", bpath);
+                char *app_arg = g_strdup_printf("--app=%s", app_url);
+                char *ud_arg = g_strdup_printf("--user-data-dir=%s/.config/remote-viber/profile", g_get_home_dir());
+                pid_t bpid = fork();
+                if (bpid == 0) {
+                    setsid();
+                    execl(bpath, browsers[b], app_arg, "--window-size=1600,960", ud_arg, NULL);
+                    _exit(127);
+                }
+                g_free(app_arg);
+                g_free(ud_arg);
+                g_free(bpath);
+                if (bpid > 0) return 0;
+            }
+        }
+        g_print("[RemoteViber] 未检测到 Chrome/Chromium 浏览器，回退至原生 GTK+WebKit 模式。\n");
+    }
+
+    if (!gtk_init_check(&argc, &argv)) {
+        g_printerr("[RemoteViber] 未检测到图形桌面环境 (DISPLAY 或 WAYLAND_DISPLAY 未设置)。\n"
+                    "提示: 若在无显示器的服务器或 SSH 会话中，请直接运行控制端核心:\n"
+                    "      ./dist-bin/viber-host-linux-x86_64 --port %d\n"
+                    "并在外部浏览器中访问: https://<你的IP>:%d/\n",
+                    app_state.port, app_state.port);
+        return 1;
+    }
+
+    app_log("SYSTEM", "================================================================================");
+    app_log("SYSTEM", "RemoteViber Linux Native Desktop Client v2.0 (Diagnostic Engine Active)");
+    app_log("SYSTEM", "全量运行诊断日志已同步写入: %s", s_log_file_path);
+    app_log("SYSTEM", "进程信息: PID=%d, PPID=%d, UID=%d, GID=%d", getpid(), getppid(), getuid(), getgid());
+    app_log("SYSTEM", "库版本: GTK+ %u.%u.%u | WebKitGTK %u.%u.%u",
+            gtk_get_major_version(), gtk_get_minor_version(), gtk_get_micro_version(),
+            webkit_get_major_version(), webkit_get_minor_version(), webkit_get_micro_version());
+    app_log("SYSTEM", "显示环境: DISPLAY='%s', WAYLAND_DISPLAY='%s', XDG_SESSION_TYPE='%s'",
+            g_getenv("DISPLAY") ? g_getenv("DISPLAY") : "(null)",
+            g_getenv("WAYLAND_DISPLAY") ? g_getenv("WAYLAND_DISPLAY") : "(null)",
+            g_getenv("XDG_SESSION_TYPE") ? g_getenv("XDG_SESSION_TYPE") : "(null)");
+    app_log("SYSTEM", "图形策略: force_software=%d, WEBKIT_DISABLE_COMPOSITING_MODE='%s', WEBKIT_DISABLE_DMABUF_RENDERER='%s', LIBGL_ALWAYS_SOFTWARE='%s'",
+            force_software_rendering,
+            g_getenv("WEBKIT_DISABLE_COMPOSITING_MODE") ? g_getenv("WEBKIT_DISABLE_COMPOSITING_MODE") : "(not set)",
+            g_getenv("WEBKIT_DISABLE_DMABUF_RENDERER") ? g_getenv("WEBKIT_DISABLE_DMABUF_RENDERER") : "(not set)",
+            g_getenv("LIBGL_ALWAYS_SOFTWARE") ? g_getenv("LIBGL_ALWAYS_SOFTWARE") : "(not set)");
+    app_log("SYSTEM", "================================================================================");
+
+    find_local_pairing_code(&app_state);
+
+    if (app_state.target_url[0] != '\0') {
+        GUri *u = g_uri_parse(app_state.target_url, G_URI_FLAGS_NONE, NULL);
+        if (u) {
+            const char *h = g_uri_get_host(u);
+            int p = g_uri_get_port(u);
+            const char *scheme = g_uri_get_scheme(u);
+            if (h && h[0] != '\0') {
+                strncpy(app_state.host, h, sizeof(app_state.host) - 1);
+            }
+            if (p > 0) {
+                app_state.port = p;
+            } else if (scheme && strcmp(scheme, "https") == 0) {
+                app_state.port = 443;
+            } else if (scheme && strcmp(scheme, "http") == 0) {
+                app_state.port = 80;
+            }
+            g_uri_unref(u);
+        }
+    } else {
+        /* Default to HTTPS in protocol v2 */
+        snprintf(app_state.target_url, sizeof(app_state.target_url), "https://%s:%d/", app_state.host, app_state.port);
+    }
+
+    if (!app_state.explicit_url && !app_state.has_detected_url && is_port_open(app_state.host, app_state.port)) {
+        if (probe_is_plain_http(app_state.host, app_state.port)) {
+            snprintf(app_state.target_url, sizeof(app_state.target_url), "http://%s:%d/", app_state.host, app_state.port);
+        } else {
+            snprintf(app_state.target_url, sizeof(app_state.target_url), "https://%s:%d/", app_state.host, app_state.port);
+        }
+    }
+
+    apply_dark_theme();
+
+    /* Create top-level GtkWindow */
+    app_state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(app_state.window), APP_TITLE);
+    gtk_window_set_default_size(GTK_WINDOW(app_state.window), 1600, 960);
+    gtk_widget_set_size_request(app_state.window, 640, 480);
+    gtk_widget_add_events(app_state.window, GDK_SCROLL_MASK);
+    gtk_window_maximize(GTK_WINDOW(app_state.window));
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.window), "remote-viber-window");
+
+    /* Try to set application icon */
+    const char *icon_paths[] = {
+        "dist-bin/remote-viber.svg",
+        "../dist-bin/remote-viber.svg",
+        "/usr/share/icons/hicolor/scalable/apps/remote-viber.svg",
+        NULL
+    };
+    for (int i = 0; icon_paths[i] != NULL; i++) {
+        if (access(icon_paths[i], R_OK) == 0) {
+            gtk_window_set_icon_from_file(GTK_WINDOW(app_state.window), icon_paths[i], NULL);
+            break;
+        }
+    }
+
+    /* Modern CSD HeaderBar */
+    app_state.header_bar = gtk_header_bar_new();
+    gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(app_state.header_bar), TRUE);
+    gtk_header_bar_set_title(GTK_HEADER_BAR(app_state.header_bar), "RemoteViber 拼图工作台");
+    gtk_header_bar_set_subtitle(GTK_HEADER_BAR(app_state.header_bar), "4-Grid Mosaic Terminal | Native Client");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.header_bar), "remote-viber-header");
+
+    /* Status Pill Badge */
+    app_state.status_badge = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.status_badge), "status-pill");
+    app_state.status_label = gtk_label_new(NULL);
+    char init_badge[128];
+    snprintf(init_badge, sizeof(init_badge),
+        "<span color='#f59e0b' font_weight='bold'>○</span> <span color='#94a3b8' font_size='small'>检测服务 (%d)</span>", app_state.port);
+    gtk_label_set_markup(GTK_LABEL(app_state.status_label), init_badge);
+    gtk_box_pack_start(GTK_BOX(app_state.status_badge), app_state.status_label, FALSE, FALSE, 4);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.status_badge);
+
+    /* Quick Action Buttons on HeaderBar - Use standard unicode symbols that never render as tofu boxes */
+    app_state.btn_quick_term = gtk_button_new_with_label("+ 启动终端 (Alt+N)");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_quick_term), "action-btn");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_quick_term), "quick-term-btn");
+    g_signal_connect(app_state.btn_quick_term, "clicked", G_CALLBACK(on_quick_term_clicked), &app_state);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_quick_term);
+
+    app_state.btn_launch_agent = gtk_button_new_with_label("⚡ 启动 Agent (Alt+A)");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_launch_agent), "action-btn");
+    g_signal_connect(app_state.btn_launch_agent, "clicked", G_CALLBACK(on_launch_agent_clicked), &app_state);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_launch_agent);
+
+    app_state.btn_mosaic = gtk_button_new_with_label("⊞ 拼图网格 (Alt+M)");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_mosaic), "action-btn");
+    g_signal_connect(app_state.btn_mosaic, "clicked", G_CALLBACK(on_mosaic_clicked), &app_state);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_mosaic);
+
+    app_state.btn_single = gtk_button_new_with_label("▶ 单终端 (Alt+\\)");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_single), "action-btn");
+    g_signal_connect(app_state.btn_single, "clicked", G_CALLBACK(on_single_clicked), &app_state);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_single);
+
+    app_state.btn_dashboard = gtk_button_new_with_label("☰ 仪表盘 (Alt+D)");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_dashboard), "action-btn");
+    g_signal_connect(app_state.btn_dashboard, "clicked", G_CALLBACK(on_dashboard_clicked), &app_state);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_dashboard);
+
+    app_state.btn_pairing = gtk_button_new_with_label("配对凭据");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_pairing), "action-btn");
+    g_signal_connect(app_state.btn_pairing, "clicked", G_CALLBACK(on_pairing_clicked), &app_state);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_pairing);
+
+    /* End buttons */
+    app_state.btn_quit = gtk_button_new_with_label("退出 (Ctrl+Q)");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_quit), "action-btn");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_quit), "quit-btn");
+    g_signal_connect(app_state.btn_quit, "clicked", G_CALLBACK(on_quit_clicked), &app_state);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_quit);
+
+    app_state.btn_fullscreen = gtk_button_new_with_label("全屏 (F11)");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_fullscreen), "action-btn");
+    g_signal_connect(app_state.btn_fullscreen, "clicked", G_CALLBACK(on_fullscreen_clicked), &app_state);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_fullscreen);
+
+    app_state.btn_reload = gtk_button_new_with_label("刷新 (Ctrl+R)");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_reload), "action-btn");
+    g_signal_connect(app_state.btn_reload, "clicked", G_CALLBACK(on_reload_clicked), &app_state);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_reload);
+
+    gtk_window_set_titlebar(GTK_WINDOW(app_state.window), app_state.header_bar);
+
+    /* Main Stack Container */
+    app_state.stack = gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(app_state.stack), GTK_STACK_TRANSITION_TYPE_NONE);
+    gtk_stack_set_transition_duration(GTK_STACK(app_state.stack), 0);
+
+    /* Loading / Waiting View: Encapsulated inside a high-end Glassmorphic Floating Panel */
+    app_state.loading_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_valign(app_state.loading_box, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign(app_state.loading_box, GTK_ALIGN_CENTER);
+
+    GtkWidget *glass_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
+    gtk_style_context_add_class(gtk_widget_get_style_context(glass_card), "glass-card");
+
+    /* Tag badge on top */
+    GtkWidget *tag_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_halign(tag_box, GTK_ALIGN_CENTER);
+    GtkWidget *tag_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(tag_label),
+        "<span size='smaller' weight='bold' foreground='#38bdf8'>⚡ REMOTE VIBER · NATIVE CLIENT</span>");
+    gtk_style_context_add_class(gtk_widget_get_style_context(tag_box), "tag-badge");
+    gtk_box_pack_start(GTK_BOX(tag_box), tag_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(glass_card), tag_box, FALSE, FALSE, 0);
+
+    /* Main Title */
+    app_state.spinner_title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(app_state.spinner_title),
+        "<span size='x-large' weight='bold' foreground='#f8fafc'>RemoteViber 终端拼图工作台</span>");
+    gtk_box_pack_start(GTK_BOX(glass_card), app_state.spinner_title, FALSE, FALSE, 0);
+
+    /* Subtitle */
+    GtkWidget *sub_lbl = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(sub_lbl),
+        "<span size='small' foreground='#94a3b8'>高弹性终端矩阵 · 自动磁吸吸附 · 纯原生零 Chrome 依赖</span>");
+    gtk_box_pack_start(GTK_BOX(glass_card), sub_lbl, FALSE, FALSE, 0);
+
+    /* Spinner */
+    app_state.spinner = gtk_spinner_new();
+    gtk_widget_set_size_request(app_state.spinner, 38, 38);
+    gtk_widget_set_halign(app_state.spinner, GTK_ALIGN_CENTER);
+    gtk_spinner_start(GTK_SPINNER(app_state.spinner));
+    gtk_box_pack_start(GTK_BOX(glass_card), app_state.spinner, FALSE, FALSE, 4);
+
+    /* Wait / Status message */
+    app_state.spinner_label = gtk_label_new(NULL);
+    gtk_label_set_justify(GTK_LABEL(app_state.spinner_label), GTK_JUSTIFY_CENTER);
+    gtk_label_set_line_wrap(GTK_LABEL(app_state.spinner_label), TRUE);
+    char initial_wait_text[1024];
+    snprintf(initial_wait_text, sizeof(initial_wait_text),
+        "<span size='medium' weight='bold' foreground='#38bdf8'>正在等待连接服务端 (%s)...</span>\n\n"
+        "<span size='small' foreground='#94a3b8'>服务端尚未启动。点击下方绿色按钮可直接在 GUI 启动：</span>\n\n"
+        "<span font_family='monospace' size='medium' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
+        "<span size='small' foreground='#64748b'>服务端启动后客户端将毫秒级自动感应并呈现拼图终端</span>",
+        app_state.target_url, app_state.port);
+    gtk_label_set_markup(GTK_LABEL(app_state.spinner_label), initial_wait_text);
+    gtk_box_pack_start(GTK_BOX(glass_card), app_state.spinner_label, FALSE, FALSE, 4);
+
+    /* Action button row */
+    GtkWidget *btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_halign(btn_row, GTK_ALIGN_CENTER);
+
+    app_state.start_host_btn = gtk_button_new_with_label("⚡ 一键启动本地服务端");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.start_host_btn), "start-host-btn");
+    g_signal_connect(app_state.start_host_btn, "clicked", G_CALLBACK(on_start_host_clicked), &app_state);
+    gtk_box_pack_start(GTK_BOX(btn_row), app_state.start_host_btn, FALSE, FALSE, 0);
+
+    app_state.retry_btn = gtk_button_new_with_label("🔄 重试检测 (R)");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.retry_btn), "retry-btn");
+    g_signal_connect(app_state.retry_btn, "clicked", G_CALLBACK(on_retry_clicked), &app_state);
+    gtk_box_pack_start(GTK_BOX(btn_row), app_state.retry_btn, FALSE, FALSE, 0);
+
+    GtkWidget *btn_proto = gtk_button_new_with_label("⚙️ 切换 HTTP/HTTPS");
+    gtk_style_context_add_class(gtk_widget_get_style_context(btn_proto), "secondary-btn");
+    g_signal_connect(btn_proto, "clicked", G_CALLBACK(on_toggle_protocol_clicked), &app_state);
+    gtk_box_pack_start(GTK_BOX(btn_row), btn_proto, FALSE, FALSE, 0);
+
+    app_state.open_browser_btn = gtk_button_new_with_label("🌐 系统浏览器打开");
+    gtk_style_context_add_class(gtk_widget_get_style_context(app_state.open_browser_btn), "secondary-btn");
+    g_signal_connect(app_state.open_browser_btn, "clicked", G_CALLBACK(on_open_browser_clicked), &app_state);
+    gtk_box_pack_start(GTK_BOX(btn_row), app_state.open_browser_btn, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(glass_card), btn_row, FALSE, FALSE, 6);
+
+    gtk_box_pack_start(GTK_BOX(app_state.loading_box), glass_card, FALSE, FALSE, 0);
+    gtk_stack_add_named(GTK_STACK(app_state.stack), app_state.loading_box, "loading");
+
+    /* WebKitWebView Setup (Software rendering policy guarantees zero DRI3 crash or black screen) */
+    WebKitWebContext *ctx = webkit_web_context_get_default();
+    webkit_web_context_set_sandbox_enabled(ctx, FALSE);
+
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    webkit_web_context_set_tls_errors_policy(ctx, WEBKIT_TLS_ERRORS_POLICY_IGNORE);
+    webkit_web_context_set_network_proxy_settings(ctx, WEBKIT_NETWORK_PROXY_MODE_NO_PROXY, NULL);
+    G_GNUC_END_IGNORE_DEPRECATIONS
+
+    WebKitWebsiteDataManager *manager = webkit_web_context_get_website_data_manager(ctx);
+    if (manager) {
+        webkit_website_data_manager_set_tls_errors_policy(manager, WEBKIT_TLS_ERRORS_POLICY_IGNORE);
+        webkit_website_data_manager_set_network_proxy_settings(manager, WEBKIT_NETWORK_PROXY_MODE_NO_PROXY, NULL);
+    }
+
+    WebKitSettings *settings = webkit_settings_new();
+    webkit_settings_set_enable_javascript(settings, TRUE);
+    webkit_settings_set_enable_developer_extras(settings, TRUE);
+    webkit_settings_set_enable_page_cache(settings, TRUE);
+    webkit_settings_set_hardware_acceleration_policy(settings,
+        force_software_rendering ? WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER : WEBKIT_HARDWARE_ACCELERATION_POLICY_ON_DEMAND);
+    webkit_settings_set_zoom_text_only(settings, FALSE);
+    webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
+
+    app_state.web_view = webkit_web_view_new_with_context(ctx);
+    webkit_web_view_set_settings(WEBKIT_WEB_VIEW(app_state.web_view), settings);
+    g_object_unref(settings);
+
+    if (app_state.zoom_level < 0.5) app_state.zoom_level = 1.0;
+    webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(app_state.web_view), app_state.zoom_level);
+
+    /* Set dark base background */
+    GdkRGBA dark_bg = { 0.035, 0.05, 0.09, 1.0 }; /* #090d16 */
+    webkit_web_view_set_background_color(WEBKIT_WEB_VIEW(app_state.web_view), &dark_bg);
+
+    /* Inject user dark theme CSS */
+    WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(app_state.web_view));
+    WebKitUserStyleSheet *sheet = webkit_user_style_sheet_new(
+        "html, body { background-color: #090d16 !important; color-scheme: dark !important; }"
+        "::-webkit-scrollbar { width: 8px; height: 8px; }"
+        "::-webkit-scrollbar-track { background: #090d16; }"
+        "::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }"
+        "::-webkit-scrollbar-thumb:hover { background: #334155; }",
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_STYLE_LEVEL_USER,
+        NULL, NULL
+    );
+    webkit_user_content_manager_add_style_sheet(ucm, sheet);
+    webkit_user_style_sheet_unref(sheet);
+
+    /* Register frontend JS console logger bridge */
+    g_signal_connect(ucm, "script-message-received::debugLog", G_CALLBACK(on_script_message), &app_state);
+    webkit_user_content_manager_register_script_message_handler(ucm, "debugLog");
+
+    const char *js_bridge =
+        "(function() {"
+        "  function sendLog(lvl, args) {"
+        "    try {"
+        "      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.debugLog) {"
+        "        var msg = Array.from(args).map(function(a) {"
+        "          if (typeof a === 'object') { try { return JSON.stringify(a); } catch(e) { return String(a); } }"
+        "          return String(a);"
+        "        }).join(' ');"
+        "        window.webkit.messageHandlers.debugLog.postMessage('[' + lvl + '] ' + msg);"
+        "      }"
+        "    } catch(e) {}"
+        "  }"
+        "  var origLog = console.log, origWarn = console.warn, origErr = console.error;"
+        "  console.log = function() { origLog.apply(console, arguments); sendLog('LOG', arguments); };"
+        "  console.warn = function() { origWarn.apply(console, arguments); sendLog('WARN', arguments); };"
+        "  console.error = function() { origErr.apply(console, arguments); sendLog('ERR', arguments); };"
+        "  window.addEventListener('error', function(e) {"
+        "    sendLog('UNCAUGHT-ERR', [e.message || '', e.filename || '', e.lineno || '']);"
+        "  });"
+        "  window.addEventListener('unhandledrejection', function(e) {"
+        "    sendLog('UNHANDLED-REJECTION', [e.reason ? (e.reason.stack || String(e.reason)) : 'unknown']);"
+        "  });"
+        "})();";
+    WebKitUserScript *bridge_script = webkit_user_script_new(
+        js_bridge,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+        NULL, NULL
+    );
+    webkit_user_content_manager_add_script(ucm, bridge_script);
+    webkit_user_script_unref(bridge_script);
+
+    /* Inject auto-pairing credential script at document start if connecting to localhost */
+    find_local_pairing_code(&app_state);
+    if (app_state.local_pairing_code[0] != '\0') {
+        char *js_init = g_strdup_printf(
+            "(function() {"
+            "  try {"
+            "    sessionStorage.setItem('viber_local_pairing_code', '%s');"
+            "    var b = '%s'.trim().replace(/-/g, '+').replace(/_/g, '/');"
+            "    var padded = b + '='.repeat((4 - b.length %% 4) %% 4);"
+            "    var bin = atob(padded);"
+            "    var bytes = new Uint8Array(bin.length);"
+            "    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);"
+            "    var d = JSON.parse(new TextDecoder('utf-8').decode(bytes));"
+            "    if (d && d.v === 2 && d.pub && d.token) {"
+            "      sessionStorage.setItem('viber_host_config_v2', JSON.stringify({"
+            "        protocolVersion: 2,"
+            "        hostId: d.id,"
+            "        hostPub: d.pub,"
+            "        hostName: d.name || 'Local Host',"
+            "        directPort: d.port || %d,"
+            "        token: d.token,"
+            "        tailscaleIps: d.tailscale || [],"
+            "        lanIps: d.lan || ['127.0.0.1'],"
+            "        relayUrl: d.relay || '',"
+            "        directUrl: d.direct_url || '',"
+            "        ssl: Boolean(d.ssl),"
+            "        fingerprint: (d.id || '').replace(/^host-/, '')"
+            "      }));"
+            "    }"
+            "  } catch(e) {}"
+            "})();",
+            app_state.local_pairing_code, app_state.local_pairing_code, app_state.port
+        );
+
+        WebKitUserScript *user_script = webkit_user_script_new(
+            js_init,
+            WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+            NULL, NULL
+        );
+        webkit_user_content_manager_add_script(ucm, user_script);
+        webkit_user_script_unref(user_script);
+        g_free(js_init);
+    }
+
+    app_state.inspector = webkit_web_view_get_inspector(WEBKIT_WEB_VIEW(app_state.web_view));
+
+    /* Connect WebKit events */
+    g_signal_connect(app_state.web_view, "load-changed", G_CALLBACK(on_load_changed), &app_state);
+    g_signal_connect(app_state.web_view, "load-failed", G_CALLBACK(on_load_failed), &app_state);
+    g_signal_connect(app_state.web_view, "load-failed-with-tls-errors", G_CALLBACK(on_load_failed_with_tls_errors), &app_state);
+    g_signal_connect(app_state.web_view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), &app_state);
+    g_signal_connect(app_state.web_view, "resource-load-started", G_CALLBACK(on_resource_load_started), &app_state);
+
+    gtk_widget_set_hexpand(app_state.web_view, TRUE);
+    gtk_widget_set_vexpand(app_state.web_view, TRUE);
+    gtk_widget_set_hexpand(app_state.stack, TRUE);
+    gtk_widget_set_vexpand(app_state.stack, TRUE);
+
+    gtk_stack_add_named(GTK_STACK(app_state.stack), app_state.web_view, "webview");
+    gtk_container_add(GTK_CONTAINER(app_state.window), app_state.stack);
+
+    /* Explicitly show loading view first */
+    gtk_stack_set_visible_child_name(GTK_STACK(app_state.stack), "loading");
+
+    /* Connect window signals */
+    g_signal_connect(app_state.window, "key-press-event", G_CALLBACK(on_key_press), &app_state);
+    g_signal_connect(app_state.window, "scroll-event", G_CALLBACK(on_scroll_event), &app_state);
+    g_signal_connect(app_state.window, "destroy", G_CALLBACK(on_window_destroy), &app_state);
+
+    gtk_widget_show_all(app_state.window);
+
+    app_log("INIT", "原生桌面工作台已启动 (PID: %d)", getpid());
+    app_log("INIT", "目标连接地址: %s", app_state.target_url);
+
+    find_local_pairing_code(&app_state);
+
+    /* Initial check */
+    if (check_host_ready_cb(&app_state) == G_SOURCE_CONTINUE) {
+        start_poll_timer(&app_state, 1000);
+    }
+
+    if (detach_to_background) {
+        pid_t pid = fork();
+        if (pid > 0) {
+            app_log("INIT", "客户端已成功转入后台独立运行 (PID: %d)。当前终端已释放。", pid);
+            return 0;
+        } else if (pid == 0) {
+            setsid();
+        }
+    }
+
+    gtk_main();
+
+    return 0;
+}

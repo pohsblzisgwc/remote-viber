@@ -28,10 +28,16 @@ import com.remoteviber.client.ui.theme.*
 private val QUICK_SNIPPETS = listOf(
     "y",
     "n",
-    "/help",
+    "ls -la",
+    "cd ..",
+    "clear",
     "git status",
+    "git diff",
     "docker ps",
     "docker compose up -d",
+    "htop",
+    "pytest",
+    "npm test",
     "确认执行，开始跑测试",
     "修复报错并重新构建"
 )
@@ -150,23 +156,21 @@ fun VirtualKeyboardBar(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        OutlinedTextField(
+                        ViberTextField(
                             value = promptInput,
                             onValueChange = { promptInput = it },
-                            placeholder = { Text(text = "输入 Agent 提示词或命令...", fontSize = 11.sp, color = TextMuted) },
+                            placeholder = "输入 Agent 提示词或命令...",
                             singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedContainerColor = ViberCard,
-                                unfocusedContainerColor = ViberCard,
-                                focusedBorderColor = ViberCyan,
-                                unfocusedBorderColor = ViberBorder,
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White
+                            textStyle = androidx.compose.ui.text.TextStyle(
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace
                             ),
-                            shape = RoundedCornerShape(8.dp),
+                            containerColor = ViberCard,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                             modifier = Modifier
                                 .weight(1f)
-                                .height(46.dp)
+                                .defaultMinSize(minHeight = 42.dp)
                         )
 
                         Spacer(modifier = Modifier.width(6.dp))
@@ -302,6 +306,11 @@ fun VirtualKeyboardBar(
 
                 KeyPill("/") { handleKey("/") }
                 KeyPill("-") { handleKey("-") }
+                KeyPill("|") { handleKey("|") }
+                KeyPill("~") { handleKey("~") }
+                KeyPill("$") { handleKey("$") }
+                KeyPill("&") { handleKey("&") }
+                KeyPill("↵", title = "回车") { handleKey("ENTER") }
 
                 // Quick Prompt Drawer Toggle
                 Box(

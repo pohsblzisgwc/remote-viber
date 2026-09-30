@@ -10,7 +10,7 @@ export async function parsePairingBundle(input) {
     }
     encoded = url.searchParams.get('data');
   }
-  if (!/^[A-Za-z0-9_-]+={0,2}$/.test(encoded)) throw new Error('配对编码无效');
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(encoded)) throw new Error('配对编码无效');
   const normal = encoded.replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
   const padded = normal + '='.repeat((4 - normal.length % 4) % 4);
   const json = new TextDecoder('utf-8', { fatal: true }).decode(fromBase64(padded));
@@ -29,7 +29,15 @@ export async function parsePairingBundle(input) {
   };
   const endpoint = (value, relay = false) => {
     if (!value) return '';
-    const url = new URL(value);
+    let normalized = value;
+    if (typeof normalized === 'string') {
+      if (normalized.startsWith('https://')) {
+        normalized = 'wss://' + normalized.slice(8);
+      } else if (normalized.startsWith('http://')) {
+        normalized = 'ws://' + normalized.slice(7);
+      }
+    }
+    const url = new URL(normalized);
     if (!['ws:', 'wss:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('端点 URL 无效');
     if (relay && url.protocol !== 'wss:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) throw new Error('远程中继必须使用 wss://');
     return url.href.replace(/\/$/, '');
@@ -38,12 +46,12 @@ export async function parsePairingBundle(input) {
     hostName: typeof data.name === 'string' ? data.name.slice(0, 128) : '远程主机',
     directPort: data.port, token: data.token, tailscaleIps: addresses(data.tailscale || []),
     lanIps: addresses(data.lan || []), relayUrl: endpoint(data.relay, true),
-    directUrl: endpoint(data.direct_url), fingerprint: digest };
+    directUrl: endpoint(data.direct_url), ssl: Boolean(data.ssl), fingerprint: digest };
 }
 
 export function loadSessionConfig(key) {
   const empty = { protocolVersion: 2, hostId: '', hostPub: '', hostName: '请重新配对',
-    token: '', directPort: 8765, tailscaleIps: [], lanIps: [], relayUrl: '', directUrl: '' };
+    token: '', directPort: 8765, tailscaleIps: [], lanIps: [], relayUrl: '', directUrl: '', ssl: false };
   try {
     // Purge v1 browser persistence. Never trust URL tokens or injected metadata.
     localStorage.removeItem('viber_host_config');

@@ -28,6 +28,8 @@ data class HostProfile(
     val tailscaleIps: List<String> = emptyList(),
     val lanIps: List<String> = emptyList(),
     val relayUrl: String = "",
+    val ssl: Boolean = false,
+    val directUrl: String = "",
     val lastConnected: Long = System.currentTimeMillis()
 ) {
     fun getPrimaryAddress(): String {
@@ -43,6 +45,8 @@ data class HostProfile(
             put("tailscaleIps", JSONArray(tailscaleIps))
             put("lanIps", JSONArray(lanIps))
             put("relayUrl", relayUrl)
+            put("ssl", ssl)
+            put("directUrl", directUrl)
             put("lastConnected", lastConnected)
         }
     }
@@ -64,7 +68,9 @@ data class HostProfile(
                 token = json.optString("token", ""),
                 tailscaleIps = tsIps,
                 lanIps = lanList,
-                relayUrl = json.optString("relayUrl", ""),
+                relayUrl = json.optString("relayUrl", "").takeIf { it != "null" } ?: "",
+                ssl = json.optBoolean("ssl", false),
+                directUrl = json.optString("directUrl", "").takeIf { it != "null" } ?: "",
                 lastConnected = json.optLong("lastConnected", System.currentTimeMillis())
             )
         }

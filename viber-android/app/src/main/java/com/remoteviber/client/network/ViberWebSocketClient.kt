@@ -10,7 +10,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import okhttp3.*
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URI
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 import com.remoteviber.client.ui.components.XtermController
 
@@ -23,10 +29,23 @@ class ViberWebSocketClient(
         private const val TAG = "ViberWS"
     }
 
-    private val okHttpClient = OkHttpClient.Builder()
-        .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(0, TimeUnit.MILLISECONDS) // We handle custom PING frames
-        .build()
+    private val okHttpClient: OkHttpClient = run {
+        val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        })
+        val sslContext = SSLContext.getInstance("TLS").apply {
+            init(null, trustAllCerts, SecureRandom())
+        }
+        OkHttpClient.Builder()
+            .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
+            .hostnameVerifier { _, _ -> true }
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(0, TimeUnit.MILLISECONDS) // We handle custom PING frames
+            .build()
+    }
 
     private var webSocket: WebSocket? = null
     private val securityLock = Any()
@@ -47,6 +66,14 @@ class ViberWebSocketClient(
     private val _mode = MutableStateFlow(ConnectionMode.UNKNOWN)
     val mode: StateFlow<ConnectionMode> = _mode.asStateFlow()
 
+    private val _lastError = MutableStateFlow<String?>(null)
+    val lastError: StateFlow<String?> = _lastError.asStateFlow()
+
+    private val _currentEndpoint = MutableStateFlow<String?>(null)
+    val currentEndpoint: StateFlow<String?> = _currentEndpoint.asStateFlow()
+
+    private var preferredEndpoint: String? = null
+
     private val _pingMs = MutableStateFlow(0L)
     val pingMs: StateFlow<Long> = _pingMs.asStateFlow()
 
@@ -62,6 +89,36 @@ class ViberWebSocketClient(
     private val _activeSessionId = MutableStateFlow<String?>(null)
     val activeSessionId: StateFlow<String?> = _activeSessionId.asStateFlow()
 
+    private val _isHistoryTruncated = MutableStateFlow(false)
+    val isHistoryTruncated: StateFlow<Boolean> = _isHistoryTruncated.asStateFlow()
+
+    private val _syncFullHistory = MutableStateFlow(false)
+    val syncFullHistory: StateFlow<Boolean> = _syncFullHistory.asStateFlow()
+
+    fun toggleSyncFullHistory() {
+        val next = !_syncFullHistory.value
+        _syncFullHistory.value = next
+        _activeSessionId.value?.let { sessId ->
+            if (next) {
+                attachSession(sessId, 0L, true)
+            }
+        }
+    }
+
+    fun loadFullHistoryNow() {
+        _activeSessionId.value?.let { sessId ->
+            attachSession(sessId, 0L, true)
+        }
+    }
+    val mobileSessionIds: MutableSet<String> = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    fun isMobileSession(sessionId: String?): Boolean {
+        if (sessionId == null) return false
+        if (mobileSessionIds.contains(sessionId)) return true
+        val sess = _sessions.value.find { it.sessionId == sessionId }
+        return sess != null && (sess.name.contains("📱") || sess.name.contains("手机") || sess.name.contains("Mobile"))
+    }
+
     private var lastReceivedSeq = 0L
     private var candidateIndex = 0
 
@@ -72,45 +129,84 @@ class ViberWebSocketClient(
         val seen = mutableSetOf<String>()
 
         fun add(url: String, mode: ConnectionMode) {
-            if (url.isNotBlank() && seen.add(url)) {
-                list.add(CandidateEndpoint(url, mode))
+            val trimmed = url.trim()
+            if (trimmed.isNotBlank() && seen.add(trimmed)) {
+                list.add(CandidateEndpoint(trimmed, mode))
             }
         }
 
-        val direct = com.remoteviber.client.data.HostManager.directUrl(host.id).orEmpty()
-        if (direct.isNotBlank()) {
-            add(direct, ConnectionMode.UNKNOWN)
+        // 1. Previous successful endpoint gets top priority
+        preferredEndpoint?.let { pref ->
+            if (pref.isNotBlank()) add(pref, ConnectionMode.UNKNOWN)
+        }
+
+        // 2. Explicit direct URL
+        val direct = host.directUrl.ifBlank { com.remoteviber.client.data.HostManager.directUrl(host.id).orEmpty() }
+        if (direct.isNotBlank() && direct != "null") {
+            var directWs = direct.trim()
+            if (directWs.startsWith("https://")) {
+                directWs = "wss://" + directWs.removePrefix("https://")
+            } else if (directWs.startsWith("http://")) {
+                directWs = "ws://" + directWs.removePrefix("http://")
+            } else if (!directWs.startsWith("ws://") && !directWs.startsWith("wss://")) {
+                val proto = if (host.ssl) "wss://" else "ws://"
+                directWs = if (directWs.contains(':')) "$proto$directWs" else "$proto$directWs:${host.port}"
+            }
+            try {
+                val uri = URI(directWs)
+                if (uri.path.isNullOrEmpty() || uri.path == "/") {
+                    val portPart = if (uri.port > 0) ":${uri.port}" else ""
+                    val hostPart = if (uri.host != null && uri.host.contains(':') && !uri.host.startsWith('[')) "[${uri.host}]" else (uri.host ?: "")
+                    directWs = "${uri.scheme}://$hostPart$portPart/ws"
+                }
+            } catch (_: Exception) {}
+            add(directWs, ConnectionMode.UNKNOWN)
+        }
+
+        val useSsl = host.ssl
+
+        val addHost = { ip: String, mode: ConnectionMode ->
+            if (ip.isNotBlank() && !ip.contains(Regex("[\\s/?#@%]"))) {
+                val formatted = if (ip.contains(':') && !ip.startsWith('[')) "[$ip]" else ip
+                if (useSsl) {
+                    add("wss://$formatted:${host.port}/ws", mode)
+                    add("ws://$formatted:${host.port}/ws", mode)
+                } else {
+                    add("ws://$formatted:${host.port}/ws", mode)
+                    add("wss://$formatted:${host.port}/ws", mode)
+                }
+            }
         }
 
         for (ip in host.tailscaleIps) {
-            if (ip.isNotBlank() && !ip.contains(Regex("[\\s/?#@%]"))) {
-                val formatted = if (ip.contains(':') && !ip.startsWith('[')) "[$ip]" else ip
-                add("ws://$formatted:${host.port}/ws", ConnectionMode.TAILSCALE)
-            }
+            addHost(ip, ConnectionMode.TAILSCALE)
         }
 
         for (ip in host.lanIps) {
-            if (ip.isNotBlank() && ip != "127.0.0.1" && ip != "localhost" && ip != "::1" && !ip.contains(Regex("[\\s/?#@%]"))) {
-                val formatted = if (ip.contains(':') && !ip.startsWith('[')) "[$ip]" else ip
-                add("ws://$formatted:${host.port}/ws", ConnectionMode.LAN)
+            if (ip != "127.0.0.1" && ip != "localhost" && ip != "::1") {
+                addHost(ip, ConnectionMode.LAN)
             }
         }
 
-        if (host.relayUrl.isNotBlank()) {
-            val relayBase = host.relayUrl.trimEnd('/')
+        if (host.relayUrl.isNotBlank() && host.relayUrl != "null") {
+            val relayBase = host.relayUrl.trimEnd('/').let {
+                if (it.startsWith("https://")) "wss://" + it.removePrefix("https://")
+                else if (it.startsWith("http://")) "ws://" + it.removePrefix("http://")
+                else it
+            }
             add("$relayBase/connect/client?host_id=${host.id}", ConnectionMode.RELAY)
         }
 
         for (ip in host.lanIps) {
             if (ip == "127.0.0.1" || ip == "localhost" || ip == "::1") {
-                add("ws://$ip:${host.port}/ws", ConnectionMode.LOCALHOST)
+                addHost("10.0.2.2", ConnectionMode.LOCALHOST)
+                addHost(ip, ConnectionMode.LOCALHOST)
             }
         }
 
         if (list.isEmpty()) {
             val address = host.getPrimaryAddress()
-            val formatted = if (address.contains(':') && !address.startsWith('[')) "[$address]" else address
-            add("ws://$formatted:${host.port}/ws", ConnectionMode.UNKNOWN)
+            addHost(address, ConnectionMode.UNKNOWN)
         }
         return list
     }
@@ -119,6 +215,7 @@ class ViberWebSocketClient(
         val changed = activeHost?.id != host.id
         disconnect()
         synchronized(securityLock) {
+            if (changed) preferredEndpoint = null
             activeHost = host
             _activeSessionId.value = null
             lastReceivedSeq = 0L
@@ -139,16 +236,33 @@ class ViberWebSocketClient(
                 secureSession = crypto
                 val generation = ++connectionGeneration
                 val candidates = getCandidateEndpoints(host)
+                if (candidates.isEmpty()) {
+                    _status.value = ConnectionStatus.ERROR
+                    _lastError.value = "没有可用的连接端点，请在主机管理中配置"
+                    return
+                }
                 val target = candidates[candidateIndex % candidates.size]
+                _currentEndpoint.value = target.url
                 _mode.value = target.mode
                 Log.d(TAG, "Attempting connection to ${target.url} [${target.mode}] (candidate $candidateIndex/${candidates.size})")
-                val request = Request.Builder().url(target.url).build()
-                webSocket = okHttpClient.newWebSocket(request, createWebSocketListener(generation, crypto))
+                val requestBuilder = Request.Builder().url(target.url)
+                try {
+                    val uri = URI(target.url)
+                    if (uri.host == "10.0.2.2") {
+                        requestBuilder.header("Host", "127.0.0.1:${host.port}")
+                    } else if (!uri.host.isNullOrBlank()) {
+                        val portPart = if (uri.port > 0 && uri.port != 80 && uri.port != 443) ":${uri.port}" else ""
+                        requestBuilder.header("Host", "${uri.host}$portPart")
+                    }
+                } catch (_: Exception) {}
+                val request = requestBuilder.build()
+                webSocket = okHttpClient.newWebSocket(request, createWebSocketListener(generation, crypto, target))
             } catch (e: Exception) {
                 if (e.message == "Re-pair required") {
                     shouldReconnect = false
                     secureSession?.close(); secureSession = null
                     _status.value = ConnectionStatus.ERROR
+                    _lastError.value = "主机安全身份校验失效，需重新配对"
                     Log.e(TAG, "Secure connection configuration is invalid; re-pair required", e)
                 } else {
                     Log.w(TAG, "Connection initiation failed for current candidate, trying next", e)
@@ -158,13 +272,14 @@ class ViberWebSocketClient(
         }
     }
 
-    private fun createWebSocketListener(generation: Long, crypto: ProtocolV2): WebSocketListener {
+    private fun createWebSocketListener(generation: Long, crypto: ProtocolV2, target: CandidateEndpoint): WebSocketListener {
         return object : WebSocketListener() {
             private fun current() = generation == connectionGeneration && secureSession === crypto
             private fun reject(ws: WebSocket) {
                 if (!current()) return
                 shouldReconnect = false
                 _status.value = ConnectionStatus.ERROR
+                _lastError.value = "安全协议认证被拒绝 (身份公钥或配对口令不符)"
                 handshakeJob?.cancel(); stopHeartbeat()
                 crypto.close(); secureSession = null
                 ws.close(1008, "Authentication or protocol failure")
@@ -208,11 +323,20 @@ class ViberWebSocketClient(
                             require(message.optString("type") == "WELCOME" && message.opt("v") == 2 &&
                                 message.opt("e2ee") == true && message.optString("status") == "authenticated")
                             crypto.acceptWelcome(); handshakeJob?.cancel()
+                            preferredEndpoint = target.url
+                            _lastError.value = null
                         } else {
                             require(message.optString("type") !in setOf("HELLO", "AUTH", "CHALLENGE", "WELCOME"))
                         }
-                        handleMessage(message) // Only authenticated decrypted application data reaches the UI.
-                    } catch (_: Exception) { reject(ws) }
+                        try {
+                            handleMessage(message) // Only authenticated decrypted application data reaches the UI.
+                        } catch (appEx: Exception) {
+                            Log.e(TAG, "Error handling decrypted application message: ${message.optString("type")}", appEx)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Protocol or authentication failure: ${e.message}", e)
+                        reject(ws)
+                    }
                 }
             }
             override fun onMessage(ws: WebSocket, bytes: okio.ByteString) {
@@ -222,11 +346,26 @@ class ViberWebSocketClient(
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 synchronized(securityLock) {
                     if (!current()) return
-                    if (code == 1008) { shouldReconnect = false; _status.value = ConnectionStatus.ERROR }
+                    if (code == 1008) {
+                        shouldReconnect = false
+                        _status.value = ConnectionStatus.ERROR
+                        _lastError.value = "服务器主动关闭连接 (Code 1008 协议或认证错误)"
+                    }
                     handleDisconnect()
                 }
             }
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                val errMsg = when {
+                    response?.code == 403 -> "HTTP 403: 主机拒绝该来源或未开启 --allow-lan"
+                    response?.code == 404 -> "HTTP 404: 未找到 WebSocket 路径 (/ws)"
+                    response?.code == 503 -> "HTTP 503: 主机连接数已达上限"
+                    t is java.net.ConnectException -> "连接被拒绝 (端口未开放或 Host 未运行)"
+                    t is java.net.SocketTimeoutException -> "连接超时 (网络不可达)"
+                    t is javax.net.ssl.SSLException -> "TLS 握手失败 (请确认主机 SSL 配置)"
+                    else -> t.message ?: "连接失败"
+                }
+                _lastError.value = "[${target.url}] $errMsg"
+                Log.w(TAG, "WebSocket connection failed: ${t.message} (response: $response)")
                 synchronized(securityLock) { if (current()) handleDisconnect() }
             }
         }
@@ -272,10 +411,12 @@ class ViberWebSocketClient(
                     }
                     _sessions.value = list
                     if (_activeSessionId.value == null && list.isNotEmpty()) {
-                        attachSession(list.first().sessionId, 0L)
+                        val target = list.find { isMobileSession(it.sessionId) } ?: list.first()
+                        attachSession(target.sessionId, 0L)
                     } else if (_activeSessionId.value != null && list.none { it.sessionId == _activeSessionId.value }) {
                         if (list.isNotEmpty()) {
-                            attachSession(list.first().sessionId, 0L)
+                            val target = list.find { isMobileSession(it.sessionId) } ?: list.first()
+                            attachSession(target.sessionId, 0L)
                         } else {
                             _activeSessionId.value = null
                             terminalBuffer.clear()
@@ -300,6 +441,7 @@ class ViberWebSocketClient(
                     val sess = AgentSession.fromJsonObject(sessJson)
                     _activeSessionId.value = sess.sessionId
                     lastReceivedSeq = msg.optLong("current_seq", 0L)
+                    _isHistoryTruncated.value = msg.optBoolean("is_truncated", false)
 
                     if (msg.optBoolean("needs_reset", false)) {
                         terminalBuffer.clear()
@@ -339,6 +481,7 @@ class ViberWebSocketClient(
                     val newSess = AgentSession.fromJsonObject(sessJson)
                     val curr = _sessions.value.filter { it.sessionId != newSess.sessionId }
                     _sessions.value = curr + newSess
+                    mobileSessionIds.add(newSess.sessionId)
                     _activeSessionId.value = newSess.sessionId
                     attachSession(newSess.sessionId, 0L)
                 }
@@ -365,15 +508,33 @@ class ViberWebSocketClient(
         webSocket = null
         if (_status.value == ConnectionStatus.ERROR) return
         if (!shouldReconnect) { _status.value = ConnectionStatus.DISCONNECTED; return }
-        candidateIndex++
-        _status.value = ConnectionStatus.RECONNECTING
-        scheduleReconnect()
+
+        val host = activeHost ?: return
+        val candidates = getCandidateEndpoints(host)
+        val nextIndex = candidateIndex + 1
+        if (nextIndex < candidates.size) {
+            // Immediate fast failover to next candidate in the pool without delay
+            candidateIndex = nextIndex
+            val generation = connectionGeneration
+            scope.launch {
+                synchronized(securityLock) {
+                    if (shouldReconnect && activeHost?.id == host.id && connectionGeneration == generation && _status.value != ConnectionStatus.CONNECTED) {
+                        attemptConnection(host, generation)
+                    }
+                }
+            }
+        } else {
+            // Completed a full candidate sweep; pause briefly before next round
+            candidateIndex = 0
+            _status.value = ConnectionStatus.RECONNECTING
+            scheduleReconnect()
+        }
     }
     private fun scheduleReconnect() {
         reconnectJob?.cancel()
         val generation = connectionGeneration
         reconnectJob = scope.launch {
-            delay(1500)
+            delay(2000)
             synchronized(securityLock) {
                 val host = activeHost
                 if (host != null && shouldReconnect && connectionGeneration == generation && _status.value != ConnectionStatus.CONNECTED) {
@@ -413,6 +574,7 @@ class ViberWebSocketClient(
             secureSession?.close(); secureSession = null
             previous?.close(1000, "User disconnected")
             _status.value = ConnectionStatus.DISCONNECTED
+            _currentEndpoint.value = null
         }
     }
 
@@ -481,16 +643,19 @@ class ViberWebSocketClient(
         send(obj)
     }
 
-    fun launchTerminal(cwd: String = "/workspace", folder: String = "") {
+    fun launchTerminal(name: String = "📱 手机终端", cwd: String = "/workspace", folder: String = "") {
         val obj = JSONObject().apply {
             put("type", "LAUNCH_TERMINAL")
+            put("name", name)
             put("cwd", cwd)
             put("folder", folder)
+            put("rows", 24)
+            put("cols", 80)
         }
         send(obj)
     }
 
-    fun attachSession(sessionId: String, lastSeq: Long = 0L) {
+    fun attachSession(sessionId: String, lastSeq: Long = 0L, fullHistory: Boolean = _syncFullHistory.value) {
         val switching = _activeSessionId.value != sessionId
         _activeSessionId.value = sessionId
         if (switching) {
@@ -503,6 +668,7 @@ class ViberWebSocketClient(
             put("type", "ATTACH_SESSION")
             put("session_id", sessionId)
             put("last_seq", if (switching) 0L else lastSeq)
+            put("full_history", fullHistory)
         }
         send(obj)
     }
@@ -533,11 +699,23 @@ class ViberWebSocketClient(
 
     fun resizeTerminal(rows: Int, cols: Int) {
         val sessId = _activeSessionId.value ?: return
+        // CRITICAL PROTECTION: Shield desktop sessions from mobile PTY resize!
+        // A mobile portrait screen has few columns (~38-45).
+        // If mobile sends RESIZE_TERMINAL to a desktop session, Linux ioctl(TIOCSWINSZ)
+        // shrinks the desktop terminal down to phone width, breaking desktop layouts and CLI apps.
+        if (!isMobileSession(sessId)) {
+            Log.d(TAG, "Shielding desktop session $sessId from mobile pty resize (${rows}x${cols})")
+            return
+        }
+
+        // For mobile sessions, enforce standard minimum columns (at least 80)
+        val safeCols = maxOf(80, cols)
+        val safeRows = maxOf(24, rows)
         val obj = JSONObject().apply {
             put("type", "RESIZE_TERMINAL")
             put("session_id", sessId)
-            put("rows", rows)
-            put("cols", cols)
+            put("rows", safeRows)
+            put("cols", safeCols)
         }
         send(obj)
     }

@@ -12,7 +12,7 @@ const QUICK_SNIPPETS = [
   "解释当前修改的架构思路",
 ];
 
-export default function MobileToolbar({ onSendKey, onSendPrompt, onZoomIn, onZoomOut }) {
+export default function MobileToolbar({ onSendKey, onSendPrompt, onPaste, onZoomIn, onZoomOut }) {
   const [ctrlActive, setCtrlActive] = useState(false);
   const [altActive, setAltActive] = useState(false);
   const [promptText, setPromptText] = useState('');
@@ -23,7 +23,7 @@ export default function MobileToolbar({ onSendKey, onSendPrompt, onZoomIn, onZoo
       if (navigator.clipboard && navigator.clipboard.readText) {
         const text = await navigator.clipboard.readText();
         if (text) {
-          onSendKey(text);
+          (onPaste || onSendKey)(text);
           return;
         }
       }
@@ -31,7 +31,7 @@ export default function MobileToolbar({ onSendKey, onSendPrompt, onZoomIn, onZoo
     // Fallback prompt for browsers blocking direct clipboard API
     const text = window.prompt("在此粘贴文本发送到终端:");
     if (text) {
-      onSendKey(text);
+      (onPaste || onSendKey)(text);
     }
   };
 
@@ -124,19 +124,22 @@ export default function MobileToolbar({ onSendKey, onSendPrompt, onZoomIn, onZoo
 
           {/* Prompt Input Form */}
           <div className="flex items-center gap-2">
-            <input
-              type="text"
+            <textarea
+              rows={1}
               value={promptText}
               onChange={(e) => setPromptText(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') submitPrompt();
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  submitPrompt();
+                }
               }}
-              placeholder="在此输入 Agent 提示词或终端命令（支持多行/换行输入）..."
-              className="flex-1 bg-slate-900 border border-slate-700/80 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+              placeholder="输入 Agent 提示词或命令（Shift+Enter 换行）..."
+              className="flex-1 bg-slate-900 border border-slate-700/80 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 resize-none max-h-24 leading-normal"
             />
             <button
               onClick={() => submitPrompt()}
-              className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-medium text-xs flex items-center gap-1 shadow-md shadow-cyan-900/20 active:scale-95"
+              className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-medium text-xs flex items-center gap-1 shadow-md shadow-cyan-900/20 active:scale-95 cursor-pointer shrink-0"
             >
               <Send className="w-3.5 h-3.5" />
               <span>发送</span>

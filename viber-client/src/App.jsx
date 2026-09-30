@@ -1,8 +1,9 @@
-import { loadSessionConfig } from './services/pairing.js';
+import { loadSessionConfig, parsePairingBundle } from './services/pairing.js';
 import React, { useState, useEffect, useRef } from 'react';
 import TopBar from './components/TopBar';
 import Dashboard from './components/Dashboard';
 import TerminalView from './components/TerminalView';
+import MosaicTerminalGrid from './components/MosaicTerminalGrid';
 import SessionTabs from './components/SessionTabs';
 import LaunchModal from './components/LaunchModal';
 import PairingModal from './components/PairingModal';
@@ -35,7 +36,36 @@ export default function App() {
     const url = new URL(window.location.href);
     for (const name of ['token', 'hostId', 'host_id']) url.searchParams.delete(name);
     if (url.href !== window.location.href) window.history.replaceState(null, '', url.href);
-    if (!hostConfig.hostPub || !hostConfig.token) setIsPairingModalOpen(true);
+
+    try {
+      const autoCode = sessionStorage.getItem('viber_local_pairing_code');
+      if (autoCode) {
+        parsePairingBundle(autoCode).then((cfg) => {
+          if (!hostConfig.hostPub || !hostConfig.token || hostConfig.hostPub !== cfg.hostPub) {
+            handleSaveConfig(cfg);
+          }
+          setIsPairingModalOpen(false);
+        }).catch(() => {
+          if (!hostConfig.hostPub || !hostConfig.token) setIsPairingModalOpen(true);
+        });
+      } else if (!hostConfig.hostPub || !hostConfig.token) {
+        setIsPairingModalOpen(true);
+      }
+    } catch (_) {
+      if (!hostConfig.hostPub || !hostConfig.token) setIsPairingModalOpen(true);
+    }
+
+    window.viber_import_pairing = (code) => {
+      if (!code) return;
+      parsePairingBundle(code).then((cfg) => {
+        handleSaveConfig(cfg);
+        setIsPairingModalOpen(false);
+      }).catch(console.error);
+    };
+
+    return () => {
+      delete window.viber_import_pairing;
+    };
   }, []);
 
   // Initialize or re-create connection when hostConfig changes
@@ -154,6 +184,7 @@ export default function App() {
 
   // Direct Quick Terminal without needing an agent
   const handleQuickTerminal = (cwd = '', folder = '') => {
+    setActiveView('terminal');
     if (connectionRef.current) {
       connectionRef.current.launchTerminal({
         cwd: cwd || '',
@@ -161,6 +192,51 @@ export default function App() {
       });
     }
   };
+
+  // Auto-launch initial terminal session on desktop client / fresh localhost if no sessions exist
+  const hasAutoLaunchedRef = useRef(false);
+  useEffect(() => {
+    if (connectionState === 'connected' && !hasAutoLaunchedRef.current) {
+      const isLocalhost = typeof window !== 'undefined' && 
+        (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost');
+      const isDesktop = Boolean(window.sessionStorage?.getItem('viber_local_pairing_code') || isLocalhost);
+      if (isDesktop && sessions.length === 0) {
+        hasAutoLaunchedRef.current = true;
+        handleQuickTerminal();
+        setActiveView('terminal');
+      }
+    }
+  }, [connectionState, sessions]);
+
+  // Integration with native desktop client buttons and hotkeys
+  useEffect(() => {
+    const onQuickTerm = () => handleQuickTerminal();
+    const onSwitchView = (e) => {
+      if (e.detail) setActiveView(e.detail);
+    };
+    const onOpenPairing = () => setIsPairingModalOpen(true);
+    const onOpenLaunch = () => setIsLaunchModalOpen(true);
+
+    window.addEventListener('viber:quickTerminal', onQuickTerm);
+    window.addEventListener('viber:switchView', onSwitchView);
+    window.addEventListener('viber:openPairing', onOpenPairing);
+    window.addEventListener('viber:openLaunch', onOpenLaunch);
+
+    window.viber = {
+      quickTerminal: handleQuickTerminal,
+      switchView: (v) => setActiveView(v),
+      openPairing: () => setIsPairingModalOpen(true),
+      openLaunch: () => setIsLaunchModalOpen(true),
+    };
+
+    return () => {
+      window.removeEventListener('viber:quickTerminal', onQuickTerm);
+      window.removeEventListener('viber:switchView', onSwitchView);
+      window.removeEventListener('viber:openPairing', onOpenPairing);
+      window.removeEventListener('viber:openLaunch', onOpenLaunch);
+      delete window.viber;
+    };
+  }, [sessions, activeSessionId]);
 
   // Handle customized launch
   const handleConfigureLaunch = (config) => {
@@ -328,11 +404,14 @@ export default function App() {
               onTerminateSession={handleTerminateSession}
               onDeleteSession={handleDeleteSession}
             />
-            <TerminalView
+            <MosaicTerminalGrid
+              sessions={sessions}
+              activeSessionId={activeSessionId || activeSession?.session_id}
+              onSelectSession={(id) => setActiveSessionId(id)}
               connection={connectionRef.current}
-              activeSession={activeSession}
               connectionState={connectionState}
               onSwitchToDashboard={() => setActiveView('dashboard')}
+              onNewTerminal={() => handleQuickTerminal()}
               onTerminateSession={handleTerminateSession}
               onRestartSession={handleRestartSession}
               onDeleteSession={handleDeleteSession}

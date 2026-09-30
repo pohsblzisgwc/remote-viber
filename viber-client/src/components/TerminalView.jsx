@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
@@ -10,8 +10,11 @@ import {
   ChevronUp,
   ChevronDown,
   ArrowDownToLine,
+  Download,
+  History,
 } from 'lucide-react';
 import MobileToolbar from './MobileToolbar';
+import SafePasteModal from './SafePasteModal';
 
 function stringToBase64(str) {
   const bytes = new TextEncoder().encode(str);
@@ -58,6 +61,78 @@ export default function TerminalView({
   });
   const preventAltScreenRef = useRef(preventAltScreen);
   preventAltScreenRef.current = preventAltScreen;
+
+  const [syncFullHistory, setSyncFullHistory] = useState(() => {
+    try {
+      const saved = localStorage.getItem('viber_sync_full_history');
+      return saved !== null ? saved === 'true' : false;
+    } catch (e) {
+      return false;
+    }
+  });
+  const syncFullHistoryRef = useRef(syncFullHistory);
+  syncFullHistoryRef.current = syncFullHistory;
+
+  const [isHistoryTruncated, setIsHistoryTruncated] = useState(false);
+  const [pasteModal, setPasteModal] = useState(null);
+
+  const handleConfirmSafePaste = () => {
+    if (!pasteModal || !connection || !activeSession) return;
+    const bracketed = `\x1b[200~${pasteModal.text}\x1b[201~`;
+    connection.sendInput(activeSession.session_id, stringToBase64(bracketed));
+    setPasteModal(null);
+  };
+
+  const handleConfirmSingleLinePaste = () => {
+    if (!pasteModal || !connection || !activeSession) return;
+    const singleLine = pasteModal.text.replace(/[\r\n]+/g, '; ');
+    connection.sendInput(activeSession.session_id, stringToBase64(singleLine));
+    setPasteModal(null);
+  };
+
+  const handlePasteText = useCallback((clipboardText) => {
+    if (!connection || !activeSession || !clipboardText) return;
+
+    if (/[\r\n]/.test(clipboardText)) {
+      // 1. Strip trailing newlines (so a single line command never auto-executes)
+      const trimmed = clipboardText.replace(/[\r\n]+$/, '');
+
+      // If after stripping trailing newlines there are no remaining newlines:
+      if (!/[\r\n]/.test(trimmed)) {
+        connection.sendInput(activeSession.session_id, stringToBase64(trimmed));
+        return;
+      }
+
+      // 2. Multi-line paste: always show confirmation modal to prevent accidental newline execution
+      setPasteModal({
+        text: trimmed,
+        linesCount: trimmed.split(/\r?\n/).length,
+      });
+    } else {
+      connection.sendInput(activeSession.session_id, stringToBase64(clipboardText));
+    }
+  }, [connection, activeSession]);
+
+  const handleToggleSyncFullHistory = () => {
+    setSyncFullHistory((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('viber_sync_full_history', String(next));
+      } catch (e) {}
+      if (next && connection && activeSession) {
+        setIsInitialScrollReady(false);
+        connection.attachSession(activeSession.session_id, 0, true);
+      }
+      return next;
+    });
+  };
+
+  const handleLoadAllHistoryNow = () => {
+    if (connection && activeSession) {
+      setIsInitialScrollReady(false);
+      connection.attachSession(activeSession.session_id, 0, true);
+    }
+  };
 
   const handleToggleAltScreen = () => {
     setPreventAltScreen((prev) => {
@@ -277,6 +352,21 @@ export default function TerminalView({
       }
     });
 
+    // Intercept DOM paste events to prevent newlines from auto-executing commands
+    const handlePaste = (e) => {
+      const clipboardText = e.clipboardData?.getData('text/plain') || '';
+      if (!clipboardText) return;
+
+      if (/[\r\n]/.test(clipboardText)) {
+        e.preventDefault();
+        e.stopPropagation();
+        handlePasteText(clipboardText);
+      }
+    };
+
+    const containerEl = containerRef.current;
+    containerEl?.addEventListener('paste', handlePaste, true);
+
     // Window & Mobile Virtual Viewport resize observer
     const handleFit = () => {
       try {
@@ -350,6 +440,7 @@ export default function TerminalView({
     // Handle session attached & buffer replay
     const unsubAttached = connection.on('session_attached', (msg) => {
       if (msg.session.session_id === activeSession.session_id) {
+        setIsHistoryTruncated(Boolean(msg.is_truncated));
         if (msg.needs_reset) {
           term.reset();
         }
@@ -367,10 +458,11 @@ export default function TerminalView({
       }
     });
 
-    // Attach to session
-    connection.attachSession(activeSession.session_id, 0);
+    // Attach to session (default to truncated history unless user explicitly requested full history sync)
+    connection.attachSession(activeSession.session_id, 0, syncFullHistoryRef.current);
 
     return () => {
+      containerEl?.removeEventListener('paste', handlePaste, true);
       if (scrollRafId) cancelAnimationFrame(scrollRafId);
       scrollDisposable?.dispose?.();
       clearTimeout(replayTimer);
@@ -442,7 +534,33 @@ export default function TerminalView({
           <span className="text-slate-500 hidden sm:inline">PID:</span>
           <span className="hidden sm:inline">{activeSession.pid || '-'}</span>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          {isHistoryTruncated && !syncFullHistory && (
+            <button
+              onClick={handleLoadAllHistoryNow}
+              title="当前终端会话为保障秒开体验，默认截断了超长历史。点击一次性拉取并渲染缓冲区完整历史"
+              className="px-2 py-0.5 rounded text-[10px] font-medium border border-amber-500/50 bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 hover:border-amber-400 flex items-center gap-1 transition-all cursor-pointer shadow-sm shadow-amber-950/40"
+            >
+              <Download className="w-3 h-3 text-amber-400" />
+              <span>📥 加载全部历史</span>
+            </button>
+          )}
+
+          <button
+            onClick={handleToggleSyncFullHistory}
+            title="终端打开时同步策略：开启后每次打开或重连终端均拉取完整历史缓冲；默认关闭时截断历史以保证极速秒开。"
+            className={`px-2.5 py-0.5 rounded text-[10px] font-medium border transition-all flex items-center gap-1.5 cursor-pointer ${
+              syncFullHistory
+                ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/60 shadow-sm shadow-emerald-900/30'
+                : 'bg-slate-800/60 text-slate-400 border-slate-700/60 hover:text-slate-200 hover:border-slate-600'
+            }`}
+          >
+            <History className="w-3 h-3" />
+            <span className="hidden sm:inline">{syncFullHistory ? '📜 完整历史: 始终同步' : '📜 完整历史: 默认截断'}</span>
+            <span className="sm:hidden">{syncFullHistory ? '📜 完整' : '📜 截断'}</span>
+            <span className={`w-1.5 h-1.5 rounded-full ${syncFullHistory ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`} />
+          </button>
+
           <button
             onClick={handleToggleAltScreen}
             title="锁定主屏幕缓冲区：拦截全屏 TUI (如 Codex/Ratatui) 切换备用屏，确保侧边 14px 宽滚动条永不消失、滚轮 60fps 平滑滚动与长对话历史完整保留"
@@ -470,11 +588,13 @@ export default function TerminalView({
             <div className="flex items-center gap-2">
               <span className="inline-block w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
               <span className="text-xs font-mono font-medium text-slate-200 tracking-wide">
-                正在同步终端会话历史...
+                {syncFullHistory ? '正在拉取完整历史数据...' : '正在同步终端会话历史...'}
               </span>
             </div>
             <p className="text-[11px] font-mono text-slate-500 mt-1.5">
-              已优化上下文行数，准备就绪后直达最新输出
+              {syncFullHistory
+                ? '已开启完整历史同步，正在流式重放并渲染完整缓冲区...'
+                : '已默认截断历史并优化上下文行数，秒级直达最新输出'}
             </p>
           </div>
         )}
@@ -552,9 +672,18 @@ export default function TerminalView({
       {/* Mobile Touch Toolbar & Quick Prompter */}
       <MobileToolbar 
         onSendKey={handleSendKey} 
+        onPaste={handlePasteText}
         onSendPrompt={handleSendPrompt}
         onZoomIn={handleZoomIn}
         onZoomOut={handleZoomOut}
+      />
+
+      {/* Safe Paste Multi-line Confirmation Modal */}
+      <SafePasteModal
+        data={pasteModal}
+        onConfirmSafe={handleConfirmSafePaste}
+        onConfirmSingleLine={handleConfirmSingleLinePaste}
+        onCancel={() => setPasteModal(null)}
       />
     </div>
   );

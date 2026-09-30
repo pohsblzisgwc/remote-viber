@@ -6,6 +6,8 @@
 .gemini/
 .npm/
 .viber/
+.cache/
+.local/
 .bash_history
 .wget-hsts
 .remote-viber-security-backup-*/
@@ -24,6 +26,10 @@ viber-android/.kotlin/
 viber_config.json
 viber_profiles.json
 *.local.json
+*.pem
+*.key
+*.crt
+.viber_host.lock
 .env
 .env.*
 !.env.example
@@ -39,6 +45,8 @@ dist-bin/
 viber-host-linux
 viber-host-linux-x86_64
 viber-host-*
+viber-desktop-linux
+viber-desktop-*
 *.exe
 *.run
 *.bin

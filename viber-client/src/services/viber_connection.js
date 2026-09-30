@@ -18,6 +18,7 @@ export class ViberConnection {
     this._generation = 0;
     this._connecting = false;
     this._ctx = null;
+    this._pendingQueue = [];
   }
   on(event, callback) {
     if (!this.listeners.has(event)) this.listeners.set(event, new Set());
@@ -73,13 +74,30 @@ export class ViberConnection {
   }
   _buildCandidateUrls() {
     const port = this.config.directPort || 8765;
+    const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
+    const useSsl = Boolean(this.config.ssl || this.config.useSsl || isHttps);
     const result = [], seen = new Set();
     const add = (value, mode) => {
       if (!value) return;
-      const u = new URL(value);
+      let normalized = value;
+      if (typeof normalized === 'string') {
+        if (normalized.startsWith('https://')) {
+          normalized = 'wss://' + normalized.slice(8);
+        } else if (normalized.startsWith('http://')) {
+          normalized = 'ws://' + normalized.slice(7);
+        }
+      }
+      const u = new URL(normalized);
       if (!['ws:', 'wss:'].includes(u.protocol) || u.username || u.password || u.hash) throw new Error('Invalid endpoint URL');
       if (mode === 'relay' && u.protocol !== 'wss:' && !['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname)) {
         throw new Error('Remote relay requires wss://');
+      }
+      // Under an HTTPS page, browser blocks unencrypted remote ws:// connections as Mixed Content.
+      if (isHttps && u.protocol === 'ws:' && !['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname)) {
+        const wssUrl = new URL(u.href);
+        wssUrl.protocol = 'wss:';
+        if (!seen.has(wssUrl.href)) { seen.add(wssUrl.href); result.push({ url: wssUrl.href, mode }); }
+        return;
       }
       if (!seen.has(u.href)) { seen.add(u.href); result.push({ url: u.href, mode }); }
     };
@@ -90,7 +108,15 @@ export class ViberConnection {
     const addHost = (host, mode) => {
       if (typeof host !== 'string' || !host || /[\s/?#@%]/.test(host)) throw new Error('Invalid host address');
       const formatted = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
-      add(`ws://${formatted}:${port}/ws`, mode);
+      if (useSsl) {
+        add(`wss://${formatted}:${port}/ws`, mode);
+        if (!isHttps) {
+          add(`ws://${formatted}:${port}/ws`, mode);
+        }
+      } else {
+        add(`ws://${formatted}:${port}/ws`, mode);
+        add(`wss://${formatted}:${port}/ws`, mode);
+      }
     };
     for (const ip of this.config.tailscaleIps || []) addHost(ip, 'tailscale');
     for (const ip of this.config.lanIps || []) addHost(ip, ['localhost', '127.0.0.1', '::1'].includes(ip) ? 'localhost' : 'lan');
@@ -163,6 +189,12 @@ export class ViberConnection {
             this._startHeartbeat(); resolve();
             if (this.activeSessionId) this.attachSession(this.activeSessionId, this.lastReceivedSeq);
             else { this.getStats(); this.listProfiles(); }
+            if (this._pendingQueue.length > 0) {
+              const queued = this._pendingQueue.splice(0);
+              for (const msg of queued) {
+                this.send(msg);
+              }
+            }
           } else this._handleDecryptedMessage(msg);
         }).catch((error) => { if (current()) fail(error, true); }).finally(() => { pendingReceives--; });
       };
@@ -193,7 +225,15 @@ export class ViberConnection {
   }
   send(message) {
     const ctx = this._ctx;
-    if (!ctx || this.status !== 'connected' || ctx.socket.readyState !== WebSocket.OPEN || ctx.pending >= 64) return Promise.resolve(false);
+    if (!ctx || this.status !== 'connected' || ctx.socket.readyState !== WebSocket.OPEN) {
+      if (['LAUNCH_TERMINAL', 'LAUNCH_AGENT', 'GET_STATS', 'LIST_PROFILES'].includes(message?.type)) {
+        if (this._pendingQueue.length < 16) {
+          this._pendingQueue.push(message);
+        }
+      }
+      return Promise.resolve(false);
+    }
+    if (ctx.pending >= 64) return Promise.resolve(false);
     ctx.pending++;
     const work = ctx.txTail.then(async () => {
       if (this._ctx !== ctx || ctx.socket.readyState !== WebSocket.OPEN) return false;
@@ -226,6 +266,7 @@ export class ViberConnection {
     this.shouldReconnect = false;
     ++this._generation;
     this._connecting = false;
+    this._pendingQueue = [];
     this._stopHeartbeat();
     clearTimeout(this.reconnectTimer); this.reconnectTimer = null;
     const ctx = this._ctx;
@@ -238,9 +279,9 @@ export class ViberConnection {
   saveProfile(profile) { return this.send({ type: 'SAVE_PROFILE', profile }); }
   deleteProfile(profileId) { return this.send({ type: 'DELETE_PROFILE', profile_id: profileId }); }
   launchAgent(options) { return this.send({ ...options, type: 'LAUNCH_AGENT' }); }
-  attachSession(sessionId, lastSeq = 0) {
+  attachSession(sessionId, lastSeq = 0, fullHistory = false) {
     this.activeSessionId = sessionId;
-    return this.send({ type: 'ATTACH_SESSION', session_id: sessionId, last_seq: lastSeq });
+    return this.send({ type: 'ATTACH_SESSION', session_id: sessionId, last_seq: lastSeq, full_history: Boolean(fullHistory) });
   }
   detachSession() { this.activeSessionId = null; return this.send({ type: 'DETACH_SESSION' }); }
   sendInput(sessionId, base64Data) { return this.send({ type: 'TERMINAL_INPUT', session_id: sessionId, data: base64Data }); }
