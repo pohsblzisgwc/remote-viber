@@ -284,14 +284,7 @@ export default function MosaicTerminalTile({
           return;
         }
 
-        // 2. Multi-line paste: if terminal has bracketed paste mode active, wrap and send safely
-        if (term.modes?.bracketedPasteMode) {
-          const bracketed = `\x1b[200~${trimmed}\x1b[201~`;
-          connection.sendInput(session.session_id, stringToBase64(bracketed));
-          return;
-        }
-
-        // 3. Otherwise show confirmation modal to prevent accidental execution
+        // 2. Multi-line paste: always show confirmation modal to prevent accidental newline execution
         setPasteModal({
           text: trimmed,
           linesCount: trimmed.split(/\r?\n/).length,

@@ -232,6 +232,60 @@ static void dispatch_web_js(WebKitWebView *web_view, const char *js) {
 #endif
 }
 
+/* Search potential configuration directories for one matching state->port */
+static char *find_matching_config_dir(int port) {
+    GPtrArray *dirs = g_ptr_array_new_with_free_func(g_free);
+    
+    /* 1. Environment override */
+    const char *env_dir = g_getenv("VIBER_CONFIG_DIR");
+    if (env_dir && *env_dir) {
+        g_ptr_array_add(dirs, g_strdup(env_dir));
+    }
+
+    /* 2. User home directory */
+    const char *home = g_get_home_dir();
+    if (home && *home) {
+        g_ptr_array_add(dirs, g_build_filename(home, ".viber", NULL));
+    }
+
+    // 3. Scan user home directories under /home for multi-user/root support
+    GDir *home_root = g_dir_open("/home", 0, NULL);
+    if (home_root) {
+        const char *user_name;
+        while ((user_name = g_dir_read_name(home_root)) != NULL) {
+            char *user_viber = g_build_filename("/home", user_name, ".viber", NULL);
+            g_ptr_array_add(dirs, user_viber);
+        }
+        g_dir_close(home_root);
+    }
+
+    /* 4. Common and local fallbacks */
+    g_ptr_array_add(dirs, g_strdup("./dist-bin"));
+    g_ptr_array_add(dirs, g_strdup("."));
+
+    char *matched_dir = NULL;
+    for (guint i = 0; i < dirs->len; i++) {
+        const char *d = (const char *)g_ptr_array_index(dirs, i);
+        char *cfg_file = g_build_filename(d, "viber_config.json", NULL);
+        char *contents = NULL;
+        if (g_file_get_contents(cfg_file, &contents, NULL, NULL)) {
+            char port_needle[64];
+            snprintf(port_needle, sizeof(port_needle), "\"direct_port\": %d", port);
+            if (strstr(contents, port_needle) != NULL) {
+                matched_dir = g_strdup(d);
+                g_free(contents);
+                g_free(cfg_file);
+                break;
+            }
+            g_free(contents);
+        }
+        g_free(cfg_file);
+    }
+
+    g_ptr_array_unref(dirs);
+    return matched_dir;
+}
+
 /* Read local host pairing code if available */
 static void find_local_pairing_code(AppState *state) {
     if (state->local_pairing_code[0] != '\0') return;
@@ -252,7 +306,15 @@ static void find_local_pairing_code(AppState *state) {
         return;
     }
 
-    char *cmd = g_strdup_printf("'%s' --pair-info 2>/dev/null", exe);
+    char *matched_cfg_dir = find_matching_config_dir(state->port);
+    char *cmd = NULL;
+    if (matched_cfg_dir) {
+        app_log("AUTH", "已匹配到端口 %d 对应的本地配置目录: %s", state->port, matched_cfg_dir);
+        cmd = g_strdup_printf("'%s' --config-dir '%s' --pair-info 2>/dev/null", exe, matched_cfg_dir);
+        g_free(matched_cfg_dir);
+    } else {
+        cmd = g_strdup_printf("'%s' --pair-info 2>/dev/null", exe);
+    }
     g_free(exe);
     app_log("AUTH", "正在探测本地配对信息: %s", cmd);
     FILE *fp = popen(cmd, "r");
@@ -320,7 +382,7 @@ static gboolean check_host_ready_cb(gpointer user_data) {
 
         find_local_pairing_code(state);
 
-        if (!state->explicit_url) {
+        if (!state->explicit_url && !state->has_fallback_tried && state->target_url[0] == '\0') {
             if (probe_is_plain_http(state->host, state->port)) {
                 snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
             } else {
@@ -566,39 +628,34 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
         return TRUE;
     }
 
-    /* 4. If HTTPS failed due to TLS handshake termination, probe if server is actually plain HTTP */
+    /* 4. If HTTPS failed due to TLS handshake / certificate / protocol error, fallback directly to HTTP */
     if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "https://")) {
-        if (error && error->message &&
-            (strstr(error->message, "non-properly terminated") != NULL ||
-             strstr(error->message, "unexpected TLS packet") != NULL ||
-             strstr(error->message, "wrong version number") != NULL)) {
-            app_log("FALLBACK", "检测到 TLS 握手异常中断 (服务端可能为 HTTP 明文)，触发主动协议验证...");
-            if (probe_is_plain_http(state->host, state->port)) {
-                state->has_fallback_tried = TRUE;
-                snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
-                app_log("FALLBACK", "验证确认服务端为纯 HTTP 模式，自动切换并重新加载: %s", state->target_url);
-                state->is_loading = TRUE;
-                state->load_failed = FALSE;
-                webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
-                return TRUE;
-            } else {
-                app_log("FALLBACK", "主动探测未返回明文 HTTP 响应，保持当前配置");
-            }
-        }
-    }
-
-    /* 5. If HTTP failed, probe if server is actually HTTPS */
-    if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "http://")) {
-        app_log("FALLBACK", "HTTP 连接失败，触发协议自适应探测是否为 HTTPS...");
-        if (!probe_is_plain_http(state->host, state->port)) {
+        if (error && (error->domain == g_tls_error_quark() ||
+                      (error->message && (strstr(error->message, "non-properly terminated") != NULL ||
+                                          strstr(error->message, "unexpected TLS packet") != NULL ||
+                                          strstr(error->message, "wrong version number") != NULL ||
+                                          strstr(error->message, "handshake") != NULL ||
+                                          strstr(error->message, "TLS") != NULL ||
+                                          strstr(error->message, "SSL") != NULL)))) {
             state->has_fallback_tried = TRUE;
-            snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
-            app_log("FALLBACK", "验证确认服务端为 HTTPS 模式，自动切换并重新加载: %s", state->target_url);
+            snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
+            app_log("FALLBACK", "HTTPS 加载遇到 TLS 异常，自动降级至 HTTP 明文协议重试: %s", state->target_url);
             state->is_loading = TRUE;
             state->load_failed = FALSE;
             webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
             return TRUE;
         }
+    }
+
+    /* 5. If HTTP failed, fallback to HTTPS */
+    if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "http://")) {
+        state->has_fallback_tried = TRUE;
+        snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
+        app_log("FALLBACK", "HTTP 连接失败，自动切换至 HTTPS 安全模式重新加载: %s", state->target_url);
+        state->is_loading = TRUE;
+        state->load_failed = FALSE;
+        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
+        return TRUE;
     }
 
     app_log("ERROR", "工作台页面加载失败: %s (原因: %s)", failing_uri ? failing_uri : "", err_msg);
@@ -653,7 +710,8 @@ static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *f
     if (context && certificate) {
         app_log("TLS", "正在为目标主机 '%s' 信任自签名证书...", host);
         webkit_web_context_allow_tls_certificate_for_host(context, certificate, host);
-        app_log("TLS", "已成功将主机 '%s' 信任证书写入 WebKit 上下文", host);
+        app_log("TLS", "已成功将主机 '%s' 信任证书写入 WebKit 上下文，立即重试载入...", host);
+        webkit_web_view_load_uri(web_view, failing_uri ? failing_uri : state->target_url);
     }
     return TRUE;
 }
@@ -1147,7 +1205,7 @@ int main(int argc, char *argv[]) {
     /* WEBKIT_DISABLE_DMABUF_RENDERER=1 fixes black screen on modern WebKitGTK 2.40-2.52 with Wayland / NVIDIA / Mesa */
     setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", 1);
     if (force_software_rendering) {
-        setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", 1);
+        setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
     }
 
     /* Check if browser mode requested */
@@ -1497,30 +1555,27 @@ int main(int argc, char *argv[]) {
             "(function() {"
             "  try {"
             "    sessionStorage.setItem('viber_local_pairing_code', '%s');"
-            "    var raw = sessionStorage.getItem('viber_host_config_v2');"
-            "    if (!raw) {"
-            "      var b = '%s'.trim().replace(/-/g, '+').replace(/_/g, '/');"
-            "      var padded = b + '='.repeat((4 - b.length %% 4) %% 4);"
-            "      var bin = atob(padded);"
-            "      var bytes = new Uint8Array(bin.length);"
-            "      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);"
-            "      var d = JSON.parse(new TextDecoder('utf-8').decode(bytes));"
-            "      if (d && d.v === 2 && d.pub && d.token) {"
-            "        sessionStorage.setItem('viber_host_config_v2', JSON.stringify({"
-            "          protocolVersion: 2,"
-            "          hostId: d.id,"
-            "          hostPub: d.pub,"
-            "          hostName: d.name || 'Local Host',"
-            "          directPort: d.port || %d,"
-            "          token: d.token,"
-            "          tailscaleIps: d.tailscale || [],"
-            "          lanIps: d.lan || ['127.0.0.1'],"
-            "          relayUrl: d.relay || '',"
-            "          directUrl: d.direct_url || '',"
-            "          ssl: Boolean(d.ssl),"
-            "          fingerprint: (d.id || '').replace(/^host-/, '')"
-            "        }));"
-            "      }"
+            "    var b = '%s'.trim().replace(/-/g, '+').replace(/_/g, '/');"
+            "    var padded = b + '='.repeat((4 - b.length %% 4) %% 4);"
+            "    var bin = atob(padded);"
+            "    var bytes = new Uint8Array(bin.length);"
+            "    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);"
+            "    var d = JSON.parse(new TextDecoder('utf-8').decode(bytes));"
+            "    if (d && d.v === 2 && d.pub && d.token) {"
+            "      sessionStorage.setItem('viber_host_config_v2', JSON.stringify({"
+            "        protocolVersion: 2,"
+            "        hostId: d.id,"
+            "        hostPub: d.pub,"
+            "        hostName: d.name || 'Local Host',"
+            "        directPort: d.port || %d,"
+            "        token: d.token,"
+            "        tailscaleIps: d.tailscale || [],"
+            "        lanIps: d.lan || ['127.0.0.1'],"
+            "        relayUrl: d.relay || '',"
+            "        directUrl: d.direct_url || '',"
+            "        ssl: Boolean(d.ssl),"
+            "        fingerprint: (d.id || '').replace(/^host-/, '')"
+            "      }));"
             "    }"
             "  } catch(e) {}"
             "})();",

@@ -47,11 +47,16 @@ def get_or_create_tls_context(config, san_hosts=None):
 
     if auto_cert.is_file() and auto_key.is_file():
         try:
+            cert_bytes = auto_cert.read_bytes()
+            existing_cert = x509.load_pem_x509_certificate(cert_bytes)
+            bc = existing_cert.extensions.get_extension_for_oid(x509.ExtensionOID.BASIC_CONSTRAINTS).value
+            if not bc.ca:
+                raise ValueError("Self-signed root certificate must have ca=True for strict TLS stacks")
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(certfile=str(auto_cert), keyfile=str(auto_key))
             return ctx
         except Exception:
-            pass  # regenerate if invalid
+            pass  # regenerate if invalid or ca=False
 
     private_key = ec.generate_private_key(ec.SECP256R1())
     subject = issuer = x509.Name([
@@ -84,7 +89,7 @@ def get_or_create_tls_context(config, san_hosts=None):
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=3650))
         .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
-        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .sign(private_key, hashes.SHA256())
     )
 

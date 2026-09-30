@@ -39,12 +39,14 @@ export default function App() {
 
     try {
       const autoCode = sessionStorage.getItem('viber_local_pairing_code');
-      if (autoCode && (!hostConfig.hostPub || !hostConfig.token)) {
+      if (autoCode) {
         parsePairingBundle(autoCode).then((cfg) => {
-          handleSaveConfig(cfg);
+          if (!hostConfig.hostPub || !hostConfig.token || hostConfig.hostPub !== cfg.hostPub) {
+            handleSaveConfig(cfg);
+          }
           setIsPairingModalOpen(false);
         }).catch(() => {
-          setIsPairingModalOpen(true);
+          if (!hostConfig.hostPub || !hostConfig.token) setIsPairingModalOpen(true);
         });
       } else if (!hostConfig.hostPub || !hostConfig.token) {
         setIsPairingModalOpen(true);
