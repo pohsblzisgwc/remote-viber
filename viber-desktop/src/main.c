@@ -87,6 +87,7 @@ typedef struct {
     gboolean is_loading;
     gboolean load_failed;
     gboolean explicit_url;
+    gboolean has_detected_url;
     gboolean has_fallback_tried;
     guint poll_timer_id;
     pid_t spawned_host_pid;
@@ -331,6 +332,7 @@ static void find_local_pairing_code(AppState *state) {
             char *url_part = g_strstrip(trimmed + 9);
             if (!state->explicit_url && url_part[0] != '\0') {
                 strncpy(state->target_url, url_part, sizeof(state->target_url) - 1);
+                state->has_detected_url = TRUE;
                 app_log("AUTH", "从 --pair-info 识别到默认工作台地址: %s", state->target_url);
             }
         }
@@ -522,7 +524,6 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
 
     if (event == WEBKIT_LOAD_STARTED) {
         state->is_loading = TRUE;
-        state->load_failed = FALSE;
         app_log("LOAD", "事件 WEBKIT_LOAD_STARTED (URI: %s)", current_uri ? current_uri : state->target_url);
     } else if (event == WEBKIT_LOAD_REDIRECTED) {
         app_log("LOAD", "事件 WEBKIT_LOAD_REDIRECTED (新 URI: %s)", current_uri ? current_uri : "unknown");
@@ -560,6 +561,8 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
         stop_poll_timer(state);
         gtk_spinner_stop(GTK_SPINNER(state->spinner));
         gtk_stack_set_visible_child(GTK_STACK(state->stack), state->web_view);
+        gtk_widget_queue_draw(state->web_view);
+        gtk_widget_queue_draw(state->window);
         
         char status_str[128];
         snprintf(status_str, sizeof(status_str),
@@ -641,7 +644,7 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
             snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
             app_log("FALLBACK", "HTTPS 加载遇到 TLS 异常，自动降级至 HTTP 明文协议重试: %s", state->target_url);
             state->is_loading = TRUE;
-            state->load_failed = FALSE;
+            state->load_failed = TRUE;
             webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
             return TRUE;
         }
@@ -653,7 +656,7 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
         snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
         app_log("FALLBACK", "HTTP 连接失败，自动切换至 HTTPS 安全模式重新加载: %s", state->target_url);
         state->is_loading = TRUE;
-        state->load_failed = FALSE;
+        state->load_failed = TRUE;
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
         return TRUE;
     }
@@ -899,6 +902,13 @@ static void apply_dark_theme(void) {
 static void on_quick_term_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
+    if (!state->page_loaded) {
+        if (!state->is_loading) {
+            app_log("ACTION", "工作台尚未呈现，点击启动终端触发重新连接探测...");
+            check_host_ready_cb(state);
+        }
+        return;
+    }
     const char *js =
         "try {"
         "  window.dispatchEvent(new CustomEvent('viber:quickTerminal'));"
@@ -1206,6 +1216,7 @@ int main(int argc, char *argv[]) {
     setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", 1);
     if (force_software_rendering) {
         setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", 1);
     }
 
     /* Check if browser mode requested */
@@ -1280,7 +1291,7 @@ int main(int argc, char *argv[]) {
         snprintf(app_state.target_url, sizeof(app_state.target_url), "https://%s:%d/", app_state.host, app_state.port);
     }
 
-    if (!app_state.explicit_url && is_port_open(app_state.host, app_state.port)) {
+    if (!app_state.explicit_url && !app_state.has_detected_url && is_port_open(app_state.host, app_state.port)) {
         if (probe_is_plain_http(app_state.host, app_state.port)) {
             snprintf(app_state.target_url, sizeof(app_state.target_url), "http://%s:%d/", app_state.host, app_state.port);
         } else {
@@ -1384,8 +1395,8 @@ int main(int argc, char *argv[]) {
 
     /* Main Stack Container */
     app_state.stack = gtk_stack_new();
-    gtk_stack_set_transition_type(GTK_STACK(app_state.stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
-    gtk_stack_set_transition_duration(GTK_STACK(app_state.stack), 250);
+    gtk_stack_set_transition_type(GTK_STACK(app_state.stack), GTK_STACK_TRANSITION_TYPE_NONE);
+    gtk_stack_set_transition_duration(GTK_STACK(app_state.stack), 0);
 
     /* Loading / Waiting View: Encapsulated inside a high-end Glassmorphic Floating Panel */
     app_state.loading_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -1537,6 +1548,9 @@ int main(int argc, char *argv[]) {
         "  console.error = function() { origErr.apply(console, arguments); sendLog('ERR', arguments); };"
         "  window.addEventListener('error', function(e) {"
         "    sendLog('UNCAUGHT-ERR', [e.message || '', e.filename || '', e.lineno || '']);"
+        "  });"
+        "  window.addEventListener('unhandledrejection', function(e) {"
+        "    sendLog('UNHANDLED-REJECTION', [e.reason ? (e.reason.stack || String(e.reason)) : 'unknown']);"
         "  });"
         "})();";
     WebKitUserScript *bridge_script = webkit_user_script_new(

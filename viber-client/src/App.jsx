@@ -184,6 +184,7 @@ export default function App() {
 
   // Direct Quick Terminal without needing an agent
   const handleQuickTerminal = (cwd = '', folder = '') => {
+    setActiveView('terminal');
     if (connectionRef.current) {
       connectionRef.current.launchTerminal({
         cwd: cwd || '',
