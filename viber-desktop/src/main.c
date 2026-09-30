@@ -1417,6 +1417,8 @@ int main(int argc, char *argv[]) {
     gboolean detach_to_background = FALSE;
     gboolean force_software_rendering = FALSE;
     gboolean launch_browser_mode = FALSE;
+    gboolean force_ssl = FALSE;
+    gboolean force_no_ssl = FALSE;
     char custom_log_path[1024] = {0};
 
     /* Parse command line arguments */
@@ -1428,6 +1430,10 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc) {
             snprintf(app_state.target_url, sizeof(app_state.target_url), "%s", argv[++i]);
             app_state.explicit_url = TRUE;
+        } else if (strcmp(argv[i], "--ssl") == 0 || strcmp(argv[i], "--tls") == 0 || strcmp(argv[i], "--https") == 0) {
+            force_ssl = TRUE;
+        } else if (strcmp(argv[i], "--no-ssl") == 0 || strcmp(argv[i], "--http") == 0) {
+            force_no_ssl = TRUE;
         } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
             g_strlcpy(custom_log_path, argv[++i], sizeof(custom_log_path));
         } else if (strcmp(argv[i], "--detach") == 0 || strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--bg") == 0) {
@@ -1448,6 +1454,8 @@ int main(int argc, char *argv[]) {
                     "选项:\n"
                     "  --port <port>     指定服务端连接端口 (默认: 8765)\n"
                     "  --host <ip>       指定服务端连接IP (默认: 127.0.0.1)\n"
+                    "  --ssl, --https    强制使用 HTTPS 安全协议连接\n"
+                    "  --no-ssl, --http  强制使用明文 HTTP 协议连接\n"
                     "  --url <url>       直接指定连接完整 URL (例如 https://192.168.1.100:8765/)\n"
                     "  --log-file <path> 指定全量运行诊断日志输出文件 (默认: /tmp/viber-desktop.log)\n"
                     "  --zoom <factor>   工作台缩放比例 (默认: 1.0, 范围: 0.5 - 3.0)\n"
@@ -1470,8 +1478,26 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (force_ssl) {
+        snprintf(app_state.target_url, sizeof(app_state.target_url), "https://%s:%d/", app_state.host, app_state.port);
+        app_state.explicit_url = TRUE;
+    } else if (force_no_ssl) {
+        snprintf(app_state.target_url, sizeof(app_state.target_url), "http://%s:%d/", app_state.host, app_state.port);
+        app_state.explicit_url = TRUE;
+    }
+
     /* Initialize persistent diagnostic log file immediately */
     init_log_file(custom_log_path);
+
+    /* Completely bypass any system/environment HTTP/SOCKS proxies for local communication */
+    unsetenv("http_proxy");
+    unsetenv("https_proxy");
+    unsetenv("all_proxy");
+    unsetenv("HTTP_PROXY");
+    unsetenv("HTTPS_PROXY");
+    unsetenv("ALL_PROXY");
+    setenv("no_proxy", "*", 1);
+    setenv("NO_PROXY", "*", 1);
 
     /* Enforce modern Linux compositor & driver compatibility */
     setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
@@ -1765,11 +1791,13 @@ int main(int argc, char *argv[]) {
 
     G_GNUC_BEGIN_IGNORE_DEPRECATIONS
     webkit_web_context_set_tls_errors_policy(ctx, WEBKIT_TLS_ERRORS_POLICY_IGNORE);
+    webkit_web_context_set_network_proxy_settings(ctx, WEBKIT_NETWORK_PROXY_MODE_NO_PROXY, NULL);
     G_GNUC_END_IGNORE_DEPRECATIONS
 
     WebKitWebsiteDataManager *manager = webkit_web_context_get_website_data_manager(ctx);
     if (manager) {
         webkit_website_data_manager_set_tls_errors_policy(manager, WEBKIT_TLS_ERRORS_POLICY_IGNORE);
+        webkit_website_data_manager_set_network_proxy_settings(manager, WEBKIT_NETWORK_PROXY_MODE_NO_PROXY, NULL);
     }
 
     WebKitSettings *settings = webkit_settings_new();
