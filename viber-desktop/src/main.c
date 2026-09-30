@@ -165,6 +165,7 @@ static void find_local_pairing_code(AppState *state) {
             char *url_part = g_strstrip(trimmed + 9);
             if (!state->explicit_url && url_part[0] != '\0') {
                 strncpy(state->target_url, url_part, sizeof(state->target_url) - 1);
+                state->explicit_url = TRUE;
             }
         }
         if (g_str_has_prefix(trimmed, "eyJ2")) {
@@ -432,33 +433,6 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
         return TRUE;
     }
 
-    /* 4. Intelligent protocol fallback: only fallback from https to http if TLS handshake failed on default URL */
-    if (!state->explicit_url && !state->has_fallback_tried) {
-        gboolean is_tls_handshake_err = FALSE;
-        if (error && error->message) {
-            if (strstr(error->message, "TLS handshake") != NULL ||
-                strstr(error->message, "handshake") != NULL ||
-                strstr(error->message, "non-properly terminated") != NULL ||
-                strstr(error->message, "not TLS") != NULL) {
-                is_tls_handshake_err = TRUE;
-            }
-        }
-
-        /* If https failed because server is plain HTTP (terminated TLS handshake) */
-        if (g_str_has_prefix(state->target_url, "https://") && is_tls_handshake_err) {
-            state->has_fallback_tried = TRUE;
-            char fallback_url[512];
-            snprintf(fallback_url, sizeof(fallback_url), "http://%s:%d/", state->host, state->port);
-            g_print("[RemoteViber] 服务端运行在纯 HTTP 模式，自动切换至 %s...\n", fallback_url);
-            fflush(stdout);
-            snprintf(state->target_url, sizeof(state->target_url), "%s", fallback_url);
-            state->is_loading = TRUE;
-            state->load_failed = FALSE;
-            webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
-            return TRUE;
-        }
-    }
-
     g_printerr("[RemoteViber] 页面加载失败: %s (原因: %s)\n", failing_uri ? failing_uri : "", error ? error->message : "无法连接");
 
     state->load_failed = TRUE;
@@ -511,9 +485,6 @@ static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *f
     if (context && certificate) {
         webkit_web_context_allow_tls_certificate_for_host(context, certificate, host);
     }
-    state->is_loading = TRUE;
-    state->load_failed = FALSE;
-    webkit_web_view_load_uri(web_view, state->target_url);
     return TRUE;
 }
 
@@ -1056,6 +1027,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    find_local_pairing_code(&app_state);
+
     if (app_state.target_url[0] != '\0') {
         GUri *u = g_uri_parse(app_state.target_url, G_URI_FLAGS_NONE, NULL);
         if (u) {
@@ -1261,6 +1234,10 @@ int main(int argc, char *argv[]) {
     /* WebKitWebView Setup (Software rendering policy guarantees zero DRI3 crash or black screen) */
     WebKitWebContext *ctx = webkit_web_context_get_default();
     webkit_web_context_set_sandbox_enabled(ctx, FALSE);
+
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    webkit_web_context_set_tls_errors_policy(ctx, WEBKIT_TLS_ERRORS_POLICY_IGNORE);
+    G_GNUC_END_IGNORE_DEPRECATIONS
 
     WebKitWebsiteDataManager *manager = webkit_web_context_get_website_data_manager(ctx);
     if (manager) {
