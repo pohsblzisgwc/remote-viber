@@ -18,6 +18,7 @@ export class ViberConnection {
     this._generation = 0;
     this._connecting = false;
     this._ctx = null;
+    this._pendingQueue = [];
   }
   on(event, callback) {
     if (!this.listeners.has(event)) this.listeners.set(event, new Set());
@@ -188,6 +189,12 @@ export class ViberConnection {
             this._startHeartbeat(); resolve();
             if (this.activeSessionId) this.attachSession(this.activeSessionId, this.lastReceivedSeq);
             else { this.getStats(); this.listProfiles(); }
+            if (this._pendingQueue.length > 0) {
+              const queued = this._pendingQueue.splice(0);
+              for (const msg of queued) {
+                this.send(msg);
+              }
+            }
           } else this._handleDecryptedMessage(msg);
         }).catch((error) => { if (current()) fail(error, true); }).finally(() => { pendingReceives--; });
       };
@@ -218,7 +225,15 @@ export class ViberConnection {
   }
   send(message) {
     const ctx = this._ctx;
-    if (!ctx || this.status !== 'connected' || ctx.socket.readyState !== WebSocket.OPEN || ctx.pending >= 64) return Promise.resolve(false);
+    if (!ctx || this.status !== 'connected' || ctx.socket.readyState !== WebSocket.OPEN) {
+      if (['LAUNCH_TERMINAL', 'LAUNCH_AGENT', 'GET_STATS', 'LIST_PROFILES'].includes(message?.type)) {
+        if (this._pendingQueue.length < 16) {
+          this._pendingQueue.push(message);
+        }
+      }
+      return Promise.resolve(false);
+    }
+    if (ctx.pending >= 64) return Promise.resolve(false);
     ctx.pending++;
     const work = ctx.txTail.then(async () => {
       if (this._ctx !== ctx || ctx.socket.readyState !== WebSocket.OPEN) return false;
@@ -251,6 +266,7 @@ export class ViberConnection {
     this.shouldReconnect = false;
     ++this._generation;
     this._connecting = false;
+    this._pendingQueue = [];
     this._stopHeartbeat();
     clearTimeout(this.reconnectTimer); this.reconnectTimer = null;
     const ctx = this._ctx;

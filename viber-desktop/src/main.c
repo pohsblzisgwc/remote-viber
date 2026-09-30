@@ -410,31 +410,29 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
         }
     }
 
-    /* 2. If already loaded, ignore any subresource failures */
+    /* 2. Subresource check: if failing_uri is not the main page URL, completely ignore it */
+    if (failing_uri && state->target_url[0] != '\0') {
+        char norm_target[512] = {0};
+        char norm_failing[512] = {0};
+        g_strlcpy(norm_target, state->target_url, sizeof(norm_target));
+        g_strlcpy(norm_failing, failing_uri, sizeof(norm_failing));
+        size_t lt = strlen(norm_target);
+        if (lt > 0 && norm_target[lt - 1] == '/') norm_target[lt - 1] = '\0';
+        size_t lf = strlen(norm_failing);
+        if (lf > 0 && norm_failing[lf - 1] == '/') norm_failing[lf - 1] = '\0';
+
+        if (strcmp(norm_target, norm_failing) != 0) {
+            /* Any failure from a subresource (/assets/..., favicon, cdn fonts, etc.) MUST NOT break or flip the page! */
+            return TRUE;
+        }
+    }
+
+    /* 3. If already loaded, ignore any subresource failures */
     if (state->page_loaded) {
         return TRUE;
     }
 
-    /* 3. If failing_uri is an external resource (e.g. Google Fonts, CDN), ignore and do not break the page */
-    if (failing_uri && state->target_url[0] != '\0') {
-        GUri *u_fail = g_uri_parse(failing_uri, G_URI_FLAGS_NONE, NULL);
-        GUri *u_target = g_uri_parse(state->target_url, G_URI_FLAGS_NONE, NULL);
-        if (u_fail && u_target) {
-            const char *h_fail = g_uri_get_host(u_fail);
-            const char *h_target = g_uri_get_host(u_target);
-            gboolean is_diff = (h_fail && h_target && g_ascii_strcasecmp(h_fail, h_target) != 0);
-            g_uri_unref(u_fail);
-            g_uri_unref(u_target);
-            if (is_diff) {
-                return TRUE;
-            }
-        } else {
-            if (u_fail) g_uri_unref(u_fail);
-            if (u_target) g_uri_unref(u_target);
-        }
-    }
-
-    /* 4. Intelligent protocol fallback (only once, and only when URL was not explicitly forced) */
+    /* 4. Intelligent protocol fallback: only fallback from https to http if TLS handshake failed on default URL */
     if (!state->explicit_url && !state->has_fallback_tried) {
         gboolean is_tls_handshake_err = FALSE;
         if (error && error->message) {
@@ -452,20 +450,6 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
             char fallback_url[512];
             snprintf(fallback_url, sizeof(fallback_url), "http://%s:%d/", state->host, state->port);
             g_print("[RemoteViber] 服务端运行在纯 HTTP 模式，自动切换至 %s...\n", fallback_url);
-            fflush(stdout);
-            snprintf(state->target_url, sizeof(state->target_url), "%s", fallback_url);
-            state->is_loading = TRUE;
-            state->load_failed = FALSE;
-            webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
-            return TRUE;
-        }
-
-        /* If http failed and port is open, try https */
-        if (g_str_has_prefix(state->target_url, "http://")) {
-            state->has_fallback_tried = TRUE;
-            char fallback_url[512];
-            snprintf(fallback_url, sizeof(fallback_url), "https://%s:%d/", state->host, state->port);
-            g_print("[RemoteViber] 检测到服务端启用了 TLS/HTTPS，自动切换至 %s...\n", fallback_url);
             fflush(stdout);
             snprintf(state->target_url, sizeof(state->target_url), "%s", fallback_url);
             state->is_loading = TRUE;
@@ -551,16 +535,27 @@ static void on_web_process_terminated(WebKitWebView *web_view, WebKitWebProcessT
 
 /* Apply GTK custom styles */
 static void apply_dark_theme(void) {
+    GtkSettings *gtk_settings = gtk_settings_get_default();
+    if (gtk_settings) {
+        g_object_set(gtk_settings,
+            "gtk-xft-antialias", 1,
+            "gtk-xft-hinting", 1,
+            "gtk-xft-hintstyle", "hintslight",
+            "gtk-xft-rgba", "rgb",
+            NULL);
+    }
+
     GtkCssProvider *provider = gtk_css_provider_new();
     const char *css =
         "window, .remote-viber-window {"
         "  background-color: #060911;"
         "  color: #f8fafc;"
+        "  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Noto Sans\", Ubuntu, Cantarell, sans-serif;"
         "}"
         "headerbar, .remote-viber-header {"
         "  background-color: #0b0f19;"
         "  background-image: linear-gradient(to bottom, #0d1424, #080c16);"
-        "  border-bottom: 1px solid rgba(56, 189, 248, 0.2);"
+        "  border-bottom: 1px solid rgba(56, 189, 248, 0.25);"
         "  padding: 4px 8px;"
         "  min-height: 44px;"
         "  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);"
@@ -582,26 +577,27 @@ static void apply_dark_theme(void) {
         "  padding: 2px 10px;"
         "}"
         "headerbar button, .titlebar button, button.action-btn {"
-        "  background-color: rgba(30, 41, 59, 0.65);"
+        "  background-color: rgba(30, 41, 59, 0.75);"
         "  background-image: none;"
-        "  border: 1px solid rgba(56, 189, 248, 0.25);"
-        "  color: #cbd5e1;"
+        "  border: 1px solid rgba(56, 189, 248, 0.3);"
+        "  color: #e2e8f0;"
         "  border-radius: 8px;"
-        "  padding: 4px 11px;"
+        "  padding: 4px 12px;"
         "  font-size: 12px;"
-        "  font-weight: 500;"
+        "  font-weight: 600;"
+        "  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Noto Sans\", Ubuntu, Cantarell, sans-serif;"
         "  box-shadow: none;"
         "  text-shadow: none;"
         "  transition: all 150ms ease-in-out;"
         "}"
         "headerbar button:hover, .titlebar button:hover, button.action-btn:hover {"
-        "  background-color: rgba(56, 189, 248, 0.15);"
-        "  border-color: rgba(56, 189, 248, 0.5);"
+        "  background-color: rgba(56, 189, 248, 0.18);"
+        "  border-color: rgba(56, 189, 248, 0.6);"
         "  color: #38bdf8;"
         "  box-shadow: 0 0 12px rgba(56, 189, 248, 0.25);"
         "}"
         "headerbar button:active, .titlebar button:active, button.action-btn:active {"
-        "  background-color: rgba(56, 189, 248, 0.3);"
+        "  background-color: rgba(56, 189, 248, 0.35);"
         "  border-color: #38bdf8;"
         "  color: #ffffff;"
         "}"
@@ -954,6 +950,8 @@ int main(int argc, char *argv[]) {
     }
 
     gboolean detach_to_background = FALSE;
+    gboolean force_software_rendering = FALSE;
+    gboolean launch_browser_mode = FALSE;
 
     /* Parse command line arguments */
     for (int i = 1; i < argc; i++) {
@@ -966,6 +964,10 @@ int main(int argc, char *argv[]) {
             app_state.explicit_url = TRUE;
         } else if (strcmp(argv[i], "--detach") == 0 || strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--bg") == 0) {
             detach_to_background = TRUE;
+        } else if (strcmp(argv[i], "--software") == 0 || strcmp(argv[i], "--software-rendering") == 0 || strcmp(argv[i], "--no-accel") == 0) {
+            force_software_rendering = TRUE;
+        } else if (strcmp(argv[i], "--browser") == 0 || strcmp(argv[i], "--chrome") == 0 || strcmp(argv[i], "--app") == 0) {
+            launch_browser_mode = TRUE;
         } else if (strcmp(argv[i], "--zoom") == 0 && i + 1 < argc) {
             double z = atof(argv[++i]);
             if (z >= 0.5 && z <= 3.0) {
@@ -980,6 +982,8 @@ int main(int argc, char *argv[]) {
                     "  --host <ip>     指定服务端连接IP (默认: 127.0.0.1)\n"
                     "  --url <url>     直接指定连接完整 URL (例如 https://192.168.1.100:8765/)\n"
                     "  --zoom <factor> 工作台缩放比例 (默认: 1.0, 范围: 0.5 - 3.0)\n"
+                    "  --software      强制软件渲染兼容模式 (禁用 GPU 硬件加速)\n"
+                    "  --browser       在系统 Chrome/Chromium 独立应用窗口中启动工作台\n"
                     "  -d, --detach    转入后台独立运行，立即释放终端交互提示符\n"
                     "  --help, -h      显示帮助信息\n\n"
                     "快捷键:\n"
@@ -997,9 +1001,51 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Enforce software rendering & container compatibility */
+    /* Enforce modern Linux compositor & driver compatibility */
     setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
-    setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", 1);
+    /* WEBKIT_DISABLE_DMABUF_RENDERER=1 fixes black screen on modern WebKitGTK 2.40-2.52 with Wayland / NVIDIA / Mesa */
+    setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", 1);
+    if (force_software_rendering) {
+        setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", 1);
+    }
+
+    /* Check if browser mode requested */
+    if (launch_browser_mode) {
+        const char *browsers[] = {
+            "google-chrome-stable",
+            "google-chrome",
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "microsoft-edge-stable",
+            NULL
+        };
+        char app_url[512];
+        if (app_state.target_url[0] != '\0') {
+            snprintf(app_url, sizeof(app_url), "%s", app_state.target_url);
+        } else {
+            snprintf(app_url, sizeof(app_url), "http://%s:%d/", app_state.host, app_state.port);
+        }
+        for (int b = 0; browsers[b]; b++) {
+            char *bpath = g_find_program_in_path(browsers[b]);
+            if (bpath) {
+                g_print("[RemoteViber] 使用系统浏览器独立应用窗口启动: %s\n", bpath);
+                char *app_arg = g_strdup_printf("--app=%s", app_url);
+                char *ud_arg = g_strdup_printf("--user-data-dir=%s/.config/remote-viber/profile", g_get_home_dir());
+                pid_t bpid = fork();
+                if (bpid == 0) {
+                    setsid();
+                    execl(bpath, browsers[b], app_arg, "--window-size=1600,960", ud_arg, NULL);
+                    _exit(127);
+                }
+                g_free(app_arg);
+                g_free(ud_arg);
+                g_free(bpath);
+                if (bpid > 0) return 0;
+            }
+        }
+        g_print("[RemoteViber] 未检测到 Chrome/Chromium 浏览器，回退至原生 GTK+WebKit 模式。\n");
+    }
 
     if (!gtk_init_check(&argc, &argv)) {
         g_printerr("[RemoteViber] 未检测到图形桌面环境 (DISPLAY 或 WAYLAND_DISPLAY 未设置)。\n"
@@ -1076,34 +1122,34 @@ int main(int argc, char *argv[]) {
     gtk_box_pack_start(GTK_BOX(app_state.status_badge), app_state.status_label, FALSE, FALSE, 4);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.status_badge);
 
-    /* Quick Action Buttons on HeaderBar */
-    app_state.btn_quick_term = gtk_button_new_with_label("➕ 启动终端 (Alt+N)");
+    /* Quick Action Buttons on HeaderBar - Use standard unicode symbols that never render as tofu boxes */
+    app_state.btn_quick_term = gtk_button_new_with_label("+ 启动终端 (Alt+N)");
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_quick_term), "action-btn");
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_quick_term), "quick-term-btn");
     g_signal_connect(app_state.btn_quick_term, "clicked", G_CALLBACK(on_quick_term_clicked), &app_state);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_quick_term);
 
-    app_state.btn_launch_agent = gtk_button_new_with_label("🚀 启动 Agent (Alt+A)");
+    app_state.btn_launch_agent = gtk_button_new_with_label("⚡ 启动 Agent (Alt+A)");
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_launch_agent), "action-btn");
     g_signal_connect(app_state.btn_launch_agent, "clicked", G_CALLBACK(on_launch_agent_clicked), &app_state);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_launch_agent);
 
-    app_state.btn_mosaic = gtk_button_new_with_label("🔲 拼图网格 (Alt+M)");
+    app_state.btn_mosaic = gtk_button_new_with_label("⊞ 拼图网格 (Alt+M)");
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_mosaic), "action-btn");
     g_signal_connect(app_state.btn_mosaic, "clicked", G_CALLBACK(on_mosaic_clicked), &app_state);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_mosaic);
 
-    app_state.btn_single = gtk_button_new_with_label("🖥️ 单终端 (Alt+\\)");
+    app_state.btn_single = gtk_button_new_with_label("▶ 单终端 (Alt+\\)");
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_single), "action-btn");
     g_signal_connect(app_state.btn_single, "clicked", G_CALLBACK(on_single_clicked), &app_state);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_single);
 
-    app_state.btn_dashboard = gtk_button_new_with_label("📊 仪表盘 (Alt+D)");
+    app_state.btn_dashboard = gtk_button_new_with_label("☰ 仪表盘 (Alt+D)");
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_dashboard), "action-btn");
     g_signal_connect(app_state.btn_dashboard, "clicked", G_CALLBACK(on_dashboard_clicked), &app_state);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_dashboard);
 
-    app_state.btn_pairing = gtk_button_new_with_label("🔑 配对凭据");
+    app_state.btn_pairing = gtk_button_new_with_label("配对凭据");
     gtk_style_context_add_class(gtk_widget_get_style_context(app_state.btn_pairing), "action-btn");
     g_signal_connect(app_state.btn_pairing, "clicked", G_CALLBACK(on_pairing_clicked), &app_state);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(app_state.header_bar), app_state.btn_pairing);
@@ -1225,7 +1271,8 @@ int main(int argc, char *argv[]) {
     webkit_settings_set_enable_javascript(settings, TRUE);
     webkit_settings_set_enable_developer_extras(settings, TRUE);
     webkit_settings_set_enable_page_cache(settings, TRUE);
-    webkit_settings_set_hardware_acceleration_policy(settings, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+    webkit_settings_set_hardware_acceleration_policy(settings,
+        force_software_rendering ? WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER : WEBKIT_HARDWARE_ACCELERATION_POLICY_ON_DEMAND);
     webkit_settings_set_zoom_text_only(settings, FALSE);
 
     app_state.web_view = webkit_web_view_new_with_context(ctx);

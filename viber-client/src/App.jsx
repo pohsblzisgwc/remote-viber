@@ -190,6 +190,21 @@ export default function App() {
     }
   };
 
+  // Auto-launch initial terminal session on desktop client / fresh localhost if no sessions exist
+  const hasAutoLaunchedRef = useRef(false);
+  useEffect(() => {
+    if (connectionState === 'connected' && !hasAutoLaunchedRef.current) {
+      const isLocalhost = typeof window !== 'undefined' && 
+        (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost');
+      const isDesktop = Boolean(window.sessionStorage?.getItem('viber_local_pairing_code') || isLocalhost);
+      if (isDesktop && sessions.length === 0) {
+        hasAutoLaunchedRef.current = true;
+        handleQuickTerminal();
+        setActiveView('terminal');
+      }
+    }
+  }, [connectionState, sessions]);
+
   // Integration with native desktop client buttons and hotkeys
   useEffect(() => {
     const onQuickTerm = () => handleQuickTerminal();

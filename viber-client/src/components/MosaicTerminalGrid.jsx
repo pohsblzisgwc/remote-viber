@@ -498,39 +498,90 @@ export default function MosaicTerminalGrid({
       </div>
 
       {/* Main Mosaic Grid Container */}
-      <div
-        className={`flex-1 p-2 gap-2 overflow-hidden bg-[#090d16] ${getGridClasses()}`}
-        style={{
-          transition: 'all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)',
-        }}
-      >
-        {pinnedSessions.map((session, idx) => {
-          // If a tile is maximized, only render the maximized one
-          if (maximizedId && session.session_id !== maximizedId) return null;
+      {pinnedSessions.length === 0 ? (
+        <div className="flex-1 flex flex-col items-center justify-center p-6 text-center select-none animate-in fade-in duration-200">
+          <div className="max-w-lg w-full bg-[#0c1220]/90 border border-cyan-500/30 rounded-2xl p-8 backdrop-blur-md shadow-2xl flex flex-col items-center gap-5">
+            <div className="w-16 h-16 rounded-2xl bg-cyan-500/10 border border-cyan-500/40 flex items-center justify-center text-cyan-400 shadow-[0_0_25px_rgba(6,182,212,0.25)]">
+              <TerminalIcon className="w-8 h-8" />
+            </div>
 
-          return (
-            <MosaicTerminalTile
-              key={session.session_id}
-              session={session}
-              connection={connection}
-              isFocused={session.session_id === focusedId}
-              onFocus={handleFocusTile}
-              isMaximized={maximizedId === session.session_id}
-              onToggleMaximize={handleToggleMaximize}
-              onSplitRight={handleSplitRight}
-              onSplitDown={handleSplitDown}
-              onClose={handleRemoveTile}
-              index={idx}
-              totalTiles={pinnedSessions.length}
-              onDragStart={handleDragStart}
-              onDragOverTile={handleDragOverTile}
-              onDragLeaveTile={handleDragLeaveTile}
-              onDropOnTile={handleDropOnTile}
-              dragState={dragState}
-            />
-          );
-        })}
-      </div>
+            <div className="space-y-2">
+              <h2 className="text-xl font-bold text-slate-100 tracking-wide">
+                4格拼图终端矩阵 · 就绪
+              </h2>
+              <p className="text-xs sm:text-sm text-slate-400 leading-relaxed">
+                当前暂无运行中的终端会话。点击下方按钮或随时按快捷键立即开启全交互终端。
+              </p>
+            </div>
+
+            <div className="flex flex-col sm:flex-row items-center gap-3 w-full">
+              <button
+                onClick={() => onNewTerminal?.()}
+                autoFocus
+                className="w-full sm:flex-1 py-3 px-5 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-semibold text-sm shadow-lg shadow-cyan-600/30 border border-cyan-400/40 transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-95"
+              >
+                <Plus className="w-4 h-4" />
+                <span>立即新建终端 (Alt+N)</span>
+              </button>
+              <button
+                onClick={() => onSwitchToDashboard?.()}
+                className="w-full sm:w-auto py-3 px-4 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-slate-300 font-medium text-sm border border-slate-700 transition-all cursor-pointer"
+              >
+                返回控制面板
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 w-full pt-4 border-t border-slate-800/80 text-[11px] text-slate-400 font-mono">
+              <div className="bg-[#090d16] p-2 rounded-lg border border-slate-800">
+                <span className="text-cyan-400 font-bold">Alt+N</span> 新建终端
+              </div>
+              <div className="bg-[#090d16] p-2 rounded-lg border border-slate-800">
+                <span className="text-cyan-400 font-bold">Alt+M</span> 拼图网格
+              </div>
+              <div className="bg-[#090d16] p-2 rounded-lg border border-slate-800">
+                <span className="text-cyan-400 font-bold">Alt+\</span> 单终端
+              </div>
+              <div className="bg-[#090d16] p-2 rounded-lg border border-slate-800">
+                <span className="text-cyan-400 font-bold">Alt+D</span> 控制面板
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div
+          className={`flex-1 p-2 gap-2 overflow-hidden bg-[#090d16] ${getGridClasses()}`}
+          style={{
+            transition: 'all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)',
+          }}
+        >
+          {pinnedSessions.map((session, idx) => {
+            // If a tile is maximized, only render the maximized one
+            if (maximizedId && session.session_id !== maximizedId) return null;
+
+            return (
+              <MosaicTerminalTile
+                key={session.session_id}
+                session={session}
+                connection={connection}
+                isFocused={session.session_id === focusedId}
+                onFocus={handleFocusTile}
+                isMaximized={maximizedId === session.session_id}
+                onToggleMaximize={handleToggleMaximize}
+                onSplitRight={handleSplitRight}
+                onSplitDown={handleSplitDown}
+                onClose={handleRemoveTile}
+                index={idx}
+                totalTiles={pinnedSessions.length}
+                onDragStart={handleDragStart}
+                onDragOverTile={handleDragOverTile}
+                onDragLeaveTile={handleDragLeaveTile}
+                onDropOnTile={handleDropOnTile}
+                dragState={dragState}
+              />
+            );
+          })}
+        </div>
+      )}
 
       {/* Floating Keyboard Shortcuts Cheat Sheet Modal */}
       {isShortcutModalOpen && (
