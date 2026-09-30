@@ -8,9 +8,12 @@
 #define _GNU_SOURCE
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
+#include <jsc/jsc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -25,6 +28,25 @@
 #define DEFAULT_PORT 8765
 #define APP_TITLE "RemoteViber 终端拼图工作台"
 #define APP_ID "com.remoteviber.desktop"
+
+/* Unified timestamped diagnostic logger */
+static void app_log(const char *tag, const char *fmt, ...) {
+    time_t rawtime;
+    struct tm timeinfo;
+    time(&rawtime);
+    localtime_r(&rawtime, &timeinfo);
+    char time_str[32];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", &timeinfo);
+
+    char buffer[2048];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+
+    g_print("[%s][RemoteViber][%s] %s\n", time_str, tag, buffer);
+    fflush(stdout);
+}
 
 typedef struct {
     GtkWidget *window;
@@ -71,6 +93,17 @@ typedef struct {
 } AppState;
 
 static AppState app_state;
+
+/* WebKit frontend console bridge callback */
+static void on_script_message(WebKitUserContentManager *manager, WebKitJavascriptResult *result, gpointer user_data) {
+    (void)manager; (void)user_data;
+    JSCValue *val = webkit_javascript_result_get_js_value(result);
+    if (val && jsc_value_is_string(val)) {
+        char *str = jsc_value_to_string(val);
+        app_log("WEB-JS", "%s", str);
+        g_free(str);
+    }
+}
 
 /* Check if TCP socket connects non-blockingly (supports IPv4, IPv6, hostnames) */
 static gboolean is_port_open(const char *host, int port) {
@@ -130,36 +163,61 @@ static gboolean probe_is_plain_http(const char *host, int port) {
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return FALSE;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) {
+        app_log("PROBE", "getaddrinfo 解析 %s:%d 失败", host, port);
+        return FALSE;
+    }
 
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (sock < 0) {
+        app_log("PROBE", "创建探测套接字失败: %s", strerror(errno));
         freeaddrinfo(res);
         return FALSE;
     }
 
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 }; /* 300ms timeout */
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 }; /* 1000ms timeout */
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+        app_log("PROBE", "连接 %s:%d 探测失败: %s", host, port, strerror(errno));
         freeaddrinfo(res);
         close(sock);
         return FALSE;
     }
     freeaddrinfo(res);
 
-    const char *probe_req = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    char probe_req[256];
+    snprintf(probe_req, sizeof(probe_req), "GET / HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n", host, port);
+    app_log("PROBE", "发送 HTTP/1.1 协议探测包 -> %s:%d (Host: %s:%d)", host, port, host, port);
     send(sock, probe_req, strlen(probe_req), 0);
 
-    char buf[16] = {0};
-    ssize_t n = recv(sock, buf, 4, 0);
+    char buf[64] = {0};
+    ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
+    int saved_errno = errno;
     close(sock);
 
-    if (n >= 4 && strncmp(buf, "HTTP", 4) == 0) {
-        return TRUE; /* Server responded with HTTP status line */
+    if (n > 0) {
+        buf[n] = '\0';
+        char clean_preview[32] = {0};
+        for (int i = 0; i < n && i < 28; i++) {
+            clean_preview[i] = (buf[i] >= 32 && buf[i] < 127) ? buf[i] : '.';
+        }
+        app_log("PROBE", "收到响应数据 (%zd 字节): '%s'", n, clean_preview);
+        if (strncmp(buf, "HTTP/", 5) == 0) {
+            app_log("PROBE", "检测到 HTTP 响应状态行 -> 确认服务端运行在 HTTP 明文协议");
+            return TRUE;
+        } else {
+            app_log("PROBE", "响应未包含 HTTP 状态行 -> 确认服务端运行在 HTTPS/TLS 模式");
+            return FALSE;
+        }
+    } else if (n == 0) {
+        app_log("PROBE", "服务端主动断开连接 (0 字节) -> 确认服务端运行在 HTTPS/TLS (非明文 HTTP)");
+        return FALSE;
+    } else {
+        app_log("PROBE", "接收超时或错误 (errno: %s) -> 预设为 HTTPS/TLS", strerror(saved_errno));
+        return FALSE;
     }
-    return FALSE; /* Closed, TLS handshake expected, or error */
 }
 
 /* Dispatch JavaScript into WebKit view */
@@ -190,14 +248,19 @@ static void find_local_pairing_code(AppState *state) {
     }
     if (access(exe, X_OK) != 0) {
         g_free(exe);
+        app_log("AUTH", "未找到本地服务端可执行文件，跳过自动配对");
         return;
     }
 
     char *cmd = g_strdup_printf("'%s' --pair-info 2>/dev/null", exe);
     g_free(exe);
+    app_log("AUTH", "正在探测本地配对信息: %s", cmd);
     FILE *fp = popen(cmd, "r");
     g_free(cmd);
-    if (!fp) return;
+    if (!fp) {
+        app_log("AUTH", "执行 --pair-info 失败: %s", strerror(errno));
+        return;
+    }
 
     char line[4096];
     while (fgets(line, sizeof(line), fp)) {
@@ -206,6 +269,7 @@ static void find_local_pairing_code(AppState *state) {
             char *url_part = g_strstrip(trimmed + 9);
             if (!state->explicit_url && url_part[0] != '\0') {
                 strncpy(state->target_url, url_part, sizeof(state->target_url) - 1);
+                app_log("AUTH", "从 --pair-info 识别到默认工作台地址: %s", state->target_url);
             }
         }
         if (g_str_has_prefix(trimmed, "eyJ2")) {
@@ -215,8 +279,7 @@ static void find_local_pairing_code(AppState *state) {
     }
     pclose(fp);
     if (state->local_pairing_code[0] != '\0') {
-        g_print("[RemoteViber] 成功检测到本机配对凭据，将自动完成本地工作台安全认证。\n");
-        fflush(stdout);
+        app_log("AUTH", "成功获取本机配对凭据 (长度: %zu 字节)，将自动注入本地工作台安全认证", strlen(state->local_pairing_code));
     }
 }
 
@@ -253,6 +316,7 @@ static gboolean check_host_ready_cb(gpointer user_data) {
 
     if (is_port_open(state->host, state->port)) {
         s_notified_waiting = FALSE;
+        app_log("SOCKET", "服务端端口已就绪 (%s:%d)", state->host, state->port);
 
         find_local_pairing_code(state);
 
@@ -264,8 +328,7 @@ static gboolean check_host_ready_cb(gpointer user_data) {
             }
         }
 
-        g_print("[RemoteViber] 服务端已连接 (%s)，正在载入工作台...\n", state->target_url);
-        fflush(stdout);
+        app_log("CONNECT", "服务端已连接 (%s)，正在载入工作台...", state->target_url);
 
         gtk_label_set_markup(GTK_LABEL(state->spinner_label),
             "<span size='medium' weight='bold' foreground='#38bdf8'>已连接服务端！</span>\n\n"
@@ -279,6 +342,7 @@ static gboolean check_host_ready_cb(gpointer user_data) {
         state->is_loading = TRUE;
         state->load_failed = FALSE;
         state->poll_timer_id = 0;
+        app_log("LOAD", "开始通过 WebKit 加载 URI: %s", state->target_url);
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
         return G_SOURCE_REMOVE;
     }
@@ -286,11 +350,12 @@ static gboolean check_host_ready_cb(gpointer user_data) {
     /* Server not reachable yet: update waiting screen and notify in terminal */
     if (!s_notified_waiting) {
         s_notified_waiting = TRUE;
-        g_print("[RemoteViber] 正在等待服务端上线 (%s)...\n", state->target_url);
+        app_log("POLL", "正在等待服务端上线 (%s:%d)...", state->host, state->port);
         g_print("[RemoteViber] 提示: 可点击 GUI 界面【一键启动本地服务端】，或在另一终端窗口启动：\n");
         g_print("      ./dist-bin/viber-host-linux-x86_64 --port %d\n", state->port);
         fflush(stdout);
     }
+
     char wait_msg[1024];
     snprintf(wait_msg, sizeof(wait_msg),
         "<span size='medium' weight='bold' foreground='#38bdf8'>正在等待连接服务端 (%s)...</span>\n\n"
@@ -312,10 +377,12 @@ static gboolean check_host_ready_cb(gpointer user_data) {
 static void on_retry_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
+    app_log("POLL", "用户触发手动重试连接 (host: %s, port: %d)", state->host, state->port);
     gtk_spinner_start(GTK_SPINNER(state->spinner));
     state->page_loaded = FALSE;
     state->is_loading = FALSE;
     state->load_failed = FALSE;
+    state->has_fallback_tried = FALSE;
     stop_poll_timer(state);
     if (check_host_ready_cb(state) == G_SOURCE_CONTINUE) {
         start_poll_timer(state, 1000);
@@ -327,7 +394,7 @@ static void on_start_host_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
     if (is_port_open(state->host, state->port)) {
-        g_print("[RemoteViber] 服务端已在运行 (端口 %d)\n", state->port);
+        app_log("HOST", "服务端已在运行中 (端口: %d)", state->port);
         gtk_label_set_markup(GTK_LABEL(state->spinner_label),
             "<span size='medium' weight='bold' foreground='#38bdf8'>服务端已在运行！</span>\n\n"
             "<span size='small' foreground='#94a3b8'>正在载入工作台...</span>");
@@ -335,8 +402,7 @@ static void on_start_host_clicked(GtkButton *btn, gpointer user_data) {
         return;
     }
 
-    g_print("[RemoteViber] 正在通过 GUI 一键拉起本地服务端 (端口 %d)...\n", state->port);
-    fflush(stdout);
+    app_log("HOST", "正在通过 GUI 一键拉起本地服务端 (端口 %d)...", state->port);
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -357,8 +423,7 @@ static void on_start_host_clicked(GtkButton *btn, gpointer user_data) {
         _exit(127);
     } else if (pid > 0) {
         state->spawned_host_pid = pid;
-        g_print("[RemoteViber] 本地服务端进程已拉起 (PID: %d)，等待端口就绪...\n", pid);
-        fflush(stdout);
+        app_log("HOST", "本地服务端进程已拉起 (PID: %d)，等待端口就绪...", pid);
         gtk_label_set_markup(GTK_LABEL(state->spinner_label),
             "<span size='medium' weight='bold' foreground='#34d399'>本地服务端进程已拉起！</span>\n\n"
             "<span size='small' foreground='#94a3b8'>正在等待端口就绪并自动载入工作台...</span>");
@@ -384,26 +449,31 @@ static void on_toggle_protocol_clicked(GtkButton *btn, gpointer user_data) {
     } else {
         snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
     }
-    g_print("[RemoteViber] 手动切换连接协议为: %s\n", state->target_url);
-    fflush(stdout);
+    app_log("MANUAL", "用户手动切换连接协议为: %s", state->target_url);
     on_retry_clicked(NULL, state);
 }
 
 /* WebKit load-changed handler */
 static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpointer user_data) {
     AppState *state = (AppState *)user_data;
+    const char *current_uri = webkit_web_view_get_uri(web_view);
 
     if (event == WEBKIT_LOAD_STARTED) {
         state->is_loading = TRUE;
         state->load_failed = FALSE;
+        app_log("LOAD", "事件 WEBKIT_LOAD_STARTED (URI: %s)", current_uri ? current_uri : state->target_url);
+    } else if (event == WEBKIT_LOAD_REDIRECTED) {
+        app_log("LOAD", "事件 WEBKIT_LOAD_REDIRECTED (新 URI: %s)", current_uri ? current_uri : "unknown");
     } else if (event == WEBKIT_LOAD_COMMITTED) {
         state->load_failed = FALSE;
+        app_log("LOAD", "事件 WEBKIT_LOAD_COMMITTED (URI: %s)", current_uri ? current_uri : state->target_url);
         gtk_label_set_markup(GTK_LABEL(state->spinner_label),
             "<span size='medium' weight='bold' foreground='#38bdf8'>已建立通信连接</span>\n\n"
             "<span size='small' foreground='#94a3b8'>正在解析渲染拼图工作台视图...</span>");
         
         /* Auto-inject local pairing code if available */
         if (state->local_pairing_code[0] != '\0') {
+            app_log("AUTH", "COMMITTED 阶段注入本机配对凭据至 sessionStorage");
             char *js = g_strdup_printf(
                 "try {"
                 "  sessionStorage.setItem('viber_local_pairing_code', '%s');"
@@ -415,8 +485,11 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
         }
     } else if (event == WEBKIT_LOAD_FINISHED) {
         state->is_loading = FALSE;
+        app_log("LOAD", "事件 WEBKIT_LOAD_FINISHED (URI: %s, load_failed=%d)",
+                current_uri ? current_uri : state->target_url, state->load_failed);
         if (state->load_failed) {
             /* Aborted or failed load; keep loading view visible, do not show blank screen! */
+            app_log("LOAD", "加载此前已被判定为失败，保持加载引导界面");
             return;
         }
 
@@ -430,8 +503,10 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
         snprintf(status_str, sizeof(status_str),
             "<span color='#10b981' font_weight='bold'>●</span> <span color='#38bdf8' font_size='small'>%d 在线</span>", state->port);
         gtk_label_set_markup(GTK_LABEL(state->status_label), status_str);
+        app_log("SUCCESS", "工作台已成功呈现！(端口: %d 在线)", state->port);
 
         if (state->local_pairing_code[0] != '\0') {
+            app_log("AUTH", "FINISHED 阶段确保配对凭据导入工作台");
             char *js = g_strdup_printf(
                 "try {"
                 "  sessionStorage.setItem('viber_local_pairing_code', '%s');"
@@ -449,6 +524,13 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
     (void)web_view; (void)event;
     AppState *state = (AppState *)user_data;
 
+    const char *err_dom = error ? g_quark_to_string(error->domain) : "none";
+    int err_code = error ? error->code : 0;
+    const char *err_msg = error && error->message ? error->message : "未知错误";
+
+    app_log("ERROR", "WebKit 加载失败通知: failing_uri='%s', domain='%s', code=%d, msg='%s'",
+            failing_uri ? failing_uri : "(null)", err_dom, err_code, err_msg);
+
     /* 1. Ignore benign cancellation errors (e.g. subresource abort, reload, redirect) */
     if (error) {
         if (g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED) ||
@@ -456,6 +538,7 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
             g_error_matches(error, WEBKIT_POLICY_ERROR, WEBKIT_POLICY_ERROR_CANNOT_SHOW_MIME_TYPE) ||
             (error->message && (strstr(error->message, "cancelled") != NULL ||
                                 strstr(error->message, "canceled") != NULL))) {
+            app_log("LOAD", "忽略良性取消/重定向错误: %s", err_msg);
             return TRUE;
         }
     }
@@ -472,13 +555,14 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
         if (lf > 0 && norm_failing[lf - 1] == '/') norm_failing[lf - 1] = '\0';
 
         if (strcmp(norm_target, norm_failing) != 0) {
-            /* Any failure from a subresource (/assets/..., favicon, cdn fonts, etc.) MUST NOT break or flip the page! */
+            app_log("LOAD", "忽略非主页面子资源加载失败: %s", failing_uri);
             return TRUE;
         }
     }
 
     /* 3. If already loaded, ignore any subresource failures */
     if (state->page_loaded) {
+        app_log("LOAD", "主页面已正常加载运行，忽略后发网络失败");
         return TRUE;
     }
 
@@ -488,26 +572,28 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
             (strstr(error->message, "non-properly terminated") != NULL ||
              strstr(error->message, "unexpected TLS packet") != NULL ||
              strstr(error->message, "wrong version number") != NULL)) {
+            app_log("FALLBACK", "检测到 TLS 握手异常中断 (服务端可能为 HTTP 明文)，触发主动协议验证...");
             if (probe_is_plain_http(state->host, state->port)) {
                 state->has_fallback_tried = TRUE;
                 snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
-                g_print("[RemoteViber] 探测到服务端运行在 HTTP 模式，已自动切换至: %s\n", state->target_url);
-                fflush(stdout);
+                app_log("FALLBACK", "验证确认服务端为纯 HTTP 模式，自动切换并重新加载: %s", state->target_url);
                 state->is_loading = TRUE;
                 state->load_failed = FALSE;
                 webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
                 return TRUE;
+            } else {
+                app_log("FALLBACK", "主动探测未返回明文 HTTP 响应，保持当前配置");
             }
         }
     }
 
     /* 5. If HTTP failed, probe if server is actually HTTPS */
     if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "http://")) {
+        app_log("FALLBACK", "HTTP 连接失败，触发协议自适应探测是否为 HTTPS...");
         if (!probe_is_plain_http(state->host, state->port)) {
             state->has_fallback_tried = TRUE;
             snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
-            g_print("[RemoteViber] 探测到服务端运行在 HTTPS 模式，已自动切换至: %s\n", state->target_url);
-            fflush(stdout);
+            app_log("FALLBACK", "验证确认服务端为 HTTPS 模式，自动切换并重新加载: %s", state->target_url);
             state->is_loading = TRUE;
             state->load_failed = FALSE;
             webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
@@ -515,7 +601,7 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
         }
     }
 
-    g_printerr("[RemoteViber] 页面加载失败: %s (原因: %s)\n", failing_uri ? failing_uri : "", error ? error->message : "无法连接");
+    app_log("ERROR", "工作台页面加载失败: %s (原因: %s)", failing_uri ? failing_uri : "", err_msg);
 
     state->load_failed = TRUE;
     state->page_loaded = FALSE;
@@ -523,14 +609,14 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
     gtk_stack_set_visible_child(GTK_STACK(state->stack), state->loading_box);
     gtk_spinner_start(GTK_SPINNER(state->spinner));
 
-    char err_msg[1024];
-    snprintf(err_msg, sizeof(err_msg),
+    char err_msg_ui[1024];
+    snprintf(err_msg_ui, sizeof(err_msg_ui),
         "<span size='medium' weight='bold' foreground='#ef4444'>未能载入工作台页面 (%s)</span>\n\n"
         "<span size='small' foreground='#94a3b8'>请确认服务端正在运行，或点击【一键启动本地服务端】：</span>\n"
         "<span font_family='monospace' size='small' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
         "<span size='small' foreground='#64748b'>正在自动检测重新连接...</span>",
         state->target_url, state->port);
-    gtk_label_set_markup(GTK_LABEL(state->spinner_label), err_msg);
+    gtk_label_set_markup(GTK_LABEL(state->spinner_label), err_msg_ui);
 
     char badge_str[128];
     snprintf(badge_str, sizeof(badge_str),
@@ -547,7 +633,7 @@ static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *f
                                                gpointer user_data) {
     (void)errors;
     AppState *state = (AppState *)user_data;
-    g_print("[RemoteViber] 自动信任服务端自签名 TLS 证书 (%s)\n", failing_uri ? failing_uri : "unknown");
+    app_log("TLS", "检测到自签名/自定义 TLS 证书 (failing_uri: '%s', flags: 0x%x)", failing_uri ? failing_uri : "(null)", (guint)errors);
     fflush(stdout);
 
     char host[256] = {0};
@@ -565,7 +651,9 @@ static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *f
 
     WebKitWebContext *context = webkit_web_view_get_context(web_view);
     if (context && certificate) {
+        app_log("TLS", "正在为目标主机 '%s' 信任自签名证书...", host);
         webkit_web_context_allow_tls_certificate_for_host(context, certificate, host);
+        app_log("TLS", "已成功将主机 '%s' 信任证书写入 WebKit 上下文", host);
     }
     return TRUE;
 }
@@ -573,7 +661,7 @@ static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view, gchar *f
 /* WebKit WebProcess crash handler */
 static void on_web_process_terminated(WebKitWebView *web_view, WebKitWebProcessTerminationReason reason, gpointer user_data) {
     AppState *state = (AppState *)user_data;
-    g_printerr("[RemoteViber] 网页渲染进程退出 (代码: %d)，正在自动重连...\n", reason);
+    app_log("PROCESS", "网页渲染进程退出 (代码: %d)，正在自动恢复重连...", reason);
 
     state->load_failed = TRUE;
     state->page_loaded = FALSE;
@@ -920,20 +1008,20 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer use
             state->zoom_level += 0.1;
             if (state->zoom_level > 3.0) state->zoom_level = 3.0;
             webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
-            g_print("[RemoteViber] 工作台缩放: %.0f%%\n", state->zoom_level * 100);
+            app_log("ZOOM", "工作台缩放: %.0f%%", state->zoom_level * 100);
             return TRUE;
         }
         if (event->keyval == GDK_KEY_minus || event->keyval == GDK_KEY_underscore || event->keyval == GDK_KEY_KP_Subtract) {
             state->zoom_level -= 0.1;
             if (state->zoom_level < 0.5) state->zoom_level = 0.5;
             webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
-            g_print("[RemoteViber] 工作台缩放: %.0f%%\n", state->zoom_level * 100);
+            app_log("ZOOM", "工作台缩放: %.0f%%", state->zoom_level * 100);
             return TRUE;
         }
         if (event->keyval == GDK_KEY_0 || event->keyval == GDK_KEY_KP_0) {
             state->zoom_level = 1.0;
             webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(state->web_view), state->zoom_level);
-            g_print("[RemoteViber] 工作台缩放已重置: 100%%\n");
+            app_log("ZOOM", "工作台缩放已重置: 100%%");
             return TRUE;
         }
     }
@@ -1368,6 +1456,40 @@ int main(int argc, char *argv[]) {
     webkit_user_content_manager_add_style_sheet(ucm, sheet);
     webkit_user_style_sheet_unref(sheet);
 
+    /* Register frontend JS console logger bridge */
+    g_signal_connect(ucm, "script-message-received::debugLog", G_CALLBACK(on_script_message), &app_state);
+    webkit_user_content_manager_register_script_message_handler(ucm, "debugLog");
+
+    const char *js_bridge =
+        "(function() {"
+        "  function sendLog(lvl, args) {"
+        "    try {"
+        "      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.debugLog) {"
+        "        var msg = Array.from(args).map(function(a) {"
+        "          if (typeof a === 'object') { try { return JSON.stringify(a); } catch(e) { return String(a); } }"
+        "          return String(a);"
+        "        }).join(' ');"
+        "        window.webkit.messageHandlers.debugLog.postMessage('[' + lvl + '] ' + msg);"
+        "      }"
+        "    } catch(e) {}"
+        "  }"
+        "  var origLog = console.log, origWarn = console.warn, origErr = console.error;"
+        "  console.log = function() { origLog.apply(console, arguments); sendLog('LOG', arguments); };"
+        "  console.warn = function() { origWarn.apply(console, arguments); sendLog('WARN', arguments); };"
+        "  console.error = function() { origErr.apply(console, arguments); sendLog('ERR', arguments); };"
+        "  window.addEventListener('error', function(e) {"
+        "    sendLog('UNCAUGHT-ERR', [e.message || '', e.filename || '', e.lineno || '']);"
+        "  });"
+        "})();";
+    WebKitUserScript *bridge_script = webkit_user_script_new(
+        js_bridge,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+        NULL, NULL
+    );
+    webkit_user_content_manager_add_script(ucm, bridge_script);
+    webkit_user_script_unref(bridge_script);
+
     /* Inject auto-pairing credential script at document start if connecting to localhost */
     find_local_pairing_code(&app_state);
     if (app_state.local_pairing_code[0] != '\0') {
@@ -1437,9 +1559,8 @@ int main(int argc, char *argv[]) {
 
     gtk_widget_show_all(app_state.window);
 
-    g_print("[RemoteViber] 原生桌面工作台已启动 (PID: %d)\n", getpid());
-    g_print("[RemoteViber] 目标连接地址: %s\n", app_state.target_url);
-    fflush(stdout);
+    app_log("INIT", "原生桌面工作台已启动 (PID: %d)", getpid());
+    app_log("INIT", "目标连接地址: %s", app_state.target_url);
 
     find_local_pairing_code(&app_state);
 
@@ -1451,8 +1572,7 @@ int main(int argc, char *argv[]) {
     if (detach_to_background) {
         pid_t pid = fork();
         if (pid > 0) {
-            g_print("[RemoteViber] 客户端已成功转入后台独立运行 (PID: %d)。当前终端已释放。\n", pid);
-            fflush(stdout);
+            app_log("INIT", "客户端已成功转入后台独立运行 (PID: %d)。当前终端已释放。", pid);
             return 0;
         } else if (pid == 0) {
             setsid();
