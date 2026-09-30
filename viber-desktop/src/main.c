@@ -121,6 +121,47 @@ static gboolean is_port_open(const char *host, int port) {
     return FALSE;
 }
 
+/* Probe whether the target port is serving plain HTTP or HTTPS */
+static gboolean probe_is_plain_http(const char *host, int port) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return FALSE;
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        return FALSE;
+    }
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 }; /* 300ms timeout */
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+        freeaddrinfo(res);
+        close(sock);
+        return FALSE;
+    }
+    freeaddrinfo(res);
+
+    const char *probe_req = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    send(sock, probe_req, strlen(probe_req), 0);
+
+    char buf[16] = {0};
+    ssize_t n = recv(sock, buf, 4, 0);
+    close(sock);
+
+    if (n >= 4 && strncmp(buf, "HTTP", 4) == 0) {
+        return TRUE; /* Server responded with HTTP status line */
+    }
+    return FALSE; /* Closed, TLS handshake expected, or error */
+}
+
 /* Dispatch JavaScript into WebKit view */
 static void dispatch_web_js(WebKitWebView *web_view, const char *js) {
     if (!web_view || !js) return;
@@ -165,7 +206,6 @@ static void find_local_pairing_code(AppState *state) {
             char *url_part = g_strstrip(trimmed + 9);
             if (!state->explicit_url && url_part[0] != '\0') {
                 strncpy(state->target_url, url_part, sizeof(state->target_url) - 1);
-                state->explicit_url = TRUE;
             }
         }
         if (g_str_has_prefix(trimmed, "eyJ2")) {
@@ -213,10 +253,19 @@ static gboolean check_host_ready_cb(gpointer user_data) {
 
     if (is_port_open(state->host, state->port)) {
         s_notified_waiting = FALSE;
-        g_print("[RemoteViber] 服务端已连接 (%s)，正在载入工作台...\n", state->target_url);
-        fflush(stdout);
 
         find_local_pairing_code(state);
+
+        if (!state->explicit_url) {
+            if (probe_is_plain_http(state->host, state->port)) {
+                snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
+            } else {
+                snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
+            }
+        }
+
+        g_print("[RemoteViber] 服务端已连接 (%s)，正在载入工作台...\n", state->target_url);
+        fflush(stdout);
 
         gtk_label_set_markup(GTK_LABEL(state->spinner_label),
             "<span size='medium' weight='bold' foreground='#38bdf8'>已连接服务端！</span>\n\n"
@@ -431,6 +480,39 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent event, g
     /* 3. If already loaded, ignore any subresource failures */
     if (state->page_loaded) {
         return TRUE;
+    }
+
+    /* 4. If HTTPS failed due to TLS handshake termination, probe if server is actually plain HTTP */
+    if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "https://")) {
+        if (error && error->message &&
+            (strstr(error->message, "non-properly terminated") != NULL ||
+             strstr(error->message, "unexpected TLS packet") != NULL ||
+             strstr(error->message, "wrong version number") != NULL)) {
+            if (probe_is_plain_http(state->host, state->port)) {
+                state->has_fallback_tried = TRUE;
+                snprintf(state->target_url, sizeof(state->target_url), "http://%s:%d/", state->host, state->port);
+                g_print("[RemoteViber] 探测到服务端运行在 HTTP 模式，已自动切换至: %s\n", state->target_url);
+                fflush(stdout);
+                state->is_loading = TRUE;
+                state->load_failed = FALSE;
+                webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
+                return TRUE;
+            }
+        }
+    }
+
+    /* 5. If HTTP failed, probe if server is actually HTTPS */
+    if (!state->explicit_url && !state->has_fallback_tried && g_str_has_prefix(state->target_url, "http://")) {
+        if (!probe_is_plain_http(state->host, state->port)) {
+            state->has_fallback_tried = TRUE;
+            snprintf(state->target_url, sizeof(state->target_url), "https://%s:%d/", state->host, state->port);
+            g_print("[RemoteViber] 探测到服务端运行在 HTTPS 模式，已自动切换至: %s\n", state->target_url);
+            fflush(stdout);
+            state->is_loading = TRUE;
+            state->load_failed = FALSE;
+            webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->web_view), state->target_url);
+            return TRUE;
+        }
     }
 
     g_printerr("[RemoteViber] 页面加载失败: %s (原因: %s)\n", failing_uri ? failing_uri : "", error ? error->message : "无法连接");
@@ -1050,6 +1132,14 @@ int main(int argc, char *argv[]) {
     } else {
         /* Default to HTTPS in protocol v2 */
         snprintf(app_state.target_url, sizeof(app_state.target_url), "https://%s:%d/", app_state.host, app_state.port);
+    }
+
+    if (!app_state.explicit_url && is_port_open(app_state.host, app_state.port)) {
+        if (probe_is_plain_http(app_state.host, app_state.port)) {
+            snprintf(app_state.target_url, sizeof(app_state.target_url), "http://%s:%d/", app_state.host, app_state.port);
+        } else {
+            snprintf(app_state.target_url, sizeof(app_state.target_url), "https://%s:%d/", app_state.host, app_state.port);
+        }
     }
 
     apply_dark_theme();
