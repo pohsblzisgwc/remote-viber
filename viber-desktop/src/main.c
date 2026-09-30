@@ -136,9 +136,13 @@ typedef struct {
     gboolean has_fallback_tried;
     guint poll_timer_id;
     pid_t spawned_host_pid;
+    guint last_http_status;
+    char last_http_error[256];
 } AppState;
 
 static AppState app_state;
+static void start_poll_timer(AppState *state, guint interval_ms);
+static void stop_poll_timer(AppState *state);
 
 /* WebKit Resource & Network Diagnostic Callbacks */
 static void on_resource_failed(WebKitWebResource *resource, GError *error, gpointer user_data) {
@@ -152,7 +156,7 @@ static void on_resource_failed(WebKitWebResource *resource, GError *error, gpoin
 }
 
 static void on_resource_finished(WebKitWebResource *resource, gpointer user_data) {
-    (void)user_data;
+    AppState *state = (AppState *)user_data;
     const char *uri = webkit_web_resource_get_uri(resource);
     WebKitURIResponse *resp = webkit_web_resource_get_response(resource);
     guint status = resp ? webkit_uri_response_get_status_code(resp) : 0;
@@ -160,19 +164,47 @@ static void on_resource_finished(WebKitWebResource *resource, gpointer user_data
     guint64 len = resp ? webkit_uri_response_get_content_length(resp) : 0;
     app_log("RES-DONE", "子资源就绪: %s [HTTP %u, MIME: %s, %lu 字节]",
             uri ? uri : "(null)", status, mime ? mime : "unknown", (unsigned long)len);
+
+    if (state && uri && state->target_url[0] != '\0') {
+        char norm_target[512] = {0};
+        char norm_uri[512] = {0};
+        g_strlcpy(norm_target, state->target_url, sizeof(norm_target));
+        g_strlcpy(norm_uri, uri, sizeof(norm_uri));
+        size_t lt = strlen(norm_target);
+        if (lt > 0 && norm_target[lt - 1] == '/') norm_target[lt - 1] = '\0';
+        size_t lu = strlen(norm_uri);
+        if (lu > 0 && norm_uri[lu - 1] == '/') norm_uri[lu - 1] = '\0';
+
+        if (strcmp(norm_target, norm_uri) == 0) {
+            state->last_http_status = status;
+            if (status >= 400) {
+                state->load_failed = TRUE;
+                const char *desc = "未知错误";
+                if (status == 502) desc = "Bad Gateway (网关错误/后端未运行或代理断开)";
+                else if (status == 503) desc = "Service Unavailable (服务暂不可用)";
+                else if (status == 504) desc = "Gateway Timeout (网关超时)";
+                else if (status == 500) desc = "Internal Server Error (服务端内部错误)";
+                else if (status == 403) desc = "Forbidden (访问被拒绝/Host头未放行)";
+                else if (status == 404) desc = "Not Found (页面未找到)";
+                snprintf(state->last_http_error, sizeof(state->last_http_error), "HTTP %u %s", status, desc);
+                app_log("ERROR", "工作台主页面响应 HTTP 异常: %s", state->last_http_error);
+            }
+        }
+    }
 }
 
 static void on_resource_load_started(WebKitWebView *web_view, WebKitWebResource *resource, WebKitURIRequest *request, gpointer user_data) {
-    (void)web_view; (void)user_data;
+    (void)web_view;
+    AppState *state = (AppState *)user_data;
     const char *uri = webkit_uri_request_get_uri(request);
     app_log("RES-START", "请求子资源: %s", uri ? uri : "(null)");
-    g_signal_connect(resource, "failed", G_CALLBACK(on_resource_failed), NULL);
-    g_signal_connect(resource, "finished", G_CALLBACK(on_resource_finished), NULL);
+    g_signal_connect(resource, "failed", G_CALLBACK(on_resource_failed), state);
+    g_signal_connect(resource, "finished", G_CALLBACK(on_resource_finished), state);
 }
 
 /* Post-load DOM State Diagnostics */
 static void on_dom_state_cb(GObject *object, GAsyncResult *result, gpointer user_data) {
-    (void)user_data;
+    AppState *state = (AppState *)user_data;
     GError *error = NULL;
 #if WEBKIT_CHECK_VERSION(2, 40, 0)
     JSCValue *val = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
@@ -182,10 +214,30 @@ static void on_dom_state_cb(GObject *object, GAsyncResult *result, gpointer user
     } else if (val) {
         char *str = jsc_value_to_string(val);
         app_log("DOM-STATE", "%s", str ? str : "(null)");
+        if (str && state) {
+            /* If #root doesn't exist and body length is 0, the page is completely blank / error */
+            if (strstr(str, "\"rootExists\":false") != NULL && strstr(str, "\"bodyLen\":0") != NULL) {
+                app_log("DOM-WARN", "DOM 检查发现页面无内容 (#root 不存在且 bodyLen=0)，页面未成功载入，回退至状态提示");
+                if (state->page_loaded) {
+                    state->page_loaded = FALSE;
+                    state->load_failed = TRUE;
+                    gtk_stack_set_visible_child(GTK_STACK(state->stack), state->loading_box);
+                    gtk_spinner_start(GTK_SPINNER(state->spinner));
+                    char err_card[1024];
+                    snprintf(err_card, sizeof(err_card),
+                        "<span size='medium' weight='bold' foreground='#ef4444'>工作台页面未正确呈现</span>\n\n"
+                        "<span foreground='#94a3b8'>页面内容为空或被服务网关拦截 (HTTP %u)。\n"
+                        "请确认服务端正在正常运行。</span>",
+                        state->last_http_status ? state->last_http_status : 502);
+                    gtk_label_set_markup(GTK_LABEL(state->spinner_label), err_card);
+                    start_poll_timer(state, 1500);
+                }
+            }
+        }
         g_free(str);
     }
 #else
-    (void)object; (void)result;
+    (void)object; (void)result; (void)state;
 #endif
 }
 
@@ -210,7 +262,7 @@ static gboolean on_delayed_dom_check(gpointer user_data) {
         "  });"
         "})()";
 #if WEBKIT_CHECK_VERSION(2, 40, 0)
-    webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(state->web_view), diag_js, -1, NULL, NULL, NULL, on_dom_state_cb, NULL);
+    webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(state->web_view), diag_js, -1, NULL, NULL, NULL, on_dom_state_cb, state);
 #else
     G_GNUC_BEGIN_IGNORE_DEPRECATIONS
     webkit_web_view_run_javascript(WEBKIT_WEB_VIEW(state->web_view), diag_js, NULL, NULL, NULL);
@@ -330,7 +382,14 @@ static gboolean probe_is_plain_http(const char *host, int port) {
         }
         app_log("PROBE", "收到响应数据 (%zd 字节): '%s'", n, clean_preview);
         if (strncmp(buf, "HTTP/", 5) == 0) {
-            app_log("PROBE", "检测到 HTTP 响应状态行 -> 确认服务端运行在 HTTP 明文协议");
+            int code = (n >= 12) ? atoi(buf + 9) : 0;
+            if (code == 502) {
+                app_log("PROBE", "服务端返回 HTTP 502 Bad Gateway (网关错误/后端未运行或代理断开)");
+            } else if (code >= 400) {
+                app_log("PROBE", "服务端返回 HTTP 异常状态码: %d", code);
+            } else {
+                app_log("PROBE", "检测到 HTTP 响应状态行 (HTTP %d) -> 确认服务端运行在 HTTP 明文协议", code);
+            }
             return TRUE;
         } else {
             app_log("PROBE", "响应未包含 HTTP 状态行 -> 确认服务端运行在 HTTPS/TLS 模式");
@@ -455,9 +514,16 @@ static void find_local_pairing_code(AppState *state) {
         if (g_str_has_prefix(trimmed, "Local UI:")) {
             char *url_part = g_strstrip(trimmed + 9);
             if (!state->explicit_url && url_part[0] != '\0') {
-                strncpy(state->target_url, url_part, sizeof(state->target_url) - 1);
-                state->has_detected_url = TRUE;
-                app_log("AUTH", "从 --pair-info 识别到默认工作台地址: %s", state->target_url);
+                GUri *u = g_uri_parse(url_part, G_URI_FLAGS_NONE, NULL);
+                if (u) {
+                    int p = g_uri_get_port(u);
+                    if (p <= 0 || p == state->port) {
+                        strncpy(state->target_url, url_part, sizeof(state->target_url) - 1);
+                        state->has_detected_url = TRUE;
+                        app_log("AUTH", "从 --pair-info 识别到默认工作台地址: %s", state->target_url);
+                    }
+                    g_uri_unref(u);
+                }
             }
         }
         if (g_str_has_prefix(trimmed, "eyJ2")) {
@@ -581,8 +647,8 @@ static void on_retry_clicked(GtkButton *btn, gpointer user_data) {
 static void on_start_host_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = (AppState *)user_data;
-    if (is_port_open(state->host, state->port)) {
-        app_log("HOST", "服务端已在运行中 (端口: %d)", state->port);
+    if (is_port_open(state->host, state->port) && state->page_loaded && state->last_http_status == 200) {
+        app_log("HOST", "服务端已在正常运行中 (端口: %d)", state->port);
         gtk_label_set_markup(GTK_LABEL(state->spinner_label),
             "<span size='medium' weight='bold' foreground='#38bdf8'>服务端已在运行！</span>\n\n"
             "<span size='small' foreground='#94a3b8'>正在载入工作台...</span>");
@@ -605,6 +671,10 @@ static void on_start_host_clicked(GtkButton *btn, gpointer user_data) {
         if (access(exe, X_OK) != 0) {
             g_free(exe);
             exe = g_strdup("./dist-bin/viber-host-linux-x86_64");
+        }
+        if (access(exe, X_OK) != 0) {
+            g_free(exe);
+            exe = g_strdup("./viber-host-linux-x86_64");
         }
         execl(exe, "viber-host-linux-x86_64", "--port", port_str, NULL);
         g_free(exe);
@@ -649,6 +719,8 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
     if (event == WEBKIT_LOAD_STARTED) {
         state->is_loading = TRUE;
         state->load_failed = FALSE;
+        state->last_http_status = 0;
+        state->last_http_error[0] = '\0';
         app_log("LOAD", "事件 WEBKIT_LOAD_STARTED (URI: %s)", current_uri ? current_uri : state->target_url);
     } else if (event == WEBKIT_LOAD_REDIRECTED) {
         app_log("LOAD", "事件 WEBKIT_LOAD_REDIRECTED (新 URI: %s)", current_uri ? current_uri : "unknown");
@@ -673,11 +745,62 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpoi
         }
     } else if (event == WEBKIT_LOAD_FINISHED) {
         state->is_loading = FALSE;
-        app_log("LOAD", "事件 WEBKIT_LOAD_FINISHED (URI: %s, load_failed=%d)",
-                current_uri ? current_uri : state->target_url, state->load_failed);
-        if (state->load_failed) {
+
+        /* Extract main resource status code directly from WebKitWebView if available */
+        WebKitWebResource *main_res = webkit_web_view_get_main_resource(web_view);
+        if (main_res) {
+            WebKitURIResponse *resp = webkit_web_resource_get_response(main_res);
+            if (resp) {
+                guint code = webkit_uri_response_get_status_code(resp);
+                if (code > 0) state->last_http_status = code;
+            }
+        }
+
+        app_log("LOAD", "事件 WEBKIT_LOAD_FINISHED (URI: %s, load_failed=%d, http_status=%u)",
+                current_uri ? current_uri : state->target_url, state->load_failed, state->last_http_status);
+        if (state->load_failed || state->last_http_status >= 400) {
             /* Aborted or failed load; keep loading view visible, do not show blank screen! */
-            app_log("LOAD", "加载此前已被判定为失败，保持加载引导界面");
+            app_log("LOAD", "加载失败或服务端返回 HTTP 异常状态码 (%u)，保持并显示错误引导界面", state->last_http_status);
+            state->page_loaded = FALSE;
+            gtk_stack_set_visible_child(GTK_STACK(state->stack), state->loading_box);
+            gtk_spinner_start(GTK_SPINNER(state->spinner));
+
+            char err_card[2048];
+            if (state->last_http_status == 502) {
+                snprintf(err_card, sizeof(err_card),
+                    "<span size='large' weight='bold' foreground='#ef4444'>未能载入工作台 (HTTP 502 Bad Gateway)</span>\n\n"
+                    "<span foreground='#f87171'>服务端或网关响应异常：端口 %d 返回了 502 Bad Gateway。</span>\n\n"
+                    "<span foreground='#94a3b8'>可能原因：</span>\n"
+                    "<span foreground='#cbd5e1'>  1. 端口 %d 被反向代理或 Docker 容器占用，但后端未运行\n"
+                    "  2. Viber Host 服务端进程未启动或已意外退出</span>\n\n"
+                    "<span foreground='#94a3b8'>解决方法：</span>\n"
+                    "<span foreground='#34d399'>  • 点击下方绿色【⚡ 一键启动本地服务端】按钮启动主机服务\n</span>"
+                    "<span foreground='#38bdf8'>  • 或在终端窗口启动: ./viber-host-linux-x86_64 --port %d\n</span>"
+                    "<span foreground='#f59e0b'>  • 检查端口占用情况: lsof -i :%d 或 netstat -tlpn | grep %d</span>",
+                    state->port, state->port, state->port, state->port, state->port);
+            } else if (state->last_http_status >= 400) {
+                snprintf(err_card, sizeof(err_card),
+                    "<span size='large' weight='bold' foreground='#ef4444'>未能载入工作台 (%s)</span>\n\n"
+                    "<span foreground='#f87171'>服务端响应了 HTTP 异常状态码：%s</span>\n\n"
+                    "<span foreground='#94a3b8'>请确认服务端正在正常运行：</span>\n"
+                    "<span font_family='monospace' foreground='#34d399'>  ./viber-host-linux-x86_64 --port %d</span>",
+                    state->last_http_error, state->last_http_error, state->port);
+            } else {
+                snprintf(err_card, sizeof(err_card),
+                    "<span size='medium' weight='bold' foreground='#ef4444'>未能载入工作台页面 (%s)</span>\n\n"
+                    "<span size='small' foreground='#94a3b8'>请确认服务端正在运行，或点击【一键启动本地服务端】：</span>\n"
+                    "<span font_family='monospace' size='small' foreground='#34d399'>  ./dist-bin/viber-host-linux-x86_64 --port %d  </span>\n\n"
+                    "<span size='small' foreground='#64748b'>正在自动检测重新连接...</span>",
+                    state->target_url, state->port);
+            }
+            gtk_label_set_markup(GTK_LABEL(state->spinner_label), err_card);
+
+            char badge_str[128];
+            snprintf(badge_str, sizeof(badge_str),
+                "<span color='#ef4444' font_weight='bold'>✕</span> <span color='#94a3b8' font_size='small'>异常 (%d)</span>", state->port);
+            gtk_label_set_markup(GTK_LABEL(state->status_label), badge_str);
+
+            start_poll_timer(state, 1500);
             return;
         }
 
